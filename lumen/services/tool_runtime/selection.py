@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from lumen_plugin_api.contracts import PluginError
+from lumen_plugin_api.contracts import Namespace, PluginError
 
 from lumen.services import mcp_client, tools
 from lumen.services.tools import ToolContext
@@ -44,7 +44,10 @@ async def _load_custom(ctx: ToolContext) -> list[dict]:
     from lumen.services import extensions_store as es
 
     try:
-        items = await es.list_for_user("tool", user_id=ctx.user_id, project_id=ctx.project_id, active_only=True)
+        items = await es.list_for_user(
+            "tool", user_id=ctx.user_id, project_id=ctx.project_id, active_only=True,
+            include_domain=ctx.selected_tool_ids or False, selected_ids=ctx.selected_tool_ids, runtime=True,
+        )
     except Exception:
         logger.warning("커스텀 툴 로드 실패 — 내장 툴만 사용", exc_info=True)
         return []
@@ -56,26 +59,27 @@ async def _load_mcp(ctx: ToolContext) -> list[dict]:
     from lumen.services import extensions_store as es
     from lumen.services import mcp_oauth
 
+    expected_credential_versions = dict(ctx.expected_mcp_credential_versions or ())
     try:
-        # reveal_secrets=True: 실행에는 복호화된 실제 인증 헤더가 필요(API 응답용 마스킹 dict 아님).
+        # Read the scope, configuration, activation and OAuth epoch before any remote discovery/refresh.
         items = await es.list_for_user(
-            "mcp", user_id=ctx.user_id, project_id=ctx.project_id, active_only=True, reveal_secrets=True
+            "mcp", user_id=ctx.user_id, project_id=ctx.project_id, active_only=True, reveal_secrets=True,
+            include_domain=ctx.selected_mcp_ids or False, selected_ids=ctx.selected_mcp_ids, runtime=True,
         )
-        # OAuth access tokens are per user/project. Public and administrator-approved
-        # sources never accept user-provided secret variables.
-        oauth_headers_by_server = (
-            await mcp_oauth.headers_for_user(user_id=ctx.user_id, project_id=ctx.project_id)
-            if any(server.get("auth_mode") == "oauth" for server in items)
-            else {}
-        )
-        expected_credential_versions = dict(ctx.expected_mcp_credential_versions or ())
-        credential_versions = (
-            await es.mcp_credential_versions(
-                list(expected_credential_versions), user_id=ctx.user_id, project_id=ctx.project_id
-            )
-            if expected_credential_versions
-            else {}
-        )
+        if ctx.selected_mcp_ids is None:
+            items = [server for server in items if server.get("implicit_selection", True)]
+        items = _frozen_selection(_selected(items, ctx.selected_mcp_ids), ctx, "mcp")
+        oauth_fences = {
+            server["id"]: mcp_oauth.OAuthFence.from_server(server, expected)
+            for server in items if server.get("auth_mode") == "oauth"
+            if type(expected := expected_credential_versions.get(server["id"])) is int and expected > 0
+            and expected == server.get("credential_version")
+        }
+        oauth_headers_by_server = {}
+        if oauth_fences:
+            namespace = Namespace(user_id=ctx.user_id, project_id=ctx.project_id)
+            with mcp_oauth.frozen_credentials(namespace, oauth_fences):
+                oauth_headers_by_server = await mcp_oauth.headers_for_user(user_id=ctx.user_id, project_id=ctx.project_id)
     except es.ExtensionSecretUnavailable:
         logger.warning("MCP secrets cannot be decrypted; disabling MCP tools", exc_info=True)
         return []
@@ -84,7 +88,9 @@ async def _load_mcp(ctx: ToolContext) -> list[dict]:
         return []
     usable: list[dict] = []
     for server in items:
-        if server.get("transport") != "http" or not str(server.get("url") or "").lower().startswith("https://"):
+        if server.get("transport") not in {"http", "sse"} or not str(server.get("url") or "").lower().startswith(
+            "https://"
+        ):
             logger.warning("MCP server %s uses an unsupported transport or URL", server.get("id"))
             continue
         server_id = server.get("id")
@@ -94,15 +100,23 @@ async def _load_mcp(ctx: ToolContext) -> list[dict]:
                 logger.info("MCP server %s has no active OAuth connection", server_id)
                 continue
             server["headers"] = {**(server.get("headers") or {}), **oauth_headers}
-        server_id = server.get("id")
-        if expected_credential_versions and (
-            not isinstance(server_id, int)
-            or expected_credential_versions.get(server_id) != credential_versions.get(server_id, 0)
-        ):
-            logger.info("MCP 서버 %s: 실행 중 인증 값이 변경되었거나 폐기됨 — 노출 스킵", server_id)
+        elif expected_credential_versions and expected_credential_versions.get(server_id) != 0:
             continue
         usable.append(server)
-    return _frozen_selection(_selected(usable, ctx.selected_mcp_ids), ctx, "mcp")
+    return usable
+
+
+def _mcp_config_fingerprint(server: dict) -> str:
+    """Freeze execution configuration and consent, excluding secrets and run headers."""
+    from lumen.services import extensions_store as es
+
+    return contracts._v2_config_fingerprint(
+        {
+            "selection": es.selection_fingerprint(server),
+            "effect_overrides": server.get("effect_overrides"),
+            "oauth_scopes": server.get("oauth_scopes"),
+        }
+    )
 
 
 def _mcp_schema(server_id: int, tool: dict) -> dict:
@@ -155,7 +169,14 @@ async def context_tool_schemas(ctx: ToolContext) -> list[dict]:
         from . import bindings
 
         dynamic_bindings = await bindings._legacy_dynamic_bindings(ctx)
-        return [*await tools.tool_schemas(), *(bindings._binding_schema(binding) for binding in dynamic_bindings.values())]
+        return [
+            *await tools.tool_schemas(),
+            *(
+                bindings._binding_schema(binding)
+                for binding in dynamic_bindings.values()
+                if binding.definition.source != "mcp" or binding.definition.effect == "read"
+            ),
+        ]
     schemas = await tools.tool_schemas()
     for name, enabled in (
         (managed._MANAGED_SEARCH_TOOL, ctx.managed_search),
@@ -165,6 +186,8 @@ async def context_tool_schemas(ctx: ToolContext) -> list[dict]:
         if enabled is not None:
             schemas.append(await managed._managed_schema(name))
     for tool_def in await _load_custom(ctx):
+        if tool_def.get("scope") == "domain" and tool_def.get("effect") != "read":
+            continue
         try:
             function = await contracts.custom_tool_function_schema(tool_def, ctx)
         except (PluginError, TypeError, ValueError):
@@ -173,6 +196,7 @@ async def context_tool_schemas(ctx: ToolContext) -> list[dict]:
         schemas.append({"type": "function", "function": function})
     for server in await _load_mcp(ctx):
         server_id = server.get("id")
-        for tool_def in await mcp_client.list_tools(server):
-            schemas.append(_mcp_schema(server_id, tool_def))
+        for tool_def in await mcp_client.list_tools(server, context=contracts.execution_context(ctx)):
+            if contracts._v2_effect((server.get("effect_overrides") or {}).get(tool_def["name"])) == "read":
+                schemas.append(_mcp_schema(server_id, tool_def))
     return schemas

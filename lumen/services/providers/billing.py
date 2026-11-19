@@ -16,19 +16,14 @@ from lumen.crypto import decrypt_llm_provider_billing_admin_key
 from lumen.db import get_session_factory, is_db_available, mark_db_unhealthy
 from lumen.models.chat_db import ChatUsageLog, LlmProvider
 
-from .credentials import resolve_api_key
 from .errors import ChatStorageUnavailable
 
 BillingCapability = Literal[
-    "openrouter_key",
-    "deepseek_balance",
     "openai_admin_usage",
     "anthropic_admin_usage",
 ]
 type BillingPeriods = dict[str, str | None]
 _BILLING_ENDPOINTS: dict[str, str] = {
-    "openrouter_key": "https://openrouter.ai/api/v1/key",
-    "deepseek_balance": "https://api.deepseek.com/user/balance",
     "openai_costs": "https://api.openai.com/v1/organization/costs",
     "openai_usage": "https://api.openai.com/v1/organization/usage/completions",
     "anthropic_costs": "https://api.anthropic.com/v1/organizations/cost_report",
@@ -44,23 +39,7 @@ _PROVIDER_PORTALS: dict[str, tuple[str, str | None]] = {
         "https://console.anthropic.com/settings/usage",
     ),
     "gemini": ("https://aistudio.google.com/billing", "https://aistudio.google.com/usage"),
-    "vertex_ai": ("https://console.cloud.google.com/billing", "https://console.cloud.google.com/vertex-ai"),
-    "azure": (
-        "https://portal.azure.com/#view/Microsoft_Azure_Billing/ModernBillingMenuBlade/~/Overview",
-        "https://portal.azure.com/#view/Microsoft_Azure_CostManagement/Menu/~/overview",
-    ),
-    "bedrock": ("https://console.aws.amazon.com/billing/home", "https://console.aws.amazon.com/costmanagement/home"),
-    "mistral": ("https://console.mistral.ai/billing/", "https://console.mistral.ai/usage/"),
-    "cohere": ("https://dashboard.cohere.com/billing", "https://dashboard.cohere.com/usage"),
-    "groq": ("https://console.groq.com/settings/billing", "https://console.groq.com/settings/usage"),
-    "deepseek": ("https://platform.deepseek.com/top_up", "https://platform.deepseek.com/usage"),
-    "together_ai": (
-        "https://api.together.ai/settings/organization/~current/billing",
-        "https://api.together.ai/settings/organization/~current/usage",
-    ),
-    "openrouter": ("https://openrouter.ai/settings/credits", "https://openrouter.ai/activity"),
     "perplexity": ("https://console.perplexity.ai/", "https://console.perplexity.ai/"),
-    "xai": ("https://console.x.ai/", "https://console.x.ai/"),
 }
 _ZERO_PERIODS = {"daily": "0", "weekly": "0", "monthly": "0", "total": "0"}
 # Anthropic organization usage report token categories, in report order.
@@ -85,8 +64,6 @@ def billing_capability_for(
     if provider_type in {"openai", "anthropic"} and not _is_direct_provider(provider_type, api_base):
         return None
     return {
-        "openrouter": "openrouter_key",
-        "deepseek": "deepseek_balance",
         "openai": "openai_admin_usage",
         "anthropic": "anthropic_admin_usage",
     }.get(provider_type)
@@ -182,56 +159,6 @@ async def _request_json(
         response = await client.get(_BILLING_ENDPOINTS[endpoint], headers=headers, params=params)
         response.raise_for_status()
         return response.json()
-
-
-def _openrouter_snapshot(base: dict, payload: object) -> dict:
-    if not isinstance(payload, dict) or not isinstance(payload.get("data"), dict):
-        raise ValueError("invalid OpenRouter billing response")
-    data = payload["data"]
-
-    def optional(field: str) -> str | None:
-        value = data.get(field)
-        return None if value is None else _decimal_string(value, field=field)
-
-    return {
-        **base,
-        "status": "available",
-        "reason": None,
-        "is_free_tier": bool(data.get("is_free_tier")) if data.get("is_free_tier") is not None else None,
-        "limit": optional("limit"),
-        "remaining": optional("limit_remaining"),
-        "usage_total": optional("usage"),
-        "usage_daily": optional("usage_daily"),
-        "usage_weekly": optional("usage_weekly"),
-        "usage_monthly": optional("usage_monthly"),
-    }
-
-
-def _deepseek_snapshot(base: dict, payload: object) -> dict:
-    if not isinstance(payload, dict) or not isinstance(payload.get("balance_infos"), list):
-        raise ValueError("invalid DeepSeek billing response")
-    balances = []
-    for entry in payload["balance_infos"][:10]:
-        if not isinstance(entry, dict):
-            raise ValueError("invalid DeepSeek balance entry")
-        currency = entry.get("currency")
-        if not isinstance(currency, str) or not currency or len(currency) > 12:
-            raise ValueError("invalid DeepSeek balance currency")
-        balances.append(
-            {
-                "currency": currency,
-                "total": _decimal_string(entry.get("total_balance"), field="total_balance"),
-                "granted": _decimal_string(entry.get("granted_balance"), field="granted_balance"),
-                "purchased": _decimal_string(entry.get("topped_up_balance"), field="topped_up_balance"),
-            }
-        )
-    return {
-        **base,
-        "status": "available",
-        "reason": None,
-        "is_available": bool(payload.get("is_available")),
-        "balances": balances,
-    }
 
 
 def _period_starts(now: datetime) -> dict[str, datetime]:
@@ -590,36 +517,14 @@ async def _provider_snapshot(provider: LlmProvider, local_usage: dict | None) ->
     base = _base(provider, capability, local_usage)
     if capability is None:
         return base
-    if capability in {"openai_admin_usage", "anthropic_admin_usage"}:
-        encrypted_admin_key = getattr(provider, "encrypted_billing_admin_key", None)
-        if not encrypted_admin_key:
-            return {**base, "reason": "admin_credential_not_configured"}
-        try:
-            admin_key = decrypt_llm_provider_billing_admin_key(encrypted_admin_key)
-        except Exception:
-            return {**base, "reason": "admin_credential_unavailable"}
-        return await _organization_usage_snapshot(base, capability, admin_key, datetime.now(UTC))
-
+    encrypted_admin_key = getattr(provider, "encrypted_billing_admin_key", None)
+    if not encrypted_admin_key:
+        return {**base, "reason": "admin_credential_not_configured"}
     try:
-        api_key = resolve_api_key(provider)
+        admin_key = decrypt_llm_provider_billing_admin_key(encrypted_admin_key)
     except Exception:
-        return {**base, "reason": "credential_unavailable"}
-    if not api_key:
-        return {**base, "reason": "credential_not_configured"}
-    try:
-        payload = await _request_json(capability, api_key)
-        if capability == "openrouter_key":
-            return _openrouter_snapshot(base, payload)
-        return _deepseek_snapshot(base, payload)
-    except httpx.HTTPStatusError as exc:
-        reason = (
-            "provider_authorization_failed" if exc.response.status_code in {401, 403} else "provider_request_failed"
-        )
-        return {**base, "reason": reason}
-    except (httpx.RequestError, ValueError, TypeError, KeyError):
-        return {**base, "reason": "provider_unavailable"}
-    except Exception:
-        return {**base, "reason": "provider_unavailable"}
+        return {**base, "reason": "admin_credential_unavailable"}
+    return await _organization_usage_snapshot(base, capability, admin_key, datetime.now(UTC))
 
 
 async def list_provider_billing() -> list[dict]:

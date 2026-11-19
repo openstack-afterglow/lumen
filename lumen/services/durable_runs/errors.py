@@ -5,12 +5,24 @@ class DurableRunError(RuntimeError):
     pass
 
 
+class DurableRunEventValidationError(RuntimeError):
+    """A server-authored journal event failed its canonical contract."""
+
+
 class DurableRunProtocolMismatch(DurableRunError):
     """A queued payload cannot safely be interpreted by this worker."""
 
 
 class DurableRunInputError(DurableRunError):
     pass
+
+
+class MediaModelAmbiguous(DurableRunInputError):
+    """A legacy model selector matched several media routes."""
+
+
+class RealtimeKindMismatch(DurableRunInputError):
+    """A realtime model was requested on an endpoint that serves a different realtime kind."""
 
 
 class DurableRunLeaseLost(DurableRunError):

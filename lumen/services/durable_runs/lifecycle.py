@@ -6,6 +6,7 @@ from sqlalchemy import delete, select, update
 
 from lumen.models.chat_agent_platform import ChatRunInteraction
 from lumen.models.chat_contracts import ChatRunResponse
+from lumen.models.chat_infrastructure import ChatWorkerRegistration
 from lumen.models.chat_runs import (
     ChatRun,
     ChatRunEventRow,
@@ -14,6 +15,7 @@ from lumen.models.chat_runs import (
     ChatTempThread,
     ChatToolApproval,
 )
+from lumen.services import credit, worker_routing
 from lumen.services.run_protocol_v2 import transition_allowed
 from lumen.services.run_store import (
     NONTERMINAL,
@@ -27,6 +29,21 @@ from lumen.services.run_store import (
 
 from .common import _LEASE_SECONDS, _event, _factory, _now
 from .errors import DurableRunConflict, DurableRunLeaseLost, DurableRunNotFound
+
+# One fenced provider call per run; its hold is keyed by segment "{run_kind}:1".
+_SINGLE_CALL_KINDS = frozenset({"image", "tts", "stt", "realtime", "api_completion"})
+
+
+async def _retain_unsettled_call_hold(session, run: ChatRun) -> None:
+    """A queued run canceled with an unsettled hold keeps it as ``unknown``; never released."""
+    from lumen.models.chat_runs import ChatModelCallReservation
+
+    reservation = (await session.execute(select(ChatModelCallReservation).where(
+        ChatModelCallReservation.run_id == run.id, ChatModelCallReservation.segment_id == f"{run.run_kind}:1",
+    ).with_for_update().execution_options(populate_existing=True))).scalar_one_or_none()
+    if reservation is not None and reservation.status == "reserved":
+        reservation.status = "unknown"
+        reservation.settled_at = _now()
 
 
 def _require_owned_running_lease(run: ChatRun, owner: str) -> None:
@@ -111,10 +128,15 @@ async def _request_cancelled_transaction(
     factory = _factory()
     wake_parent: str | None = None
     async with factory() as session, session.begin():
+        await worker_routing.use_read_committed(session)
         try:
             identity = await load_owned_run(session, run_id, user_id=user_id, project_id=project_id, lock=False)
         except RunStoreError as exc:
             raise DurableRunNotFound(str(exc)) from exc
+        payer = credit.run_payer(identity)
+        if payer.domain_id is not None:
+            await credit.lock_payer(session, payer, user_id=identity.user_id,
+                                    project_id=identity.project_id, api_key_id=identity.api_key_id)
         # Root cancellation is a barrier committed under the global lock order before any further
         # child dispatch; a child cancels itself only after its lineage is locked root-first.
         order = budgets.LockOrder()
@@ -124,7 +146,10 @@ async def _request_cancelled_transaction(
         ).scalar_one_or_none() is not None
         quota = None
         root = None
-        if is_child or has_children or identity.execution_mode == "code" or identity.credit_ceiling is not None:
+        if (
+            is_child or has_children or identity.execution_mode == "code" or identity.credit_ceiling is not None
+            or getattr(identity, "assigned_resource_id", None) is not None
+        ):
             quota = await budgets.lock_project_quota(session, identity.project_id, order=order)
         if is_child:
             _quota, root, _ancestors = await children._lock_lineage(session, identity, order, quota=quota)
@@ -132,9 +157,15 @@ async def _request_cancelled_transaction(
         else:
             run = await budgets.lock_run(session, run_id, order=order, lock_class="root")
             root = run
-        if run.status in NONTERMINAL and run.cancel_requested_at is None:
+        # Recovery requeues collected single-call results solely for settlement. Cancelling
+        # them must not strand a billable checkpoint or turn its known hold into unknown.
+        settlement_only = (
+            run.status == "queued" and run.run_kind in _SINGLE_CALL_KINDS
+            and await worker_routing.has_provider_checkpoint(session, run.id)
+        )
+        if run.status in NONTERMINAL and run.cancel_requested_at is None and not settlement_only:
             run.cancel_requested_at = _now()
-        immediate = (run.execution_protocol_version == 2 or run.run_kind in {"image", "tts", "stt", "realtime"}) and run.status in {
+        immediate = not settlement_only and (run.execution_protocol_version == 2 or run.run_kind in _SINGLE_CALL_KINDS) and run.status in {
             "awaiting_input",
             "queued",
             "waiting_children",
@@ -187,6 +218,8 @@ async def _request_cancelled_transaction(
                 )
             if not transition_allowed(run.status, "finalizing", cancel_or_failure=True):
                 raise DurableRunConflict("cancellation cannot finalize this run")
+            if run.run_kind in _SINGLE_CALL_KINDS:
+                await _retain_unsettled_call_hold(session, run)
             run.status = "finalizing"
             await append_event(session, run, _event(run, "run.stage.changed", {"stage": "finalizing"}))
             message_id = await _cancel_streaming_assistant_message(session, run)
@@ -235,11 +268,15 @@ async def _request_cancelled_transaction(
                 ),
                 release_resource=not has_children,
             )
-        if immediate and not is_child and run.execution_mode == "code":
+        if immediate and not is_child and (run.execution_mode == "code" or getattr(run, "assigned_resource_id", None) is not None):
             await budgets.settle_root_sandbox(session, quota=quota, root=run, order=order)
         if immediate and not is_child and quota is not None:
             await budgets.close_root_budget(session, quota=quota, root=run, order=order)
-        release_self = immediate and ((not is_child and run.execution_mode == "code") or (is_child and has_children))
+        # Ordinary chat can retain a ready MCP sandbox while paused for another approval.
+        release_self = immediate and (
+            (not is_child and (run.execution_mode == "code" or getattr(run, "assigned_resource_id", None) is not None))
+            or (is_child and has_children)
+        )
         if finalized or release_self:
             from lumen.services.infrastructure import store as infra_store
 
@@ -268,21 +305,31 @@ async def _cancel_requested(run_id: str) -> bool:
 
 
 
-async def fail_waiting_run(run_id: str, *, error_code: str, safe_message: str) -> bool:
+async def fail_waiting_run(
+    run_id: str, *, error_code: str, safe_message: str, require_unstarted: bool = False,
+) -> bool:
     """Fail a run parked in ``waiting_resource``/``queued`` without a worker lease.
 
     Used by the resource controller when provisioning fails or the deadline passes.
     Lineage locks are taken in the global order so child reservations settle exactly once;
     running runs are left to their lease owner's cancellation path.
+    Resource expiry can require an unclaimed run (lease_fence == 0), so a queued
+    parent resuming orchestration after a child join is not failed by Pod expiry.
     """
     from . import budgets, children
 
     async def transaction() -> tuple[bool, str | None]:
         order = budgets.LockOrder()
         async with _factory()() as session, session.begin():
+            await worker_routing.use_read_committed(session)
             identity = (await session.execute(select(ChatRun).where(ChatRun.id == run_id))).scalar_one_or_none()
-            if identity is None or identity.status not in {"waiting_resource", "queued"}:
+            if (identity is None or identity.status not in {"waiting_resource", "queued"}
+                    or (require_unstarted and int(identity.lease_fence or 0) != 0)):
                 return False, None
+            payer = credit.run_payer(identity)
+            if payer.domain_id is not None:
+                await credit.lock_payer(session, payer, user_id=identity.user_id,
+                                        project_id=identity.project_id, api_key_id=identity.api_key_id)
             quota = None
             root = None
             has_children = (
@@ -292,11 +339,15 @@ async def fail_waiting_run(run_id: str, *, error_code: str, safe_message: str) -
                 quota, root, _ancestors = await children._lock_lineage(session, identity, order)
                 run = await budgets.lock_run(session, run_id, order=order, lock_class="child")
             else:
-                if has_children or identity.execution_mode == "code" or identity.credit_ceiling is not None:
+                if (
+                    has_children or identity.execution_mode == "code" or identity.credit_ceiling is not None
+                    or getattr(identity, "assigned_resource_id", None) is not None
+                ):
                     quota = await budgets.lock_project_quota(session, identity.project_id, order=order)
                 run = await budgets.lock_run(session, run_id, order=order, lock_class="root")
                 root = run
-            if run.status not in {"waiting_resource", "queued"}:
+            if (run.status not in {"waiting_resource", "queued"}
+                    or (require_unstarted and int(run.lease_fence or 0) != 0)):
                 return False, None
             if not transition_allowed(run.status, "finalizing", cancel_or_failure=True):
                 raise DurableRunConflict("waiting run cannot be finalized")
@@ -326,11 +377,11 @@ async def fail_waiting_run(run_id: str, *, error_code: str, safe_message: str) -
                     result=children.child_result_payload(status="failed", error_code=error_code, summary="", artifacts=[]),
                     release_resource=not has_children,
                 )
-            elif run.execution_mode == "code":
+            elif run.execution_mode == "code" or getattr(run, "assigned_resource_id", None) is not None:
                 await budgets.settle_root_sandbox(session, quota=quota, root=run, order=order)
             if run.parent_run_id is None and quota is not None:
                 await budgets.close_root_budget(session, quota=quota, root=run, order=order)
-            release_self = (run.parent_run_id is None and run.execution_mode == "code") or (run.parent_run_id is not None and has_children)
+            release_self = (run.parent_run_id is None and (run.execution_mode == "code" or getattr(run, "assigned_resource_id", None) is not None)) or (run.parent_run_id is not None and has_children)
             if finalized or release_self:
                 from lumen.services.infrastructure import store as infra_store
 
@@ -346,8 +397,13 @@ async def fail_waiting_run(run_id: str, *, error_code: str, safe_message: str) -
         await wake_run(wake)
     return finalized
 
-async def recover_stale_runs(*, owner: str, limit: int = 16) -> list[str]:
-    """Requeue pre-I/O and completed work; indeterminate provider calls fail closed."""
+async def recover_stale_runs(*, owner: str, registration_id: str, limit: int = 16) -> list[str]:
+    """Requeue pre-I/O and completed work; indeterminate provider calls fail closed.
+
+    Any worker may reconcile any expired lease (DB-only, no provider I/O). Only requeued
+    runs this registration may itself claim are returned for launch; others remain
+    queued for their own class/pool.
+    """
     from .execution import _finish
 
     factory = _factory()
@@ -355,6 +411,7 @@ async def recover_stale_runs(*, owner: str, limit: int = 16) -> list[str]:
     failed_run_ids: list[str] = []
     requeued_run_ids: list[str] = []
     async with factory() as session, session.begin():
+        registration = await session.get(ChatWorkerRegistration, registration_id)
         stale_runs = (
             (
                 await session.execute(
@@ -395,7 +452,9 @@ async def recover_stale_runs(*, owner: str, limit: int = 16) -> list[str]:
             run.status = "queued"
             run.lease_owner = None
             run.lease_expires_at = None
-            requeued_run_ids.append(run.id)
+            run.worker_registration_id = None
+            if registration is not None and worker_routing.run_matches_registration(run, registration):
+                requeued_run_ids.append(run.id)
     for run_id, fenced in failed_run_ids:
         await _finish(
             run_id,
@@ -411,4 +470,5 @@ async def recover_stale_runs(*, owner: str, limit: int = 16) -> list[str]:
 async def _renew_lease(run_id: str, owner: str) -> bool:
     factory = _factory()
     async with factory() as session, session.begin():
+        await worker_routing.use_read_committed(session)
         return await renew_run_lease(session, run_id, owner=owner) is not None

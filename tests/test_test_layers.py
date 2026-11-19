@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-from lumen.scripts.test_layers import run_contract, run_integration, run_system
+import pytest
+
+from lumen.scripts.test_layers import _compose_env, run_contract, run_integration, run_system
 
 
 @patch("subprocess.run")
@@ -54,7 +56,7 @@ def test_run_integration_success(mock_run: MagicMock) -> None:
         "mariadb",
         "redis",
     ]
-    assert calls[1][0][0] == ["lumen-migrate", "--apply"]
+    assert calls[1][0][0][:2] == ["lumen-migrate", "--apply"]
     assert calls[2][0][0] == ["pytest", "-m", "integration", "tests"]
     assert calls[3][0][0] == [
         "docker",
@@ -70,6 +72,15 @@ def test_run_integration_success(mock_run: MagicMock) -> None:
     projects = {call.kwargs["env"]["COMPOSE_PROJECT_NAME"] for call in calls}
     assert len(projects) == 1
     assert next(iter(projects)).startswith("lumen-integration-")
+
+
+@pytest.mark.parametrize("target", ["LUMEN_TEST_COMPOSE_PROJECT", "LUMEN_TEST_DATABASE_URL", "LUMEN_TEST_REDIS_URL"])
+def test_production_schema_never_touches_an_external_target(monkeypatch, capsys, target):
+    monkeypatch.setenv(target, "external-target")
+    with patch("subprocess.run") as run:
+        assert run_integration(production_schema=True) == 2
+    run.assert_not_called()
+    assert "requires an owned, disposable Compose stack" in capsys.readouterr().err
 
 
 @patch("subprocess.run")
@@ -117,9 +128,10 @@ def test_run_system_success(mock_run: MagicMock) -> None:
         "-d",
         "--wait",
         "--wait-timeout",
-        "180",
+        "600",
         "lumen-api",
         "lumen-worker",
+        "lumen-batch-worker",
     ]
     assert calls[2][0][0] == [*compose, "run", "--rm", "--no-deps", "system-tests"]
     assert calls[3][0][0] == [*compose, "down", "-v", "--remove-orphans", "--timeout", "1"]
@@ -154,3 +166,12 @@ def test_run_system_logs_and_cleanup_on_failure(mock_run: MagicMock) -> None:
         "--timeout",
         "1",
     ]
+
+
+def test_layers_never_inherit_manual_cloud_runtime_profile(monkeypatch):
+    monkeypatch.setenv("COMPOSE_PROFILES", "agent-runtime")
+    monkeypatch.setenv("RUNTIME_CONFIG", '{"enabled":true}')
+    for layer in ("integration", "system"):
+        environment = _compose_env(layer)
+        assert environment["COMPOSE_PROFILES"] == ""
+        assert environment["RUNTIME_CONFIG"] == '{"enabled":false}'

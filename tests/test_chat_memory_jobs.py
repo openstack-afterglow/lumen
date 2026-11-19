@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -10,6 +12,13 @@ from lumen.services import memory_jobs as jobs
 from lumen.services import title_jobs
 
 pytestmark = pytest.mark.asyncio
+# These tests replace the committed claim and exercise only post-claim behavior.
+# Actual registration gates and finish-inflight behavior are integration-tested.
+
+@pytest.fixture(autouse=True)
+def current_vault_scope(monkeypatch):
+    monkeypatch.setattr(jobs, "revalidate", AsyncMock())
+
 
 
 class _Result:
@@ -39,6 +48,9 @@ def _run(**overrides):
         "run_scope": "persistent",
         "parent_run_id": None,
         "conversation_id": "conversation-1",
+        "source": "web",
+        "api_key_id": None,
+        "capability_snapshot": {"vault_domain_id": "domain-1", "vault_ingress_verified": True},
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -66,6 +78,9 @@ async def test_enqueue_completed_run_uses_one_idempotency_key():
         (_run(run_scope="temp"), True),
         (_run(parent_run_id="parent-run"), True),
         (_run(conversation_id=None), True),
+        (_run(api_key_id=7), True),
+        (_run(capability_snapshot={}), True),
+        (_run(capability_snapshot={"vault_domain_id": "domain-1"}), True),
         (_run(), False),
     ],
 )
@@ -82,7 +97,7 @@ async def test_process_one_applies_small_model_deltas_and_completes_atomically(m
 
     async def fake_claim(*, owner):
         assert owner == "worker-1"
-        return "job-1", "run-1", "conversation-1", "project-1", "user-1"
+        return "job-1", "run-1", "conversation-1", "project-1", "user-1", "domain-1"
 
     async def fake_extract(**kwargs):
         assert kwargs == {
@@ -90,6 +105,7 @@ async def test_process_one_applies_small_model_deltas_and_completes_atomically(m
             "project_id": "project-1",
             "run_id": "run-1",
             "user_id": "user-1",
+            "domain_id": "domain-1",
         }
         return [{"op": "add", "category": "preference", "content": "다크 모드 선호"}]
 
@@ -101,12 +117,13 @@ async def test_process_one_applies_small_model_deltas_and_completes_atomically(m
     monkeypatch.setattr(jobs, "generate_memory_if_applicable", fake_extract)
     monkeypatch.setattr(jobs, "_apply_and_complete", fake_apply_and_complete)
 
-    assert await jobs.process_one(owner="worker-1") is True
+    assert await jobs.process_one.__wrapped__(owner="worker-1") is True
     assert completed == {
         "job_id": "job-1",
         "owner": "worker-1",
         "project_id": "project-1",
         "user_id": "user-1",
+        "domain_id": "domain-1",
         "ops": [{"op": "add", "category": "preference", "content": "다크 모드 선호"}],
     }
 
@@ -115,7 +132,7 @@ async def test_process_one_does_not_retry_when_another_worker_owns_the_lease(mon
     retried = []
 
     async def fake_claim(*, owner):
-        return "job-1", "run-1", "conversation-1", "project-1", "user-1"
+        return "job-1", "run-1", "conversation-1", "project-1", "user-1", "domain-1"
 
     async def fake_extract(**_kwargs):
         return []
@@ -131,7 +148,7 @@ async def test_process_one_does_not_retry_when_another_worker_owns_the_lease(mon
     monkeypatch.setattr(jobs, "_apply_and_complete", fake_apply_and_complete)
     monkeypatch.setattr(jobs, "_retry", fake_retry)
 
-    assert await jobs.process_one(owner="worker-1") is True
+    assert await jobs.process_one.__wrapped__(owner="worker-1") is True
     assert retried == []
 
 
@@ -139,7 +156,7 @@ async def test_process_one_retries_transient_extraction_failure(monkeypatch):
     retried = {}
 
     async def fake_claim(*, owner):
-        return "job-1", "run-1", "conversation-1", "project-1", "user-1"
+        return "job-1", "run-1", "conversation-1", "project-1", "user-1", "domain-1"
 
     async def fake_extract(**_kwargs):
         raise RuntimeError("provider unavailable")
@@ -151,7 +168,7 @@ async def test_process_one_retries_transient_extraction_failure(monkeypatch):
     monkeypatch.setattr(jobs, "generate_memory_if_applicable", fake_extract)
     monkeypatch.setattr(jobs, "_retry", fake_retry)
 
-    assert await jobs.process_one(owner="worker-1") is True
+    assert await jobs.process_one.__wrapped__(owner="worker-1") is True
     assert retried == {"job_id": "job-1", "owner": "worker-1"}
 
 
@@ -159,7 +176,7 @@ async def test_process_one_retries_post_apply_failure(monkeypatch):
     retried = {}
 
     async def fake_claim(*, owner):
-        return "job-1", "run-1", "conversation-1", "project-1", "user-1"
+        return "job-1", "run-1", "conversation-1", "project-1", "user-1", "domain-1"
 
     async def fake_extract(**_kwargs):
         return [{"op": "add", "category": "preference", "content": "다크 모드 선호"}]
@@ -175,7 +192,7 @@ async def test_process_one_retries_post_apply_failure(monkeypatch):
     monkeypatch.setattr(jobs, "_apply_and_complete", failing_apply_and_complete)
     monkeypatch.setattr(jobs, "_retry", fake_retry)
 
-    assert await jobs.process_one(owner="worker-1") is True
+    assert await jobs.process_one.__wrapped__(owner="worker-1") is True
     assert retried == {"job_id": "job-1", "owner": "worker-1"}
 
 
@@ -234,6 +251,7 @@ async def test_post_apply_crash_rolls_back_the_memory_and_completion_transaction
             owner="worker-1",
             project_id="project-1",
             user_id="user-1",
+            domain_id="domain-1",
             ops=[{"op": "add", "category": "preference", "content": "다크 모드 선호"}],
         )
 
@@ -258,7 +276,7 @@ async def test_title_provider_started_expiry_never_replays_provider(monkeypatch)
     monkeypatch.setattr(title_jobs, "_claim_one", fake_claim)
     monkeypatch.setattr(title_jobs.title_summary, "generate_title", forbidden_generate)
 
-    assert await title_jobs.process_one(owner="worker-1") is True
+    assert await title_jobs.process_one.__wrapped__(owner="worker-1") is True
     assert calls == []
 
 
@@ -293,11 +311,40 @@ async def test_title_completed_result_replays_without_provider(monkeypatch):
     monkeypatch.setattr(title_jobs, "_apply_result", fake_apply)
     monkeypatch.setattr(title_jobs.title_summary, "generate_title", forbidden_generate)
 
-    assert await title_jobs.process_one(owner="worker-1") is True
+    assert await title_jobs.process_one.__wrapped__(owner="worker-1") is True
     assert applied == ["job-1"]
 
 
-async def test_title_late_result_on_custom_route_does_not_bill_public_catalog(monkeypatch):
+@pytest.mark.parametrize(
+    ("frozen_prices", "prompt_tokens", "cache_tokens", "raw_cost", "pricing_status"),
+    [
+        ({"input_price_per_token": None, "output_price_per_token": None}, 3, 0, Decimal("0"), "unpriced"),
+        ({
+            "input_price_per_token": "0.000001",
+            "output_price_per_token": "0.000002",
+            "input_price_per_token_above_200k": "0.000003",
+            "output_price_per_token_above_200k": "0.000004",
+            "cache_read_price_per_token": "0.000005",
+            "cache_read_price_per_token_above_200k": "0.000006",
+            "cache_price_sources": {"cache_read": "native_catalog"},
+            "long_context_threshold_tokens": 272_000,
+        }, 272_000, 10, Decimal("0.272044"), "priced"),
+        ({
+            "input_price_per_token": "0.000001",
+            "output_price_per_token": "0.000002",
+            "input_price_per_token_above_200k": "0.000003",
+            "output_price_per_token_above_200k": "0.000004",
+            "cache_read_price_per_token": "0.000005",
+            "cache_read_price_per_token_above_200k": "0.000006",
+            "cache_price_sources": {"cache_read": "native_catalog"},
+            "long_context_threshold_tokens": 272_000,
+        }, 272_001, 10, Decimal("0.816041"), "priced"),
+    ],
+    ids=["legacy-unpriced", "frozen-threshold-boundary", "frozen-long-context-tier"],
+)
+async def test_title_late_result_on_custom_route_does_not_bill_public_catalog(
+    monkeypatch, frozen_prices, prompt_tokens, cache_tokens, raw_cost, pricing_status,
+):
     payload = {
         "conversation_id": "conversation-1",
         "project_id": "project-1",
@@ -306,9 +353,9 @@ async def test_title_late_result_on_custom_route_does_not_bill_public_catalog(mo
         "expected_title_revision": 1,
         "summary_route": {"model_name": "gemini/gemini-2.5-flash-lite", "provider_name": "private-provider",
                           "provider_type": "gemini", "api_base": "https://custom.example/v1"},
-        "pricing_snapshot": {"input_price_per_token": None, "output_price_per_token": None, "margin_multiplier": "1"},
-        "result": {"title": "오래된 제목", "prompt_tokens": 3, "completion_tokens": 2,
-                   "model_name": "gemini/gemini-2.5-flash-lite"},
+        "pricing_snapshot": {**frozen_prices, "margin_multiplier": "1"},
+        "result": {"title": "오래된 제목", "prompt_tokens": prompt_tokens, "completion_tokens": 2,
+                   "cache_read_input_tokens": cache_tokens, "model_name": "gemini/gemini-2.5-flash-lite"},
     }
 
     class Session:
@@ -356,10 +403,15 @@ async def test_title_late_result_on_custom_route_does_not_bill_public_catalog(mo
     async def fake_apply_usage(_session, **kwargs):
         usage.append(kwargs["event_id"])
         usage_cost = kwargs["usage_cost"]
-        assert usage_cost.raw_cost == 0
-        assert usage_cost.pricing_status == "unpriced"
+        assert usage_cost.raw_cost == raw_cost
+        assert usage_cost.pricing_status == pricing_status
         return 0
 
+    def forbid_catalog(*_args, **_kwargs):
+        raise AssertionError("title settlement must not read the catalog")
+
+    monkeypatch.setattr(title_jobs.provider_metadata, "native_catalog_entry", forbid_catalog)
+    monkeypatch.setattr(title_jobs.provider_metadata, "bundled_cache_rates", forbid_catalog)
     monkeypatch.setattr(title_jobs.credit, "apply_usage_in_transaction", fake_apply_usage)
     assert (
         await title_jobs._apply_result({"job_id": "job-1", "owner": "worker-1", "payload": payload, "replay": True})
@@ -418,6 +470,6 @@ async def test_title_apply_failure_requeues_stored_result_without_provider_retry
     monkeypatch.setattr(title_jobs, "_apply_result", failing_apply)
     monkeypatch.setattr(title_jobs, "_requeue_stored_result", fake_requeue)
 
-    assert await title_jobs.process_one(owner="worker-1") is True
+    assert await title_jobs.process_one.__wrapped__(owner="worker-1") is True
     assert provider_calls == [True]
     assert requeued == [("job-1", "worker-1")]

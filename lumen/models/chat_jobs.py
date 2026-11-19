@@ -38,7 +38,10 @@ class ChatJob(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
 
-    __table_args__ = (Index("idx_chat_jobs_claim", "status", "next_at"),)
+    __table_args__ = (
+        Index("idx_chat_jobs_claim", "status", "next_at"),
+        Index("idx_chat_jobs_owner_lease", "lease_owner", "status", "lease_expires_at"),
+    )
 
 
 class ChatInputDerivation(Base):
@@ -98,7 +101,8 @@ class ChatMemoryOutbox(Base):
 
     change_seq: Mapped[int] = mapped_column(BIGINT, primary_key=True, autoincrement=True)
     event_key: Mapped[str] = mapped_column(VARCHAR(190), nullable=False, unique=True)
-    memory_id: Mapped[int] = mapped_column(BIGINT, ForeignKey("chat_memories.id", ondelete="RESTRICT"), nullable=False)
+    memory_id: Mapped[int | None] = mapped_column(BIGINT, ForeignKey("chat_memories.id", ondelete="RESTRICT"))
+    vault_note_id: Mapped[int | None] = mapped_column(BIGINT, ForeignKey("memory_vault_notes.id"))
     mutation: Mapped[str] = mapped_column(VARCHAR(20), nullable=False)
     content_hash: Mapped[str] = mapped_column(CHAR(64), nullable=False)
     required_generations: Mapped[list] = mapped_column(JSON, nullable=False)
@@ -111,4 +115,7 @@ class ChatMemoryOutbox(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
 
-    __table_args__ = (Index("idx_chat_memory_outbox_claim", "status", "change_seq"),)
+    __table_args__ = (
+        Index("idx_chat_memory_outbox_claim", "status", "change_seq"),
+        Index("idx_chat_memory_outbox_owner_lease", "lease_owner", "status", "lease_expires_at"),
+    )

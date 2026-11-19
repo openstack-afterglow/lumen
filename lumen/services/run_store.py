@@ -3,17 +3,111 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from sqlalchemy import Select, select
+from cryptography.exceptions import InvalidTag
+from sqlalchemy import Select, and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from lumen.crypto import decrypt_chat_content, encrypt_chat_content
 from lumen.models.chat_contracts import ChatRunEvent, validate_chat_run_event
-from lumen.models.chat_infrastructure import ChatRuntimeResource, ChatWorkerRegistration
 from lumen.models.chat_runs import ChatRun, ChatRunEventRow, ChatRunSegment
+from lumen.services import worker_routing
+
+logger = logging.getLogger(__name__)
+
+_PUBLIC_ACTIVITY_TYPES = frozenset({
+    "run.started", "run.stage.changed", "context.updated", "part.completed",
+    "tool.call.started", "tool.call.progress", "tool.call.completed", "tool.approval_required", "tool.approval_resolved",
+    "child.created", "child.completed", "run.completed", "run.failed", "run.canceled",
+})
+_MAX_PUBLIC_ACTIVITY_EVENTS = 1024
+_MAX_PUBLIC_ACTIVITY_CIPHERTEXT = 8 * 1024 * 1024
+
+
+@dataclass
+class PublicActivityRead:
+    events: list[ChatRunEvent] = field(default_factory=list)
+    unavailable_code: str | None = None
+
+
+async def read_public_activity_events(
+    session: AsyncSession, run_ids: list[str],
+) -> dict[str, PublicActivityRead]:
+    """Read bounded public history for already-authorized runs, never text-token replay.
+
+    Completed user-visible reasoning is the durable summary boundary. Delta events
+    are intentionally not selected, decrypted or treated as completed reasoning.
+    """
+    results = {run_id: PublicActivityRead() for run_id in run_ids}
+    if not results:
+        return results
+    # Bound each run in SQL, including one sentinel row proving an exceeded limit.
+    ranked = select(
+        ChatRunEventRow.run_id, ChatRunEventRow.seq,
+        func.row_number().over(
+            partition_by=ChatRunEventRow.run_id, order_by=ChatRunEventRow.seq,
+        ).label("activity_ordinal"),
+    ).where(
+        ChatRunEventRow.run_id.in_(run_ids), ChatRunEventRow.event_type.in_(_PUBLIC_ACTIVITY_TYPES),
+    ).subquery()
+    statement = select(ChatRunEventRow).join(ranked, and_(
+        ChatRunEventRow.run_id == ranked.c.run_id, ChatRunEventRow.seq == ranked.c.seq,
+    )).where(
+        ranked.c.activity_ordinal <= _MAX_PUBLIC_ACTIVITY_EVENTS + 1,
+    ).order_by(ChatRunEventRow.run_id, ChatRunEventRow.seq).execution_options(yield_per=64)
+    counts: dict[str, int] = {}
+    sizes: dict[str, int] = {}
+    tools_by_run: dict[str, dict[str, tuple[str, bool]]] = {}
+    rows = await session.stream_scalars(statement)
+    try:
+        async for row in rows:
+            result = results[row.run_id]
+            if result.unavailable_code is not None:
+                continue
+            counts[row.run_id] = counts.get(row.run_id, 0) + 1
+            sizes[row.run_id] = sizes.get(row.run_id, 0) + len(row.payload)
+            if counts[row.run_id] > _MAX_PUBLIC_ACTIVITY_EVENTS or sizes[row.run_id] > _MAX_PUBLIC_ACTIVITY_CIPHERTEXT:
+                result.events.clear()
+                result.unavailable_code = "history_activity_limit"
+                logger.warning("Public activity unavailable: run=%s reason=limit", row.run_id)
+                continue
+            try:
+                payload = _normalize_replayed_payload(row, json.loads(decrypt_chat_content(row.payload)))
+                if row.event_type == "part.completed":
+                    if not isinstance(payload, dict) or not isinstance(payload.get("part"), dict):
+                        raise ValueError("invalid completed activity part")
+                    part = payload["part"]
+                    if part.get("type") != "reasoning" or part.get("visibility") != "user":
+                        continue
+                event = validate_chat_run_event({
+                    "event_id": f"{row.run_id}:{row.seq}", "run_id": row.run_id, "seq": row.seq,
+                    "type": row.event_type, "created_at": _as_utc(row.created_at).isoformat(), "payload": payload,
+                })
+                if event.type == "tool.call.started":
+                    tools_by_run.setdefault(row.run_id, {})[event.payload.call_id] = (event.payload.name, True)
+                elif event.type == "tool.call.progress":
+                    tool = tools_by_run.get(row.run_id, {}).get(event.payload.call_id)
+                    if tool != (event.payload.name, True):
+                        raise ValueError("tool progress has no active matching call")
+                elif event.type == "tool.call.completed":
+                    tools_by_run.setdefault(row.run_id, {})[event.payload.call_id] = (event.payload.name, False)
+                result.events.append(event)
+            except (ValueError, TypeError, InvalidTag):
+                # Never log raw validation/decryption errors: they may include private payloads.
+                result.events.clear()
+                result.unavailable_code = "history_activity_invalid"
+                logger.warning("Public activity unavailable: run=%s reason=invalid", row.run_id)
+    finally:
+        await rows.close()
+    for result in results.values():
+        if not result.events and result.unavailable_code is None:
+            result.unavailable_code = "history_activity_missing"
+    return results
 
 
 class RunStoreError(RuntimeError):
@@ -143,36 +237,16 @@ def fenced_owner(owner: str, fence: int) -> str:
     return f"{owner}#{fence}"
 
 
-async def claim_queued_run(
-    session: AsyncSession, run_id: str, *, owner: str, lease_seconds: int = 45,
-    registration_id: str | None = None,
-) -> ChatRun | None:
-    run = (await session.execute(select(ChatRun).where(ChatRun.id == run_id).with_for_update())).scalar_one_or_none()
+async def _lock_queued_run(session: AsyncSession, run_id: str) -> ChatRun | None:
+    run = (await session.execute(
+        select(ChatRun).where(ChatRun.id == run_id).with_for_update().execution_options(populate_existing=True)
+    )).scalar_one_or_none()
     if run is None or run.status != "queued" or run.cancel_requested_at is not None:
         return None
-    if registration_id is not None:
-        registration = (await session.execute(select(ChatWorkerRegistration).where(
-            ChatWorkerRegistration.id == registration_id,
-            ChatWorkerRegistration.worker_identity == owner,
-        ).with_for_update())).scalar_one_or_none()
-        now = datetime.now(UTC)
-        if (registration is None or registration.draining or not registration.accepting
-                or _as_utc(registration.heartbeat_at) < now - timedelta(seconds=20)
-                or run.execution_protocol_version not in registration.protocol_versions
-                or (run.required_plugin_digest is not None
-                    and run.required_plugin_digest != registration.plugin_digest)):
-            return None
-        if registration.resource_id is not None:
-            resource = (await session.execute(select(ChatRuntimeResource).where(
-                ChatRuntimeResource.id == registration.resource_id))).scalar_one_or_none()
-            if (resource is None or resource.role != "worker" or resource.observed_state != "ready"
-                    or resource.desired_state == "deleting" or resource.pool_id != registration.pool_id
-                    or resource.generation != registration.resource_generation
-                    or resource.certificate_fingerprint != registration.certificate_fingerprint
-                    or resource.bootstrap_token_hash is not None):
-                return None
-        elif registration.resource_generation is not None or registration.certificate_fingerprint is not None:
-            return None
+    return run
+
+
+def _take_lease(run: ChatRun, *, owner: str, lease_seconds: int) -> ChatRun:
     now = datetime.now(UTC)
     run.status = "running"
     # Monotonic per claim: the owner token carries the fence, so a worker whose lease
@@ -183,11 +257,69 @@ async def claim_queued_run(
     return run
 
 
+async def claim_queued_run(
+    session: AsyncSession, run_id: str, *, owner: str, registration_id: str, lease_seconds: int = 45,
+) -> ChatRun | None:
+    """Atomically claim one queued run for a registered worker.
+
+    Lock order is batch (if any) -> trusted resource -> registration -> run. The worker
+    must be fresh and accepting, serve the run's exact workload class and pool, and have
+    a free slot measured by share-locked live DB leases rather than heartbeat counts.
+    Callers should run READ COMMITTED (``worker_routing.use_read_committed``); under
+    REPEATABLE READ snapshot isolation a concurrent change surfaces as a retryable 1020.
+    """
+    identity = (await session.execute(
+        select(ChatRun.batch_id, ChatRun.workload_class).where(ChatRun.id == run_id)
+    )).one_or_none()
+    if identity is None or identity.workload_class not in worker_routing.WORKER_WORKLOAD_CLASSES:
+        return None
+    batch_id = identity.batch_id
+    # A closed batch admits only checkpoint replay, which never starts provider I/O.
+    if (batch_id is not None and not await worker_routing.lock_open_batch(session, batch_id)
+            and not await worker_routing.has_provider_checkpoint(session, run_id)):
+        return None
+    locked = await worker_routing.lock_registration(session, registration_id, owner=owner, require_accepting=True)
+    if locked is None:
+        return None
+    registration, _resource = locked
+    run = await _lock_queued_run(session, run_id)
+    if run is None or run.batch_id != batch_id or not worker_routing.run_matches_registration(run, registration):
+        return None
+    if await worker_routing.live_run_leases(session, registration.id, lock=True) >= registration.capacity:
+        return None
+    run.worker_registration_id = registration.id
+    return _take_lease(run, owner=owner, lease_seconds=lease_seconds)
+
+
+async def claim_realtime_run(session: AsyncSession, run_id: str, *, owner: str, lease_seconds: int = 45) -> ChatRun | None:
+    """Claim an API-owned realtime run; never usable for any worker workload class."""
+    run = await _lock_queued_run(session, run_id)
+    if (run is None or run.run_kind != "realtime" or run.workload_class != "realtime"
+            or run.worker_pool_id is not None or run.batch_id is not None):
+        return None
+    run.worker_registration_id = None
+    return _take_lease(run, owner=owner, lease_seconds=lease_seconds)
+
+
 async def renew_run_lease(session: AsyncSession, run_id: str, *, owner: str, lease_seconds: int = 45) -> ChatRun | None:
-    """Extend only the currently-owned running lease; a stale worker loses authority."""
-    run = (await session.execute(select(ChatRun).where(ChatRun.id == run_id).with_for_update())).scalar_one_or_none()
+    """Extend only the currently-owned running lease; a stale worker loses authority.
+
+    Worker-owned runs also re-prove the registration's trusted identity (resource ->
+    registration -> run). Draining workers keep renewing, they only stop claiming.
+    Callers must use READ COMMITTED: the run row changes with every journal append.
+    """
+    registration_id = (await session.execute(
+        select(ChatRun.worker_registration_id).where(ChatRun.id == run_id)
+    )).scalar_one_or_none()
+    if registration_id is not None and await worker_routing.lock_registration(
+        session, registration_id, require_accepting=False
+    ) is None:
+        return None
+    run = (await session.execute(
+        select(ChatRun).where(ChatRun.id == run_id).with_for_update().execution_options(populate_existing=True)
+    )).scalar_one_or_none()
     now = datetime.now(UTC)
-    if run is None:
+    if run is None or run.worker_registration_id != registration_id:
         return None
     expires_at = run.lease_expires_at
     if run.status != "running" or run.lease_owner != owner or expires_at is None or _as_utc(expires_at) <= now:
@@ -266,7 +398,7 @@ def complete_segment_io(
         raise RunStoreError(f"segment cannot complete from {segment.status}")
     # Provider text checkpoints (chat output, bounded transcripts with optional
     # segment timing) exceed the small tool/media-reference payload limit.
-    result_limit = (_MAX_PROVIDER_RESULT_BYTES if segment.endpoint in {"chat_completions", "audio_stt"}
+    result_limit = (_MAX_PROVIDER_RESULT_BYTES if segment.endpoint in {"chat_completions", "responses", "audio_stt"}
                     else _MAX_SEGMENT_RESULT_BYTES)
     result = _encode_segment_payload(result_payload, max_bytes=result_limit)
     record_segment_usage(segment, usage_payload)

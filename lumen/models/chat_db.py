@@ -42,38 +42,26 @@ class LlmProvider(Base):
 
     id: Mapped[int] = mapped_column(BIGINT, primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(VARCHAR(100), nullable=False)
-    # litellm custom_llm_provider (openai|anthropic|gemini|vertex_ai|azure|bedrock|ollama|...)
+    # Provider adapter family, independent of public API identity.
     provider_type: Mapped[str] = mapped_column(VARCHAR(40), nullable=False, default="openai")
     # Public API selector is independent of the execution transport.
     api_provider: Mapped[str] = mapped_column(VARCHAR(40), nullable=False, default=_default_api_provider)
     sort_order: Mapped[int] = mapped_column(INT, nullable=False, default=0, server_default="0")
     api_base: Mapped[str | None] = mapped_column(VARCHAR(255))
-    # AES-256-GCM(lumen_encryption_key, 도메인 llm_provider_key) 암호화 상태로 저장
-    encrypted_api_key: Mapped[str | None] = mapped_column(TEXT)
+    selection_policy: Mapped[str] = mapped_column(VARCHAR(16), nullable=False, default="priority", server_default="priority")
+    selected_credential_id: Mapped[int | None] = mapped_column(BIGINT)
     # Organization billing credentials use a separate HKDF domain and never enter inference execution.
     encrypted_billing_admin_key: Mapped[str | None] = mapped_column(TEXT)
-    # Optional environment variable name used only when no database key exists.
-    api_key_env: Mapped[str | None] = mapped_column(VARCHAR(128))
-    # Subscription credentials are encrypted separately from API keys so execution cannot fall back across auth modes.
     auth_mode: Mapped[str] = mapped_column(VARCHAR(32), nullable=False, default="api_key")
-    encrypted_subscription_tokens: Mapped[str | None] = mapped_column(TEXT)
-    subscription_status: Mapped[str] = mapped_column(VARCHAR(24), nullable=False, default="disconnected")
-    subscription_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    subscription_generation: Mapped[int] = mapped_column(BIGINT, nullable=False, default=0)
     is_active: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=True)
     margin_multiplier: Mapped[Decimal] = mapped_column(Numeric(8, 4), nullable=False, default=Decimal("1.0"))
-    # models.dev provider key. Display names are never used for catalog matching.
-    models_dev_provider_id: Mapped[str | None] = mapped_column(VARCHAR(100))
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
 
     models: Mapped[list["LlmModel"]] = relationship("LlmModel", back_populates="provider", cascade="all, delete-orphan")
-    auth_attempt: Mapped["LlmProviderAuthAttempt | None"] = relationship(
-        "LlmProviderAuthAttempt",
-        back_populates="provider",
-        cascade="all, delete-orphan",
-        uselist=False,
+    accounts: Mapped[list["LlmProviderAccount"]] = relationship(
+        "LlmProviderAccount", back_populates="provider", cascade="all, delete-orphan", lazy="selectin"
     )
 
     __table_args__ = (
@@ -82,16 +70,60 @@ class LlmProvider(Base):
     )
 
 
+class LlmProviderAccount(Base):
+    __tablename__ = "llm_provider_accounts"
+
+    id: Mapped[int] = mapped_column(BIGINT, primary_key=True, autoincrement=True)
+    provider_id: Mapped[int] = mapped_column(BIGINT, ForeignKey("llm_providers.id", ondelete="CASCADE"), nullable=False)
+    name: Mapped[str] = mapped_column(VARCHAR(100), nullable=False)
+    is_active: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=True)
+    priority: Mapped[int] = mapped_column(INT, nullable=False, default=0)
+    weight: Mapped[int] = mapped_column(INT, nullable=False, default=1)
+    allowed_model_ids: Mapped[list | None] = mapped_column(JSON)
+    allowed_capabilities: Mapped[list | None] = mapped_column(JSON)
+    quota_group: Mapped[str | None] = mapped_column(VARCHAR(100))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
+    provider: Mapped["LlmProvider"] = relationship("LlmProvider", back_populates="accounts")
+    credentials: Mapped[list["LlmProviderCredential"]] = relationship(
+        "LlmProviderCredential", back_populates="account", cascade="all, delete-orphan", lazy="selectin"
+    )
+    __table_args__ = (UniqueConstraint("provider_id", "name", name="uq_provider_account_name"),)
+
+
+class LlmProviderCredential(Base):
+    __tablename__ = "llm_provider_credentials"
+
+    id: Mapped[int] = mapped_column(BIGINT, primary_key=True, autoincrement=True)
+    account_id: Mapped[int] = mapped_column(BIGINT, ForeignKey("llm_provider_accounts.id", ondelete="CASCADE"), nullable=False)
+    name: Mapped[str] = mapped_column(VARCHAR(100), nullable=False)
+    auth_mode: Mapped[str] = mapped_column(VARCHAR(32), nullable=False)
+    encrypted_api_key: Mapped[str | None] = mapped_column(TEXT)
+    api_key_env: Mapped[str | None] = mapped_column(VARCHAR(128))
+    encrypted_subscription_tokens: Mapped[str | None] = mapped_column(TEXT)
+    subscription_status: Mapped[str] = mapped_column(VARCHAR(24), nullable=False, default="disconnected")
+    subscription_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    cooldown_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    generation: Mapped[int] = mapped_column(BIGINT, nullable=False, default=0)
+    is_active: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=True)
+    priority: Mapped[int] = mapped_column(INT, nullable=False, default=0)
+    weight: Mapped[int] = mapped_column(INT, nullable=False, default=1)
+    allowed_model_ids: Mapped[list | None] = mapped_column(JSON)
+    allowed_capabilities: Mapped[list | None] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
+    account: Mapped["LlmProviderAccount"] = relationship("LlmProviderAccount", back_populates="credentials")
+    __table_args__ = (UniqueConstraint("account_id", "name", name="uq_provider_credential_name"),)
+
+
 class LlmProviderAuthAttempt(Base):
-    """Single durable device-auth attempt for one provider."""
+    """Single durable, caller-bound device-auth attempt for one selected credential."""
 
     __tablename__ = "llm_provider_auth_attempts"
 
-    provider_id: Mapped[int] = mapped_column(
-        BIGINT,
-        ForeignKey("llm_providers.id", ondelete="CASCADE"),
-        primary_key=True,
-    )
+    credential_id: Mapped[int] = mapped_column(BIGINT, ForeignKey("llm_provider_credentials.id", ondelete="CASCADE"), primary_key=True)
+    provider_id: Mapped[int] = mapped_column(BIGINT, ForeignKey("llm_providers.id", ondelete="CASCADE"), nullable=False)
     id: Mapped[str] = mapped_column(CHAR(36), nullable=False, unique=True)
     initiated_by_user_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
     initiated_by_project_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
@@ -101,8 +133,6 @@ class LlmProviderAuthAttempt(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     next_poll_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
-
-    provider: Mapped["LlmProvider"] = relationship("LlmProvider", back_populates="auth_attempt")
 
 
 class LlmModel(Base):
@@ -120,20 +150,19 @@ class LlmModel(Base):
     is_title_model: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=False)
     # 채팅 완료 후 사용자 메모리 자동 추출에 쓸 초소형 모델. 최대 1개만 True(set_memory_model).
     is_memory_model: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=False)
-    # 미지정 시 litellm 내장 단가 사용 (override용). 토큰당 USD 단가.
+    # Stored administrator rates override the native catalog fallback. USD per token.
     input_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
     output_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
     # 관리자가 저장한 프롬프트 캐시 토큰당 USD 단가(nullable). 적용 단가는 routing이
     # 수동값→direct provider exact catalog→text write cascade 순으로 해석하며 저장값을 채우지 않는다.
     cache_read_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
-    cache_write_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))  # 5분 TTL cache write
+    cache_write_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))  # Provider's short-TTL cache write.
     cache_write_1h_price: Mapped[Decimal | None] = mapped_column(Numeric(20, 10))
-    # models.dev catalog mapping and the immutable provenance of the last import.
-    models_dev_model_id: Mapped[str | None] = mapped_column(VARCHAR(190))
+    # Historical stored price provenance remains readable; catalog rates are never stored.
     price_source: Mapped[str | None] = mapped_column(VARCHAR(20))
     price_metadata: Mapped[dict | None] = mapped_column(JSON)
-    # 능력(vision/reasoning/tool_call/attachment/modalities/reasoning_options/context_limit) 저장.
-    # None 이면 런타임 litellm 판별로 fallback. capability_source: override|models_dev|None.
+    # Stored administrator capability overrides, including endpoint capability decisions.
+    # Only capability_source=override is authoritative; otherwise use native catalog or conservative defaults.
     capabilities: Mapped[dict | None] = mapped_column(JSON)
     capability_source: Mapped[str | None] = mapped_column(VARCHAR(20))
 
@@ -157,8 +186,12 @@ class ChatMessageGraph(Base):
     id: Mapped[str] = mapped_column(CHAR(36), primary_key=True)
     user_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
     project_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    domain_id: Mapped[str | None] = mapped_column(VARCHAR(64))
 
-    __table_args__ = (Index("idx_chat_message_graphs_owner", "project_id", "user_id"),)
+    __table_args__ = (
+        Index("idx_chat_message_graphs_owner", "project_id", "user_id"),
+        Index("idx_chat_message_graphs_domain", "domain_id", "user_id"),
+    )
 
 
 class ChatConversation(Base):
@@ -170,6 +203,7 @@ class ChatConversation(Base):
     )
     project_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
     user_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    domain_id: Mapped[str | None] = mapped_column(VARCHAR(64))
     # AES-256-GCM(도메인 chat_content) 암호문. 첫 메시지 요약 제목도 채팅 내용이라 암호화. TEXT(암호문 길이).
     title: Mapped[str | None] = mapped_column(TEXT)
     title_source: Mapped[str] = mapped_column(VARCHAR(20), nullable=False, default="legacy")
@@ -202,6 +236,7 @@ class ChatConversation(Base):
     __table_args__ = (
         Index("idx_chat_conversations_graph", "graph_id"),
         Index("idx_chat_conversations_owner", "project_id", "user_id"),
+        Index("idx_chat_conversations_domain", "domain_id", "user_id", "updated_at"),
         Index("idx_chat_conversations_user_updated", "user_id", "updated_at"),  # 사용자별 목록(프로젝트 무관)
         Index("idx_chat_conversations_updated", "updated_at"),
         Index("idx_chat_conversations_code_workspace", "code_workspace_id"),
@@ -301,8 +336,12 @@ class ChatUsageLog(Base):
     __tablename__ = "chat_usage_logs"
 
     id: Mapped[int] = mapped_column(BIGINT, primary_key=True, autoincrement=True)
-    project_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
-    user_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    project_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    user_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    domain_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    billing_scope: Mapped[str] = mapped_column(VARCHAR(10), server_default="user")
+    payer_user_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    payer_domain_id: Mapped[str | None] = mapped_column(VARCHAR(64))
     conversation_id: Mapped[str | None] = mapped_column(CHAR(36))  # 대화 삭제 후에도 원장 보존 — FK 없음
     model_name: Mapped[str] = mapped_column(VARCHAR(190), nullable=False)
     provider: Mapped[str | None] = mapped_column(VARCHAR(100))
@@ -317,6 +356,12 @@ class ChatUsageLog(Base):
     credited_cost: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False, default=Decimal("0"))
     source: Mapped[str] = mapped_column(VARCHAR(10), nullable=False, default="web")  # web | api
     api_key_id: Mapped[int | None] = mapped_column(BIGINT)
+    provider_id: Mapped[int | None] = mapped_column(BIGINT)
+    provider_account_id: Mapped[int | None] = mapped_column(BIGINT)
+    provider_credential_id: Mapped[int | None] = mapped_column(BIGINT)
+    provider_credential_generation: Mapped[int | None] = mapped_column(BIGINT)
+    provider_backend: Mapped[str | None] = mapped_column(VARCHAR(40))
+    provider_backend_version: Mapped[str | None] = mapped_column(VARCHAR(100))
     event_id: Mapped[str | None] = mapped_column(VARCHAR(64), unique=True)
     pricing_status: Mapped[str] = mapped_column(VARCHAR(20), nullable=False, default="legacy")
     pricing_snapshot: Mapped[dict | None] = mapped_column(JSON)
@@ -329,9 +374,33 @@ class ChatUsageLog(Base):
     __table_args__ = (
         Index("idx_chat_usage_project_created", "project_id", "created_at"),
         Index("idx_chat_usage_user_created", "user_id", "created_at"),
+        Index("idx_chat_usage_domain_created", "domain_id", "created_at"),
+        Index("idx_chat_usage_payer_domain_created", "payer_domain_id", "created_at"),
+        Index("idx_chat_usage_payer_user_created", "payer_user_id", "created_at"),
         Index("idx_chat_usage_api_key_created", "api_key_id", "created_at"),
         Index("idx_chat_usage_run_id", "run_id"),
+        Index("idx_chat_usage_provider_account", "provider_account_id", "created_at"),
     )
+
+class ChatProviderUsage(Base):
+    """Upstream attribution allocated inside the existing idempotent credit transaction."""
+
+    __tablename__ = "chat_provider_usage"
+
+    event_id: Mapped[str] = mapped_column(VARCHAR(64), primary_key=True)
+    provider_account_id: Mapped[int] = mapped_column(BIGINT, primary_key=True)
+    provider_credential_id: Mapped[int] = mapped_column(BIGINT, primary_key=True)
+    provider_id: Mapped[int] = mapped_column(BIGINT, nullable=False)
+    provider_credential_generation: Mapped[int] = mapped_column(BIGINT, nullable=False)
+    provider_backend: Mapped[str | None] = mapped_column(VARCHAR(40))
+    provider_backend_version: Mapped[str | None] = mapped_column(VARCHAR(100))
+    prompt_tokens: Mapped[int] = mapped_column(BIGINT, nullable=False, default=0)
+    completion_tokens: Mapped[int] = mapped_column(BIGINT, nullable=False, default=0)
+    raw_cost: Mapped[Decimal] = mapped_column(Numeric(20, 10), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
+
+    __table_args__ = (Index("idx_provider_usage_account", "provider_account_id", "created_at"),)
+
 
 
 class ChatQuotaPolicy(Base):
@@ -382,6 +451,10 @@ class ChatMcpServer(Base):
     owner_user_id: Mapped[str | None] = mapped_column(VARCHAR(64))
     owner_project_id: Mapped[str | None] = mapped_column(VARCHAR(64))
     project_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    owner_domain_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    legacy_domain_group: Mapped[str | None] = mapped_column(CHAR(64))
+    connection_scope_key: Mapped[str] = mapped_column(VARCHAR(200), nullable=False, default="global", server_default="global")
+    implicit_selection: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=True, server_default="1")
     name: Mapped[str] = mapped_column(VARCHAR(100), nullable=False)
     transport: Mapped[str] = mapped_column(VARCHAR(20), nullable=False, default="http")  # HTTPS streamable HTTP only
     url: Mapped[str | None] = mapped_column(VARCHAR(500))
@@ -405,19 +478,56 @@ class ChatMcpServer(Base):
     load_policy: Mapped[str] = mapped_column(
         VARCHAR(16), nullable=False, default="on_demand", server_default="on_demand"
     )
+    # Template identity: several global connections may share a template and differ by label.
+    template_key: Mapped[str | None] = mapped_column(VARCHAR(100))
+    connection_label: Mapped[str | None] = mapped_column(VARCHAR(100))
+    # Discovery metadata only; refreshing it never bumps config_version.
+    tool_catalog: Mapped[dict | None] = mapped_column(JSON)
+    catalog_refreshed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    catalog_error: Mapped[str | None] = mapped_column(VARCHAR(300))
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
 
     __table_args__ = (
+        CheckConstraint(
+            "scope <> 'domain' OR owner_domain_id IS NOT NULL",
+            name="ck_chat_mcp_servers_domain_owner",
+        ),
         Index("idx_chat_mcp_scope", "scope"),
         Index("idx_chat_mcp_owner", "owner_user_id"),
         Index("idx_chat_mcp_servers_project", "project_id"),
+        Index("idx_chat_mcp_domain", "owner_domain_id", "scope"),
+        UniqueConstraint("connection_scope_key", "template_key", "connection_label", name="uq_chat_mcp_scoped_template_label"),
+    )
+
+
+class ChatMcpActivation(Base):
+    """Per-user approval of an exact MCP revision in the current domain."""
+
+    __tablename__ = "chat_mcp_activations"
+
+    mcp_server_id: Mapped[int] = mapped_column(
+        BIGINT, ForeignKey("chat_mcp_servers.id", ondelete="CASCADE"), primary_key=True
+    )
+    owner_user_id: Mapped[str] = mapped_column(VARCHAR(64), primary_key=True)
+    owner_project_id: Mapped[str] = mapped_column(VARCHAR(64), primary_key=True)
+    owner_domain_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    is_active: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=False)
+    config_version: Mapped[int] = mapped_column(BIGINT, nullable=False)
+    generation: Mapped[int] = mapped_column(BIGINT, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
+
+    __table_args__ = (
+        Index("idx_chat_mcp_activation_owner", "owner_user_id", "owner_project_id"),
+        UniqueConstraint("mcp_server_id", "owner_user_id", "owner_domain_id", name="uq_chat_mcp_activation_domain"),
+        Index("idx_chat_mcp_activation_domain", "owner_domain_id", "owner_user_id"),
     )
 
 
 class ChatMcpOAuthConnection(Base):
-    """Per-user/project OAuth token bundle for a remote MCP server."""
+    """Personal domain or shared organization OAuth token bundle for an MCP server."""
 
     __tablename__ = "chat_mcp_oauth_connections"
 
@@ -425,6 +535,7 @@ class ChatMcpOAuthConnection(Base):
     mcp_server_id: Mapped[int] = mapped_column(BIGINT, nullable=False)
     owner_user_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
     owner_project_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    owner_domain_id: Mapped[str | None] = mapped_column(VARCHAR(64))
     encrypted_tokens: Mapped[str] = mapped_column(TEXT, nullable=False)
     credential_version: Mapped[int] = mapped_column(BIGINT, nullable=False, default=1)
     status: Mapped[str] = mapped_column(VARCHAR(12), nullable=False, default="active")
@@ -435,6 +546,8 @@ class ChatMcpOAuthConnection(Base):
 
     __table_args__ = (
         UniqueConstraint("mcp_server_id", "owner_user_id", "owner_project_id", name="uq_chat_mcp_oauth_connection"),
+        UniqueConstraint("mcp_server_id", "owner_user_id", "owner_domain_id", name="uq_chat_mcp_oauth_domain"),
+        Index("idx_chat_mcp_oauth_domain", "owner_domain_id", "owner_user_id"),
         Index("idx_chat_mcp_oauth_connection_owner", "owner_user_id", "owner_project_id", "status"),
     )
 
@@ -449,6 +562,7 @@ class ChatMcpOAuthRequest(Base):
     mcp_server_id: Mapped[int] = mapped_column(BIGINT, nullable=False)
     owner_user_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
     owner_project_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    owner_domain_id: Mapped[str | None] = mapped_column(VARCHAR(64))
     encrypted_payload: Mapped[str] = mapped_column(TEXT, nullable=False)
     server_config_version: Mapped[int] = mapped_column(BIGINT, nullable=False, default=1)
     status: Mapped[str] = mapped_column(VARCHAR(12), nullable=False, default="pending")
@@ -470,8 +584,11 @@ class ChatApiKey(Base):
     __tablename__ = "chat_api_keys"
 
     id: Mapped[int] = mapped_column(BIGINT, primary_key=True, autoincrement=True)
-    owner_user_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
-    owner_project_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    owner_user_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    owner_project_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    key_kind: Mapped[str] = mapped_column(VARCHAR(16), nullable=False, default="personal", server_default="personal")
+    owner_domain_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    created_by_user_id: Mapped[str | None] = mapped_column(VARCHAR(64))
     name: Mapped[str] = mapped_column(VARCHAR(100), nullable=False, default="")
     key_prefix: Mapped[str] = mapped_column(VARCHAR(24), nullable=False)  # 표시용(시크릿 아님)
     key_hash: Mapped[str] = mapped_column(CHAR(64), nullable=False)  # SHA-256 hex
@@ -506,7 +623,15 @@ class ChatApiKey(Base):
             "credential_kind IN ('api_key', 'claude_gateway')",
             name="chk_chat_api_keys_credential_kind",
         ),
+        CheckConstraint(
+            "(key_kind = 'personal' AND owner_user_id IS NOT NULL AND owner_domain_id IS NULL)"
+            " OR (key_kind = 'service' AND credential_kind = 'api_key' AND owner_domain_id IS NOT NULL"
+            " AND owner_user_id IS NULL AND owner_project_id IS NULL AND created_by_user_id IS NOT NULL)",
+            name="chk_chat_api_keys_owner_kind",
+        ),
         Index("idx_chat_api_keys_owner", "owner_user_id", "owner_project_id"),
+        Index("idx_chat_api_keys_kind_user", "key_kind", "owner_user_id"),
+        Index("idx_chat_api_keys_kind_domain", "key_kind", "owner_domain_id"),
     )
 
 
@@ -546,7 +671,7 @@ class ChatGatewayDeviceGrant(Base):
 
 
 class ChatCustomTool(Base):
-    """커스텀 HTTP 툴 (백엔드가 SSRF 가드 후 대리 호출). scope: global|user."""
+    """SSRF-guarded HTTP extension; scope is global, user, or domain."""
 
     __tablename__ = "chat_custom_tools"
 
@@ -555,6 +680,9 @@ class ChatCustomTool(Base):
     owner_user_id: Mapped[str | None] = mapped_column(VARCHAR(64))
     owner_project_id: Mapped[str | None] = mapped_column(VARCHAR(64))
     project_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    domain_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    owner_domain_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    legacy_domain_group: Mapped[str | None] = mapped_column(CHAR(64))
     name: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)  # 영숫자/언더스코어
     description: Mapped[str] = mapped_column(VARCHAR(500), nullable=False)
     method: Mapped[str] = mapped_column(VARCHAR(10), nullable=False, default="GET")  # GET|POST
@@ -575,9 +703,35 @@ class ChatCustomTool(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
 
     __table_args__ = (
+        CheckConstraint("scope <> 'domain' OR owner_domain_id IS NOT NULL", name="ck_chat_tool_domain_owner"),
+        Index("idx_chat_tool_user_domain", "domain_id", "owner_user_id", "updated_at"),
+        Index("idx_chat_tool_domain", "owner_domain_id", "scope"),
         Index("idx_chat_tool_scope", "scope"),
         Index("idx_chat_tool_owner", "owner_user_id"),
         Index("idx_chat_custom_tools_project", "project_id"),
+    )
+
+
+class ChatExtensionArchive(Base):
+    """Encrypted snapshot of a merged extension and its original dependent records."""
+
+    __tablename__ = "chat_extension_archives"
+
+    id: Mapped[int] = mapped_column(BIGINT, primary_key=True, autoincrement=True)
+    kind: Mapped[str] = mapped_column(VARCHAR(10), nullable=False)
+    entry_type: Mapped[str] = mapped_column(VARCHAR(20), nullable=False, default="extension", server_default="extension")
+    original_id: Mapped[int] = mapped_column(BIGINT, nullable=False)
+    canonical_id: Mapped[int] = mapped_column(BIGINT, nullable=False)
+    owner_user_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    domain_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    name: Mapped[str] = mapped_column(VARCHAR(100), nullable=False)
+    encrypted_snapshot: Mapped[str] = mapped_column(MEDIUMTEXT, nullable=False)
+    archived_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
+    restored_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+    __table_args__ = (
+        Index("idx_chat_extension_archive_original", "kind", "original_id", "entry_type"),
+        Index("idx_chat_extension_archive_owner", "domain_id", "owner_user_id", "restored_at"),
     )
 
 
@@ -659,12 +813,15 @@ class ChatAgent(Base):
     id: Mapped[int] = mapped_column(BIGINT, primary_key=True, autoincrement=True)
     owner_user_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
     project_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    domain_id: Mapped[str | None] = mapped_column(VARCHAR(64))
     name: Mapped[str] = mapped_column(VARCHAR(100), nullable=False)
     description: Mapped[str | None] = mapped_column(VARCHAR(500))
     avatar: Mapped[str | None] = mapped_column(VARCHAR(500))  # 이모지 또는 URL
     # AES-256-GCM(chat_content) 암호문. 시스템 프롬프트로 주입되는 지침.
     instructions: Mapped[str | None] = mapped_column(MEDIUMTEXT)
     model_name: Mapped[str | None] = mapped_column(VARCHAR(190))
+    # Keep the exact selection even if the catalog row is removed; never fall back to its name.
+    model_row_id: Mapped[int | None] = mapped_column(BIGINT)
     params: Mapped[dict | None] = mapped_column(JSON)  # {temperature, max_tokens, ...}
     mcp_ids: Mapped[list | None] = mapped_column(JSON)  # 바인딩된 ChatMcpServer id 목록
     tool_ids: Mapped[list | None] = mapped_column(JSON)  # 바인딩된 ChatCustomTool id 목록
@@ -689,6 +846,7 @@ class ChatAgent(Base):
 
     __table_args__ = (
         Index("idx_chat_agents_owner", "owner_user_id"),
+        Index("idx_chat_agents_domain", "domain_id", "owner_user_id", "updated_at"),
         Index("idx_chat_agents_visibility", "visibility"),
         Index("idx_chat_agents_project", "project_id"),
         Index("idx_chat_agents_project_active", "project_id", "is_active"),
@@ -717,7 +875,7 @@ class ChatWorkspace(Base):
 
 
 class ChatMemory(Base):
-    """Encrypted memory source of truth, scoped for fail-closed semantic hydration."""
+    """Read-only legacy source for the Agent Vault migration."""
 
     __tablename__ = "chat_memories"
 
@@ -734,6 +892,8 @@ class ChatMemory(Base):
     # AES-256-GCM(chat_content) 암호문. 기억할 사실(예: "사용자는 Python 을 선호").
     content: Mapped[str | None] = mapped_column(MEDIUMTEXT)
     is_active: Mapped[bool] = mapped_column(BOOLEAN, nullable=False, default=True)
+    vault_migration_status: Mapped[str | None] = mapped_column(VARCHAR(16))
+    vault_migration_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_now, onupdate=_now)
@@ -747,6 +907,7 @@ class ChatMemory(Base):
         ),
         Index("idx_chat_memories_user", "user_id"),
         Index("idx_chat_memories_scope", "user_id", "project_id", "workspace_id", "status", "is_active"),
+        Index("idx_chat_memories_vault_pending", "vault_migration_status", "vault_migration_retry_at", "id"),
     )
 
 

@@ -1,6 +1,6 @@
 """빌트인 AI 채팅 대화/메시지 API (사용자 소유 리소스).
 
-전 엔드포인트 get_token_info 인증 + user_id 소유권 검증(IDOR 방어, 프로젝트 무관).
+모든 경로는 서비스 scope 및 user/project 소유권을 검증한다.
 서비스(conversation_store)가 소유권을 강제하고, 예외를 HTTP 상태로 매핑한다.
 """
 
@@ -10,6 +10,7 @@ import base64
 import hashlib
 import hmac
 import json
+from decimal import Decimal
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -19,6 +20,8 @@ from lumen.auth import require_scopes
 from lumen.config import get_settings
 from lumen.services import capabilities
 from lumen.services import conversation_store as cs
+from lumen.services.domain_scope import history_domain_id
+from lumen.services.provider_metadata import is_gemini_decision_model, provider_family
 from lumen.services.providers import audio_transport, errors, image_transport, realtime_transport, repository, routing
 
 router = APIRouter()
@@ -31,9 +34,13 @@ class AvailableModel(BaseModel):
     api_provider: str
     provider_id: int
     provider_type: str
+    provider_family: Literal["native", "compatible"]
+    price_origin: Literal["manual", "native_catalog"] | None = None
+    catalog_version: str | None = None
+    catalog_entry: dict | None = None
     provider_sort_order: int = 0
     sort_order: int = 0
-    model_kind: Literal["text", "image", "tts", "stt", "realtime"] = "text"
+    model_kind: Literal["text", "image", "tts", "stt", "realtime", "embedding", "decision"] = "text"
     display_name: str
     provider: str | None = None
     provider_api_key_configured: bool
@@ -43,13 +50,16 @@ class AvailableModel(BaseModel):
     context_limit: int | None = None
     # Whether reasoning_effort="none" passes chat admission for this model (same rule).
     reasoning_none_supported: bool = False
+    # Text models only: whether domain-paid chat can admit this model, with a reason code when not.
+    domain_billing: dict | None = None
+    effective_input_price_per_million: Decimal | None = None
 
     model_config = {"protected_namespaces": ()}
 
 
-@router.get("/chat/models", response_model=list[AvailableModel])
+@router.get("/chat/models", response_model=list[AvailableModel], response_model_exclude_unset=True)
 async def list_available_models(
-    model_kind: Literal["text", "image", "tts", "stt", "realtime"] = "text",
+    model_kind: Literal["text", "image", "tts", "stt", "realtime", "embedding", "decision"] = "text",
     token_info: dict = Depends(require_scopes("models:read")),
 ):
     """사용자용 활성 모델 카탈로그(키·가격 미포함, provider명·능력 포함). 저장소 장애 시 빈 목록(graceful)."""
@@ -65,6 +75,8 @@ async def list_available_models(
         caps = m.get("effective_capabilities") or {}
         provider = providers.get(m["provider_id"])
         provider_type = m.get("provider_type") or (provider.get("provider_type", "") if provider else "")
+        if model_kind != "decision" and is_gemini_decision_model(m["model_name"], provider_type):
+            continue
         result.append(
             {
                 "id": m["id"],
@@ -74,6 +86,12 @@ async def list_available_models(
                 "api_provider": m["api_provider"],
                 "provider_id": m["provider_id"],
                 "provider_type": provider_type,
+                "provider_family": m.get("provider_family") or provider_family(
+                    provider_type, (provider or {}).get("api_base"), (provider or {}).get("auth_mode", "api_key"),
+                ),
+                "price_origin": m.get("price_origin"),
+                "catalog_version": m.get("catalog_version"),
+                "catalog_entry": m.get("catalog_entry"),
                 "provider_sort_order": m.get("provider_sort_order", 0),
                 "sort_order": m.get("sort_order", 0),
                 "display_name": m["display_name"],
@@ -85,6 +103,9 @@ async def list_available_models(
                     caps if isinstance(caps, dict) else None,
                     provider_type,
                 ),
+                **({"domain_billing": m.get("domain_billing")} if model_kind == "text" else {}),
+                **({"effective_input_price_per_million": m.get("effective_input_price_per_million")}
+                   if model_kind == "decision" else {}),
             }
         )
     return result
@@ -93,11 +114,10 @@ async def list_available_models(
 @router.get("/capabilities")
 async def get_chat_capabilities(
     model_id: int = Query(..., ge=1),
-    model_kind: Literal["text", "image", "tts", "stt", "realtime"] = "text",
+    model_kind: Literal["text", "image", "tts", "stt", "realtime", "embedding", "decision"] = "text",
     token_info: dict = Depends(require_scopes("models:read")),
 ):
     """Expose selected-model and deployment runtime gates without secrets."""
-    del token_info
     try:
         resolved = (
             await routing.resolve_model_by_id(model_id)
@@ -113,15 +133,28 @@ async def get_chat_capabilities(
         "model_id": model_id,
         "model_name": resolved["model_name"],
         "runtime": effective,
+        "model_kind": model_kind,
+        "model_capabilities": resolved.get("capabilities"),
     }
-    if model_kind != "text":
-        result["model_kind"] = model_kind
-        result["model_capabilities"] = resolved.get("capabilities")
     if model_kind == "image":
         image_gate = ((resolved.get("capabilities") or {}).get("feature_gates") or {}).get("image_output") or {}
         routable = image_gate.get("available") is True
         result["available_image_variants"] = image_transport.available_image_variants(resolved) if routable else []
         result["max_image_count"] = image_transport.max_image_count(resolved) if routable else 0
+        if routable:
+            result.update(image_transport.available_image_options(resolved))
+            if "svg" in result.get("image_output_formats", ()):
+                from lumen.policy import authorize
+
+                if authorize("native:runs:write", token_info):
+                    try:
+                        authors = await routing.resolve_image_svg_authors(resolved)
+                    except errors.ChatStorageUnavailable as exc:
+                        raise HTTPException(status_code=503, detail="chat model configuration is unavailable") from exc
+                    result["image_svg_author_models"] = [
+                        {"model": row["api_model_name"], "reasoning_efforts": list(row["svg_reasoning_efforts"])}
+                        for row in authors
+                    ]
     if model_kind == "tts":
         audio_gate = ((resolved.get("capabilities") or {}).get("feature_gates") or {}).get("audio_output") or {}
         if audio_gate.get("available") is True:
@@ -137,11 +170,23 @@ async def get_chat_capabilities(
         )
     if model_kind == "realtime":
         gates = (resolved.get("capabilities") or {}).get("feature_gates") or {}
-        if all((gates.get(name) or {}).get("available") is True for name in ("audio_input", "audio_output")):
+        kind = realtime_transport.realtime_kind(resolved) if realtime_transport.realtime_route_ready(resolved) else None
+        result["realtime_kind"] = kind
+        # Native transcription needs input only; every other kind also speaks audio back.
+        if ((gates.get("audio_input") or {}).get("available") is True and (
+                kind == "transcription" or kind is not None
+                and (gates.get("audio_output") or {}).get("available") is True)):
             result.update(realtime_transport.available_realtime_options(resolved))
         else:
             result.update(available_voices=[], default_voice=None, input_sample_rate_hz=0,
-                          output_sample_rate_hz=0, max_duration_seconds=0, default_duration_seconds=0)
+                          output_sample_rate_hz=0, max_duration_seconds=0, default_duration_seconds=0,
+                          realtime_session_fields=[], available_reasoning_efforts=[],
+                          default_reasoning_effort=None, realtime_image_input=False,
+                          realtime_function_calling=False)
+    if model_kind == "embedding":
+        from lumen.services.embeddings import embedding_metadata
+
+        result.update(embedding_metadata(resolved), max_inputs=16)
     return result
 
 
@@ -291,6 +336,7 @@ async def create_conversation(
         return await cs.create_conversation(
             project_id=token_info["project_id"],
             user_id=token_info["user_id"],
+            domain_id=history_domain_id(token_info),
             title=payload.title,
             model_name=payload.model_name,
             workspace_id=payload.workspace_id,
@@ -311,6 +357,7 @@ async def set_conversation_workspace(
             conversation_id,
             user_id=token_info["user_id"],
             project_id=token_info["project_id"],
+            domain_id=history_domain_id(token_info),
             workspace_id=payload.workspace_id,
         )
     except (
@@ -329,7 +376,11 @@ async def list_conversations(
 ):
     try:
         return await cs.list_conversations(
-            user_id=token_info["user_id"], project_id=token_info["project_id"], limit=limit, offset=offset
+            user_id=token_info["user_id"],
+            project_id=token_info["project_id"],
+            domain_id=history_domain_id(token_info),
+            limit=limit,
+            offset=offset,
         )
     except cs.ChatStorageUnavailable as exc:
         raise _map_error(exc) from exc
@@ -345,6 +396,7 @@ async def search_conversations(
         return await cs.search_conversations(
             user_id=token_info["user_id"],
             project_id=token_info["project_id"],
+            domain_id=history_domain_id(token_info),
             query=q,
             limit=limit,
         )
@@ -358,7 +410,10 @@ async def get_conversation(
 ):
     try:
         return await cs.get_conversation(
-            conversation_id, user_id=token_info["user_id"], project_id=token_info["project_id"]
+            conversation_id,
+            user_id=token_info["user_id"],
+            project_id=token_info["project_id"],
+            domain_id=history_domain_id(token_info),
         )
     except (cs.ConversationNotFound, cs.ConversationForbidden, cs.ChatStorageUnavailable) as exc:
         raise _map_error(exc) from exc
@@ -366,11 +421,14 @@ async def get_conversation(
 
 @router.delete("/conversations/{conversation_id}", status_code=204)
 async def delete_conversation(
-    conversation_id: str, token_info: dict = Depends(require_scopes("native:conversations:write"))
+    conversation_id: str, token_info: dict = Depends(require_scopes("native:conversations:delete"))
 ):
     try:
         await cs.delete_conversation(
-            conversation_id, user_id=token_info["user_id"], project_id=token_info["project_id"]
+            conversation_id,
+            user_id=token_info["user_id"],
+            project_id=token_info["project_id"],
+            domain_id=history_domain_id(token_info),
         )
     except (
         cs.ConversationNotFound,
@@ -390,11 +448,13 @@ async def list_messages(
     token_info: dict = Depends(require_scopes("native:conversations:read")),
 ):
     """Return an indexed page; cursor boundaries are exclusive and revision-fenced."""
+    domain_id = history_domain_id(token_info)
     try:
         await cs.get_conversation(
             conversation_id,
             user_id=token_info["user_id"],
             project_id=token_info["project_id"],
+            domain_id=domain_id,
         )
         if cursor is not None and anchor is not None:
             raise HTTPException(status_code=422, detail="anchor_and_cursor_are_mutually_exclusive")
@@ -408,6 +468,7 @@ async def list_messages(
             conversation_id,
             user_id=token_info["user_id"],
             project_id=token_info["project_id"],
+            domain_id=domain_id,
             anchor=anchor or "latest",
             cursor_direction=decoded["direction"] if decoded else None,
             cursor_position=decoded["position"] if decoded else None,
@@ -462,6 +523,7 @@ async def set_active_leaf(
             conversation_id,
             user_id=token_info["user_id"],
             project_id=token_info["project_id"],
+            domain_id=history_domain_id(token_info),
             message_id=payload.message_id,
             descend=payload.descend,
         )
@@ -484,6 +546,7 @@ async def fork_conversation(
             conversation_id,
             user_id=token_info["user_id"],
             project_id=token_info["project_id"],
+            domain_id=history_domain_id(token_info),
             message_id=payload.message_id,
         )
     except (

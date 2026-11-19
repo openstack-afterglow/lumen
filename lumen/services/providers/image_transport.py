@@ -1,7 +1,7 @@
 """Direct, single-attempt OpenAI/Gemini image transport for durable image runs.
 
-``validate_image_request`` resolves a configured ``size:quality`` USD-per-image
-rate before admission. ``generate_images`` returns bounded (bytes, MIME) pairs;
+``validate_image_request`` resolves a unit price or token hold before admission.
+``generate_images`` returns bounded (bytes, MIME) pairs;
 it never retrieves image URLs and never retries a provider request.
 """
 
@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import re
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -17,7 +18,9 @@ import httpx
 
 from lumen.services.usage_breakdown import UsageBreakdown
 
+from .credentials import api_key_route_configured, resolve_route_api_key
 from .errors import ProviderValidationError
+from .image_billing import openai_image_hold, parse_svg_usage, svg_author_pricing
 from .pricing import (
     exact_media_price,
     media_billing_basis,
@@ -32,7 +35,21 @@ _MAX_SOURCE_BYTES = 5 * 1024 * 1024
 _MAX_PROMPT_CHARS = 32000
 _MAX_RESPONSE_BYTES_PER_IMAGE = (_MAX_IMAGE_BYTES * 4 // 3) + 8192
 _TIMEOUT = httpx.Timeout(120.0, connect=10.0, read=120.0, write=30.0, pool=10.0)
-_OPENAI_MODELS = frozenset({"gpt-image-1", "gpt-image-1-mini", "gpt-image-1.5"})
+# Legacy GPT Image models take presets only; GPT Image 2+ takes custom WxH.
+# gpt-image-1 shut down in October 2026.
+_OPENAI_PRESET_MODELS = frozenset({
+    "gpt-image-1-mini", "gpt-image-1.5", "gpt-image-1.5-2025-12-16", "chatgpt-image-latest",
+})
+_OPENAI_FLEX_MODELS = frozenset({"gpt-image-2", "gpt-image-2-2026-04-21"})
+_OPENAI_FLAGSHIP_MODELS = frozenset({
+    "gpt-image-2.5-flare", "gpt-image-2.5-flare-2026-09-08",
+    "gpt-image-2.5-sunburst", "gpt-image-2.5-sunburst-2026-09-08",
+    "gpt-image-2.6-flare", "gpt-image-2.6-sunburst",
+})
+_OPENAI_COMPLEXITY_MODELS = frozenset({"gpt-image-2.6-flare", "gpt-image-2.6-sunburst"})
+_OPENAI_MODELS = _OPENAI_PRESET_MODELS | _OPENAI_FLEX_MODELS | _OPENAI_FLAGSHIP_MODELS
+_COMPLEXITIES = frozenset({"low", "medium", "high"})
+_CUSTOM_SIZE = re.compile(r"([1-9][0-9]{0,4})x([1-9][0-9]{0,4})")
 _GEMINI_MODELS = frozenset({
     "gemini-2.5-flash-image", "gemini-2.5-flash-image-preview",
     "gemini-3-pro-image", "gemini-3-pro-image-preview",
@@ -40,16 +57,48 @@ _GEMINI_MODELS = frozenset({
 })
 _SIZES = {"auto": None, "1024x1024": "1:1", "1536x1024": "3:2", "1024x1536": "2:3"}
 _MIMES = {"image/png", "image/jpeg", "image/webp"}
+_FORMAT_MIME = {"png": "image/png", "jpeg": "image/jpeg", "webp": "image/webp",
+                "gif": "image/gif", "svg": "image/svg+xml"}
+_CUSTOM_SIZE_LIMITS = {"min_pixels": 655_360, "max_pixels": 8_294_400, "dimension_multiple": 16,
+                       "max_edge": 3840, "max_aspect_ratio": 3}
+GIF_LIMITS = {"min_frame_count": 2, "max_frame_count": 16, "default_frame_count": 9,
+              "min_frame_duration_ms": 20, "max_frame_duration_ms": 2000, "default_frame_duration_ms": 200,
+              # At 4 bits per pixel this total fills the existing 5 MiB limit.
+              # Actual GIF compression varies; the hard byte limit also applies.
+              "max_total_pixels": _MAX_IMAGE_BYTES * 2, "size_auto_supported": False}
+MAX_OPENAI_IMAGE_INPUT_COUNT = 16
+IMAGE_OPTION_KEYS = ("complexity", "background", "output_format", "output_compression",
+                     "frame_count", "frame_duration_ms", "moderation", "input_fidelity", "svg_model", "svg_reasoning_effort")
+_NON_FLAT_OPTIONS = frozenset({"svg_model", "svg_reasoning_effort"})
+_INPUT_FIDELITIES = {"gpt-image-1.5": ("low", "high"), "gpt-image-1.5-2025-12-16": ("low", "high"),
+                     "gpt-image-1-mini": ("low",)}
+
+
+def image_options(payload: dict) -> dict:
+    """Omit unset options on both the provider wire and durable intent."""
+    return {key: payload[key] for key in IMAGE_OPTION_KEYS if payload.get(key) is not None}
+
+
+def reject_streaming(*, stream: object, partial_images: object) -> None:
+    if (stream is not None and stream is not False) or (
+            partial_images is not None and (type(partial_images) is not int or partial_images != 0)):
+        raise ProviderValidationError("image streaming and partial images are not supported")
 
 
 class ImageTransportError(RuntimeError):
     """An image provider failed or returned an unusable bounded result."""
+
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(message)
+        # Only the integer upstream status survives; provider bodies are never retained.
+        self.status_code = status_code
 
 
 @dataclass(frozen=True)
 class ImageResult:
     images: list[tuple[bytes, str]]
     usage: UsageBreakdown | None = None
+    svg_usage: dict | None = None
 
 
 def _image_usage(route: dict, result: dict, provider: str) -> UsageBreakdown | None:
@@ -60,9 +109,26 @@ def _image_usage(route: dict, result: dict, provider: str) -> UsageBreakdown | N
         if not isinstance(raw, dict):
             raise ValueError("image usage is missing")
         if provider == "openai":
+            model = route["api_model_name"]
+            input_details = raw.get("input_tokens_details")
             output_details = raw.get("output_tokens_details")
+            if model not in _OPENAI_PRESET_MODELS and isinstance(input_details, dict) and input_details.get("cached_tokens"):
+                raise ValueError("direct Images cache usage is unsupported")
+            if "output_tokens_details" not in raw:
+                # Direct Images returns images; SVG authoring is metered separately.
+                # Require the documented input split before using the optional output fallback.
+                if not isinstance(input_details, dict) or not {"image_tokens", "text_tokens"} <= input_details.keys():
+                    raise ValueError("image input modality usage is missing")
+                output_details = {"image_tokens": raw.get("output_tokens")}
+                raw = {**raw, "output_tokens_details": output_details}
             if not isinstance(output_details, dict) or "image_tokens" not in output_details:
                 raise ValueError("image output modality usage is missing")
+            for details, direction in ((input_details, "input"), (output_details, "output")):
+                if isinstance(details, dict) and "text_tokens" in details:
+                    text, image = details["text_tokens"], details.get("image_tokens", 0)
+                    if (type(text) is not int or text < 0 or type(image) is not int or image < 0
+                            or text + image != raw.get(f"{direction}_tokens")):
+                        raise ValueError("image modality totals are inconsistent")
             parsed = UsageBreakdown.from_openai_media(raw)
         else:
             output_details = raw.get("output_tokens_by_modality")
@@ -80,7 +146,7 @@ def _image_usage(route: dict, result: dict, provider: str) -> UsageBreakdown | N
 
 def _model(route: dict) -> tuple[str, str]:
     """Accept only canonical direct endpoints, API-key authentication and known models."""
-    if route.get("model_kind") != "image" or route.get("provider_auth") is not None:
+    if not isinstance(route, dict) or route.get("model_kind") != "image" or not api_key_route_configured(route):
         raise ProviderValidationError("image route is not directly executable")
     provider = route.get("provider_type")
     model = route.get("api_model_name")
@@ -96,8 +162,6 @@ def _model(route: dict) -> tuple[str, str]:
     if configured_base is not None and (not isinstance(configured_base, str)
                                         or configured_base.rstrip("/") not in accepted_bases):
         raise ProviderValidationError("unsupported image provider endpoint")
-    if not isinstance(route.get("api_key"), str) or not route["api_key"].strip():
-        raise ProviderValidationError("image provider credential is unavailable")
     return provider, model
 
 
@@ -105,40 +169,87 @@ def image_billing_basis(route: dict) -> str:
     return media_billing_basis("image", route.get("media_pricing"))
 
 
-def validate_image_request(route: dict, *, size: str, quality: str, n: int, edit: bool) -> Decimal:
-    """Return USD per unit or the whole-request token envelope, before provider I/O.
+def _custom_size(size: str) -> bool:
+    """WIDTHxHEIGHT per the GPT Image 2+ rules: multiples of 16, ratio within 3:1, edge <= 3840, 0.65–8.29 MP."""
+    match = _CUSTOM_SIZE.fullmatch(size)
+    if match is None:
+        return False
+    width, height = int(match[1]), int(match[2])
+    limits = _CUSTOM_SIZE_LIMITS
+    multiple, ratio = limits["dimension_multiple"], limits["max_aspect_ratio"]
+    return (width % multiple == 0 and height % multiple == 0 and max(width, height) <= limits["max_edge"]
+            and width <= ratio * height and height <= ratio * width
+            and limits["min_pixels"] <= width * height <= limits["max_pixels"])
 
-    OpenAI GPT Image 1/1-mini/1.5: sizes auto, 1024x1024, 1536x1024,
-    1024x1536; qualities auto, low, medium, high; count 1–10.
-    Gemini 2.5 Flash Image: same sizes, quality auto, count 1. Gemini 3
-    Pro/3.1 Flash Image: same sizes, quality auto/1k/2k/4k, count 1.
-    Gemini dimension presets select output aspect ratio, not guaranteed pixels.
-    Unit mode requires an exact ``image_variants`` entry for every requested
-    combination, including auto; token mode prices actual provider counts only.
-    """
+
+def validate_image_request(
+    route: dict, *, size: str, quality: str, n: int, edit: bool, prompt: str = "",
+    source_dimensions: tuple[int, int] | list[int] | None = None,
+    additional_dimensions: list[list[int]] | None = None, source_count: int = 1, overlay: str | None = None,
+    complexity: str | None = None, background: str | None = None, output_format: str | None = None,
+    output_compression: int | None = None, frame_count: int | None = None, frame_duration_ms: int | None = None,
+    author_prices: dict[str, dict] | None = None,
+    moderation: str | None = None, input_fidelity: str | None = None, svg_model: str | None = None,
+    svg_reasoning_effort: str | None = None,
+) -> Decimal:
+    """Return USD per unit or the whole-request token hold, before provider I/O."""
     provider, model = _model(route)
-    if not isinstance(size, str) or size not in _SIZES or not isinstance(quality, str):
+    if not isinstance(size, str) or not isinstance(quality, str):
+        raise ProviderValidationError("unsupported image size or quality")
+    custom_sizes = provider == "openai" and model not in _OPENAI_PRESET_MODELS
+    if size not in _SIZES and not (custom_sizes and _custom_size(size)):
         raise ProviderValidationError("unsupported image size or quality")
     if type(n) is not int or not 1 <= n <= (10 if provider == "openai" else 1):
         raise ProviderValidationError("unsupported image count")
     if type(edit) is not bool:
         raise ProviderValidationError("invalid image operation")
+    token_mode = image_billing_basis(route) == "tokens"
+    _validate_options(provider, model, size=size, n=n, edit=edit, token_mode=token_mode, complexity=complexity,
+                      background=background, output_format=output_format, output_compression=output_compression,
+                      frame_count=frame_count, frame_duration_ms=frame_duration_ms)
+    if moderation is not None and (provider != "openai" or moderation not in ("auto", "low")):
+        raise ProviderValidationError("unsupported image moderation")
+    _validate_edit_options(provider, model, edit=edit, source_count=source_count, overlay=overlay,
+                           output_format=output_format, input_fidelity=input_fidelity)
+    if edit and not token_mode and (source_count > 1 or overlay is not None):
+        raise ProviderValidationError("multi-image and overlay edits require a token-billed image model")
+    if svg_model is not None and (output_format != "svg" or author_prices is None or set(author_prices) != {svg_model}):
+        raise ProviderValidationError("SVG requires an authorized, priced author model")
+    if svg_reasoning_effort is not None and svg_model is None:
+        raise ProviderValidationError("SVG reasoning effort requires svg_model")
     if provider == "openai":
         qualities = {"auto", "low", "medium", "high"}
+        if model in _OPENAI_FLAGSHIP_MODELS:
+            qualities |= {"xhigh", "max"}
     elif model.startswith("gemini-2.5-"):
         qualities = {"auto"}
     else:
         qualities = {"auto", "1k", "2k", "4k"}
     if quality not in qualities:
         raise ProviderValidationError("unsupported image quality")
-    if image_billing_basis(route) == "tokens":
-        pricing = validate_media_pricing("image", route.get("media_pricing"))
-        reservation = media_reservation_usd(pricing)
-        if reservation is None or not route_media_pricing_available({**route, "media_pricing": pricing}):
-            raise ProviderValidationError("image token pricing or reservation is unavailable")
-        if edit and "input_per_million" not in route_token_rates(route).get("image", {}):
+    if token_mode:
+        pricing = validate_media_pricing("image", route.get("media_pricing"), provider_type=route.get("provider_type"))
+        if not route_media_pricing_available({**route, "media_pricing": pricing}):
+            raise ProviderValidationError("image token pricing is unavailable")
+        image_rates = route_token_rates(route).get("image", {})
+        if edit and "input_per_million" not in image_rates:
             raise ProviderValidationError("image input token price is unavailable")
-        return reservation
+        if output_format == "svg":
+            author_prices = svg_author_pricing() if author_prices is None else author_prices
+            if not author_prices:
+                raise ProviderValidationError("SVG authoring rates are unavailable")
+        reservation = media_reservation_usd(pricing)
+        if reservation is not None:
+            return reservation
+        if provider != "openai":
+            raise ProviderValidationError("image token reservation is unavailable")
+        if edit and len(additional_dimensions or ()) != source_count - 1 + (overlay is not None):
+            raise ProviderValidationError("scanned dimensions are required for every image input")
+        frames = (frame_count or GIF_LIMITS["default_frame_count"]) if output_format == "gif" else 1
+        return openai_image_hold(model, size=size, quality=quality, count=n, frames=frames, prompt=prompt,
+                                 edit=edit, source_dimensions=source_dimensions,
+                                 additional_dimensions=additional_dimensions, image_rates=image_rates,
+                                 text_input_rate=route["input_price_per_token"], author_prices=author_prices)
     pricing = route.get("media_pricing")
     variants = pricing.get("image_variants") if isinstance(pricing, dict) else None
     variant = f"{size}:{quality}"
@@ -151,6 +262,61 @@ def validate_image_request(route: dict, *, size: str, quality: str, n: int, edit
     return price
 
 
+def _validate_options(
+    provider: str, model: str, *, size: str, n: int, edit: bool, token_mode: bool, complexity: str | None,
+    background: str | None, output_format: str | None, output_compression: int | None,
+    frame_count: int | None, frame_duration_ms: int | None,
+) -> None:
+    flagship = model in _OPENAI_COMPLEXITY_MODELS
+    if complexity is not None and (not flagship or not isinstance(complexity, str) or complexity not in _COMPLEXITIES):
+        raise ProviderValidationError("unsupported image complexity")
+    if provider != "openai" and any(option is not None for option in (
+            background, output_format, output_compression, frame_count, frame_duration_ms)):
+        raise ProviderValidationError("image output options require an OpenAI Images model")
+    if background is not None and background not in ("auto", "opaque", "transparent"):
+        raise ProviderValidationError("unsupported image background")
+    output = "png" if output_format is None else output_format
+    if not isinstance(output, str) or output not in _FORMAT_MIME:
+        raise ProviderValidationError("unsupported image output format")
+    if output in ("gif", "svg") and not (flagship and token_mode):
+        raise ProviderValidationError("GIF and SVG require a token-billed GPT Image 2.6 model")
+    if output == "svg" and (edit or n != 1):
+        raise ProviderValidationError("SVG is available only for generations with n=1")
+    if background == "transparent" and output not in ("png", "webp"):
+        raise ProviderValidationError("transparent background requires PNG or WebP")
+    if output_compression is not None and (output not in ("jpeg", "webp") or type(output_compression) is not int
+                                           or not 0 <= output_compression <= 100):
+        raise ProviderValidationError("output compression requires JPEG or WebP and a value from 0 to 100")
+    if output != "gif" and (frame_count is not None or frame_duration_ms is not None):
+        raise ProviderValidationError("frame options require GIF output")
+    if output == "gif":
+        frames = GIF_LIMITS["default_frame_count"] if frame_count is None else frame_count
+        if type(frames) is not int or not GIF_LIMITS["min_frame_count"] <= frames <= GIF_LIMITS["max_frame_count"]:
+            raise ProviderValidationError("GIF frame count must be between 2 and 16")
+        if frame_duration_ms is not None and (type(frame_duration_ms) is not int or not
+                GIF_LIMITS["min_frame_duration_ms"] <= frame_duration_ms <= GIF_LIMITS["max_frame_duration_ms"]):
+            raise ProviderValidationError("GIF frame duration must be between 20 and 2000 milliseconds")
+        if size == "auto":
+            raise ProviderValidationError("GIF requires an explicit frame size")
+        width, height = map(int, size.split("x"))
+        if width * height * frames * n > GIF_LIMITS["max_total_pixels"]:
+            raise ProviderValidationError("GIF request exceeds total frame pixel budget")
+
+
+def _validate_edit_options(provider: str, model: str, *, edit: bool, source_count: int, overlay: str | None,
+                           output_format: str | None, input_fidelity: str | None) -> None:
+    if edit and not 1 <= source_count <= (MAX_OPENAI_IMAGE_INPUT_COUNT if provider == "openai" else 1):
+        raise ProviderValidationError("unsupported image input count")
+    if input_fidelity is not None and (not edit or input_fidelity not in _INPUT_FIDELITIES.get(model, ())):
+        raise ProviderValidationError("unsupported image input fidelity")
+    if overlay == "mask" and (not edit or provider != "openai" or output_format == "gif"):
+        raise ProviderValidationError("image masks require an OpenAI edit without GIF output")
+    if overlay == "markup" and (not edit or provider != "openai" or model not in _OPENAI_FLAGSHIP_MODELS):
+        raise ProviderValidationError("image markup requires a GPT Image 2.5 or 2.6 edit")
+    if overlay not in (None, "mask", "markup"):
+        raise ProviderValidationError("unsupported image overlay")
+
+
 def _image_mime(data: bytes) -> str:
     if data.startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png"
@@ -161,12 +327,26 @@ def _image_mime(data: bytes) -> str:
     raise ImageTransportError("image provider returned an unsupported image")
 
 
+def _openai_result_image(encoded: object, output_format: str | None) -> tuple[bytes, str]:
+    if output_format not in ("gif", "svg"):
+        return _decode_image(encoded, _FORMAT_MIME.get(output_format))
+    raw = _decode_base64(encoded)
+    if output_format == "gif" and not raw.startswith((b"GIF87a", b"GIF89a")):
+        raise ImageTransportError("image provider returned an invalid GIF")
+    # SVG has no fixed signature. The asset inspector parses UTF-8 XML and
+    # verifies the static SVG subset before scanning or exposing the result.
+    return raw, _FORMAT_MIME[output_format]
+
+
+_PRESET_QUALITIES = ("auto", "low", "medium", "high", "xhigh", "max", "1k", "2k", "4k")
+
+
 def available_image_variants(route: dict) -> list[str]:
     """List executable size:quality choices for the route's selected billing basis."""
     pricing = route.get("media_pricing")
     try:
         if image_billing_basis(route) == "tokens":
-            variants = {f"{size}:{quality}" for size in _SIZES for quality in ("auto", "low", "medium", "high", "1k", "2k", "4k")}
+            variants = {f"{size}:{quality}" for size in _SIZES for quality in _PRESET_QUALITIES}
         else:
             variants = pricing.get("image_variants") if isinstance(pricing, dict) else None
     except ProviderValidationError:
@@ -191,13 +371,73 @@ def image_route_ready(route: dict) -> bool:
     return bool(available_image_variants(route))
 
 
+def image_pricing_readiness(route: dict) -> dict:
+    """Whether priced choices are executable for this provider/model, independent of credential state.
+
+    ``reason`` is ``route_unavailable`` (unsupported provider, model or endpoint),
+    ``pricing_unavailable`` (the selected basis lacks a needed rate, e.g. a base-only
+    unit price), ``unsupported_image_variants`` (positive unit variants exist but
+    none is a valid choice for this model) or ``None`` when ready.
+    """
+    probe = {**route, "api_key": "configured"}
+    try:
+        _model(probe)
+        basis = image_billing_basis(probe)
+    except ProviderValidationError:
+        return {"ready": False, "reason": "route_unavailable", "executable_variants": [],
+                "unsupported_variants": [], "supported_variants": []}
+    presets = dict.fromkeys((f"{size}:{quality}" for size in _SIZES for quality in _PRESET_QUALITIES), "1")
+    supported = available_image_variants({**probe, "media_pricing": {"billing_basis": "unit", "image_variants": presets}})
+    executable = available_image_variants(probe)
+    unsupported: list[str] = []
+    pricing = probe.get("media_pricing")
+    variants = pricing.get("image_variants") if basis == "unit" and isinstance(pricing, dict) else None
+    if isinstance(variants, dict):
+        unsupported = sorted(
+            key for key in variants
+            if key not in executable and (exact_media_price(pricing, "image_per_unit", variant=key) or 0) > 0
+        )
+    reason = None if executable else "unsupported_image_variants" if unsupported else "pricing_unavailable"
+    return {"ready": bool(executable), "reason": reason, "executable_variants": executable,
+            "unsupported_variants": unsupported, "supported_variants": supported}
+
+
 def max_image_count(route: dict) -> int:
     """Maximum images per direct request; unsupported routes fail closed."""
     provider, _ = _model(route)
     return 10 if provider == "openai" else 1
 
 
-def _decode_image(encoded: object, mime: str | None = None) -> tuple[bytes, str]:
+def available_image_options(route: dict) -> dict:
+    provider, model = _model(route)
+    options: dict = {}
+    token_mode = image_billing_basis(route) == "tokens"
+    image_rates = route_token_rates(route).get("image", {}) if token_mode else {}
+    if token_mode:
+        options["image_output_price_per_million"] = image_rates["output_per_million"]
+    advanced_edits = provider == "openai" and "input_per_million" in image_rates
+    options["max_image_input_count"] = MAX_OPENAI_IMAGE_INPUT_COUNT if advanced_edits else 1
+    if provider != "openai":
+        return options
+    formats = ["png", "jpeg", "webp"]
+    options.update(image_output_formats=formats, image_backgrounds=["auto", "opaque", "transparent"])
+    options.update(image_moderation_options=["auto", "low"], image_mask_supported=advanced_edits,
+                   image_markup_supported=advanced_edits and model in _OPENAI_FLAGSHIP_MODELS)
+    if model in _INPUT_FIDELITIES:
+        options["image_input_fidelities"] = list(_INPUT_FIDELITIES[model])
+    if token_mode and model not in _OPENAI_PRESET_MODELS:
+        options["image_custom_size"] = dict(_CUSTOM_SIZE_LIMITS)
+    if model in _OPENAI_COMPLEXITY_MODELS:
+        options["image_complexities"] = ["low", "medium", "high"]
+        if token_mode:
+            formats.append("gif")
+            options["image_gif"] = dict(GIF_LIMITS)
+            if svg_author_pricing():
+                formats.append("svg")
+    return options
+
+
+def _decode_base64(encoded: object) -> bytes:
     if not isinstance(encoded, str) or not encoded or len(encoded) > _MAX_RESPONSE_BYTES_PER_IMAGE:
         raise ImageTransportError("image provider returned oversized or empty image data")
     try:
@@ -206,6 +446,11 @@ def _decode_image(encoded: object, mime: str | None = None) -> tuple[bytes, str]
         raise ImageTransportError("image provider returned invalid image data") from exc
     if not raw or len(raw) > _MAX_IMAGE_BYTES:
         raise ImageTransportError("image provider returned oversized or empty image data")
+    return raw
+
+
+def _decode_image(encoded: object, mime: str | None = None) -> tuple[bytes, str]:
+    raw = _decode_base64(encoded)
     detected = _image_mime(raw)
     if mime is not None and (mime not in _MIMES or mime != detected):
         raise ImageTransportError("image provider returned an invalid image type")
@@ -213,16 +458,20 @@ def _decode_image(encoded: object, mime: str | None = None) -> tuple[bytes, str]
 
 
 async def _post(url: str, *, headers: dict, count: int, json_body: dict | None = None,
-                form: dict | None = None, files: dict | None = None) -> dict:
+                form: dict | None = None, files: list[tuple[str, tuple]] | None = None, relay_ref=None, relay_model=None) -> dict:
     # Streaming avoids buffering an unlimited upstream body in httpx before validation.
     max_bytes = count * _MAX_RESPONSE_BYTES_PER_IMAGE + 65536
     try:
         async with (
-            httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False, trust_env=False) as client,
+            httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False, trust_env=False,
+                              transport=httpx.AsyncHTTPTransport(retries=0, trust_env=False)) as client,
             client.stream("POST", url, headers=headers, json=json_body, data=form, files=files) as response,
         ):
+            from .relay_history import record_dispatch
+            record_dispatch(relay_ref, endpoint=url, model=relay_model, operation="image", status_code=response.status_code)
             if response.status_code != 200:
-                raise ImageTransportError(f"image provider returned HTTP {response.status_code}")
+                raise ImageTransportError(f"image provider returned HTTP {response.status_code}",
+                                          status_code=response.status_code)
             if response.headers.get("content-length", "").isdecimal() and int(response.headers["content-length"]) > max_bytes:
                 raise ImageTransportError("image provider response exceeds size limit")
             chunks = bytearray()
@@ -241,36 +490,71 @@ async def _post(url: str, *, headers: dict, count: int, json_body: dict | None =
     return result
 
 
-async def generate_images(route: dict, *, prompt: str, size: str, quality: str, n: int,
-                          source_image: bytes | None = None, source_mime: str | None = None) -> ImageResult:
+async def generate_images(
+    route: dict, *, prompt: str, size: str, quality: str, n: int, source_image: bytes | None = None,
+    source_mime: str | None = None, source_dimensions: tuple[int, int] | list[int] | None = None,
+    additional_sources: list[tuple[bytes, str]] | None = None,
+    overlay_data: tuple[str, bytes, str] | None = None, additional_dimensions: list[list[int]] | None = None,
+    author_prices: dict[str, dict] | None = None, **options,
+) -> ImageResult:
     """Execute one direct call, preserving provider usage alongside bounded image bytes."""
-    validate_image_request(route, size=size, quality=quality, n=n, edit=source_image is not None)
     provider, model = _model(route)
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > _MAX_PROMPT_CHARS:
         raise ProviderValidationError("image prompt is empty or too long")
-    if source_image is not None:
-        if not isinstance(source_image, bytes) or not 0 < len(source_image) <= _MAX_SOURCE_BYTES:
+    sources = [(source_image, source_mime), *(additional_sources or ())] if source_image is not None else []
+    if not sources and (source_mime is not None or additional_sources or overlay_data is not None):
+        raise ProviderValidationError("source image is required")
+    validate_image_request(
+        route, size=size, quality=quality, n=n, edit=bool(sources), prompt=prompt,
+        source_dimensions=source_dimensions, additional_dimensions=additional_dimensions,
+        source_count=len(sources), overlay=overlay_data[0] if overlay_data else None, author_prices=author_prices, **options,
+    )
+    for image, mime in [*sources, *((overlay_data[1:],) if overlay_data else ())]:
+        if not isinstance(image, bytes) or not 0 < len(image) <= _MAX_SOURCE_BYTES:
             raise ProviderValidationError("source image exceeds size limit")
-        if source_mime not in _MIMES or _image_mime(source_image) != source_mime:
+        if mime not in _MIMES or _image_mime(image) != mime:
             raise ProviderValidationError("source image MIME is invalid")
-    elif source_mime is not None:
-        raise ProviderValidationError("source image MIME without data")
+    if overlay_data is not None and overlay_data[2] != "image/png":
+        raise ProviderValidationError("image mask or markup must be PNG")
+    api_key = await resolve_route_api_key(route)
     if provider == "openai":
-        body = {"model": model, "prompt": prompt, "size": size, "quality": quality, "n": n}
-        headers = {"Authorization": f"Bearer {route['api_key']}"}
+        body = {"model": model, "prompt": prompt, "size": size, "quality": quality, "n": n,
+                **{k: v for k, v in image_options(options).items() if k not in _NON_FLAT_OPTIONS}}
+        if options.get("svg_model") is not None:
+            body["svg"] = {"model": options["svg_model"]}
+            if options.get("svg_reasoning_effort") is not None:
+                body["svg"]["reasoning"] = {"effort": options["svg_reasoning_effort"]}
+        headers = {"Authorization": f"Bearer {api_key}"}
         if source_image is None:
             result = await _post("https://api.openai.com/v1/images/generations", headers=headers,
+                                 relay_ref=route.get("provider_auth"), relay_model=model,
                                  count=n, json_body=body)
         else:
+            field = "image" if len(sources) == 1 else "image[]"
+            files = [(field, (f"source.{mime.split('/')[1]}", image, mime)) for image, mime in sources]
+            if overlay_data is not None:
+                overlay, image, mime = overlay_data
+                files.append((overlay, (f"{overlay}.png", image, mime)))
             result = await _post("https://api.openai.com/v1/images/edits", headers=headers,
+                                 relay_ref=route.get("provider_auth"), relay_model=model,
                                  count=n, form=body,
-                                 files={"image": ("source.png", source_image, source_mime)})
+                                 files=files)
         data = result.get("data")
         if not isinstance(data, list) or len(data) != n:
             raise ImageTransportError("image provider returned an unexpected image count")
         if any(not isinstance(item, dict) or "url" in item for item in data):
             raise ImageTransportError("image provider returned a URL instead of inline data")
-        return ImageResult([_decode_image(item.get("b64_json")) for item in data], _image_usage(route, result, provider))
+        output_format = options.get("output_format")
+        usage = _image_usage(route, result, provider)
+        svg_usage = None
+        if output_format == "svg" or result.get("svg_usage") is not None:
+            try:
+                if output_format != "svg":
+                    raise ValueError("unexpected SVG authoring")
+                svg_usage = parse_svg_usage(result.get("svg_usage"))
+            except ValueError as exc:
+                raise ImageTransportError("SVG authoring usage is unavailable or invalid") from exc
+        return ImageResult([_openai_result_image(item.get("b64_json"), output_format) for item in data], usage, svg_usage)
 
     inputs: list[dict] = [{"type": "text", "text": prompt}]
     if source_image is not None:
@@ -283,7 +567,8 @@ async def generate_images(route: dict, *, prompt: str, size: str, quality: str, 
         response_format["image_size"] = quality.upper()
     result = await _post(
         "https://generativelanguage.googleapis.com/v1beta/interactions",
-        headers={"x-goog-api-key": route["api_key"]}, count=1,
+        relay_ref=route.get("provider_auth"), relay_model=model,
+        headers={"x-goog-api-key": api_key}, count=1,
         json_body={"model": model, "input": inputs, "response_format": response_format, "store": False},
     )
     if result.get("status") != "completed":

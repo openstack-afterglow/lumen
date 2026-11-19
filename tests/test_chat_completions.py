@@ -14,16 +14,19 @@ from lumen.models.chat_contracts import (
     UserAssetInputPart,
     validate_user_input_parts,
 )
+from lumen.service_authority import SERVICE_CAPABILITIES
 from lumen.services import capabilities, chat_admission, context_store, credit
 from lumen.services import conversation_store as cs
 from lumen.services.durable_runs import admission, common, queries
 from lumen.services.durable_runs import errors as durable_errors
+from lumen.services.provider_client import ProviderObject
 from lumen.services.providers import repository
 from lumen.services.providers import routing as ps
 
 _BASE = "/api/v1/chat/conversations"
 _HEADERS = {"Idempotency-Key": "d27ac16a-0e5b-465f-89cc-eefe6e9d0001"}
 
+pytestmark = pytest.mark.usefixtures("synthetic_inference_store")
 
 def _request(text: str = "hello", **extra):
     return {"parts": [{"type": "text", "text": text}], "model_id": "gpt-3.5-turbo", "features": {}, **extra}
@@ -64,6 +67,7 @@ async def test_extension_selection_expands_omitted_ids_for_default_chat(monkeypa
                 "params_schema": {"type": "object"},
                 "config_version": 1,
                 "effect": "read",
+                **({"credential_version": 3} if kind == "mcp" else {}),
             },
             {
                 "id": 8,
@@ -74,16 +78,11 @@ async def test_extension_selection_expands_omitted_ids_for_default_chat(monkeypa
                 "params_schema": {"type": "object"},
                 "config_version": 1,
                 "effect": "external_mutation",
+                **({"credential_version": 4} if kind == "mcp" else {}),
             },
         ]
 
-    async def fake_credential_versions(server_ids, *, user_id, project_id):
-        assert server_ids == [7, 8]
-        assert (user_id, project_id) == ("u1", "p1")
-        return {7: 3, 8: 4}
-
     monkeypatch.setattr(chat_admission.es, "list_for_user", fake_list)
-    monkeypatch.setattr(chat_admission.es, "mcp_credential_versions", fake_credential_versions)
 
     no_agent = await chat_admission._resolve_extension_selection(
         None, ChatFeatureOptions(), user_id="u1", project_id="p1"
@@ -118,16 +117,11 @@ async def test_mcp_selection_snapshots_credential_version(monkeypatch):
                 "url": "https://mcp.example",
                 "transport": "http",
                 "config_version": 1,
+                "credential_version": 4,
             }
         ]
 
-    async def credential_versions(server_ids, *, user_id, project_id):
-        assert server_ids == [7]
-        assert (user_id, project_id) == ("u1", "p1")
-        return {7: 4}
-
     monkeypatch.setattr(chat_admission.es, "list_for_user", fake_list)
-    monkeypatch.setattr(chat_admission.es, "mcp_credential_versions", credential_versions)
 
     selection = await chat_admission._resolve_extension_selection(
         {"tool_ids": [], "mcp_ids": [7]},
@@ -233,7 +227,8 @@ async def test_preview_tool_schemas_match_the_first_provider_request(monkeypatch
     )
 
 
-async def _ok_precheck(user_id, project_id=None, api_key_id=None):
+async def _ok_precheck(user_id, project_id=None, api_key_id=None, *, payer=None):
+    del payer
     return None
 
 
@@ -337,7 +332,7 @@ async def test_context_planner_does_not_duplicate_saved_regenerate_input(monkeyp
         lambda *_args, **_kwargs: _return({"tools": [], "mcp": []}),
     )
     monkeypatch.setattr(chat_admission, "_resolve_feature_routes", lambda *_args, **_kwargs: _return({}))
-    monkeypatch.setattr(chat_admission, "resolve_summary_route", lambda route: _return(route))
+    monkeypatch.setattr(chat_admission, "resolve_summary_route", lambda route, *, domain_paid=False: _return(route))
     monkeypatch.setattr(chat_admission.memory_host, "recall_for_run", lambda *args, **kwargs: _return([]))
 
     parts = [{"type": "text", "text": "saved turn"}]
@@ -786,7 +781,7 @@ class TestExecutionCapabilityGate:
         monkeypatch.setattr(chat_admission.memory_host, "recall_for_run", load_memory)
 
         workspace, memories = await chat_admission._load_context(
-            {"workspace_id": None}, "u1", "p1", include_memory=True
+            {"workspace_id": None}, "u1", "p1", include_memory=True, memory_domain="domain"
         )
 
         assert workspace is None
@@ -797,6 +792,7 @@ class TestExecutionCapabilityGate:
             "project_id": "p1",
             "workspace_id": None,
             "include_account": True,
+            "domain_id": "domain",
             "strategy": "recency",
             "query": "",
             "limit": 30,
@@ -906,11 +902,12 @@ class TestCanonicalCompletionRequests:
         monkeypatch.setattr(
             chat_admission,
             "_resolve_agent",
-            lambda *_args: _return(
+            lambda *_args, **_kwargs: _return(
                 {
                     "id": 9,
                     "role": "general",
                     "instructions": None,
+                    "model_name": "stale-legacy-default",
                     "params": {},
                     "tool_ids": [],
                     "mcp_ids": [],
@@ -941,6 +938,7 @@ class TestCanonicalCompletionRequests:
         response = await client.post(f"{_BASE}/c1/completions", headers=_HEADERS, json=_request(agent_id="9"))
 
         assert response.status_code == 202
+        assert seen["model_name"] == "gpt-3.5-turbo"
         policy = seen["request_payload"]["execution_policy"]
         assert policy["max_model_turns"] == 3
         assert policy["max_tool_calls"] == 7
@@ -1071,13 +1069,78 @@ class TestCanonicalCompletionRequests:
         assert response.status_code == 422
 
 
+@pytest.mark.parametrize("path,method", [
+    ("conversations/c1/completions", "create_persistent_run"),
+    ("conversations/c1/messages/12/regenerate", "create_run"),
+    ("temp-completions", "create_temp_run"),
+    ("conversations/c1/context-preview", None),
+    ("temp-threads/t1/context-preview", None),
+])
+async def test_native_selection_exact_row_and_name_assertion(client, monkeypatch, path, method):
+    await _patch_text_execution(monkeypatch)
+    monkeypatch.setattr(cs, "find_turn_start_user", lambda *_args, **_kwargs: _return(
+        {"id": 12, "content": "original"}
+    ))
+    first = _resolved()
+    second = {**first, "model_id": 2, "provider_id": 20, "provider_name": "another endpoint",
+              "capabilities": {**first["capabilities"], "max_output_tokens": 2048}}
+    routes = {1: first, 2: second}
+
+    async def resolve_exact(row_id, *, model_kind):
+        assert model_kind == "text"
+        return routes.get(row_id)
+
+    async def resolve_name(name):
+        if name == first["model_name"]:
+            raise ps.AmbiguousModelRouteError("duplicate text model")
+        return None
+
+    monkeypatch.setattr(ps, "resolve_model_by_id", resolve_exact)
+    monkeypatch.setattr(ps, "resolve_model", resolve_name)
+    seen = {}
+
+    async def create(**kwargs):
+        seen.update(kwargs)
+        return ChatRunDescriptor(run_id="row-selected", status="queued", events_url="/events", cancel_url="/cancel")
+
+    if method is not None:
+        monkeypatch.setattr(admission, method, create)
+    body = {"parts": [{"type": "text", "text": "hi"}]} if not path.endswith("/regenerate") else {}
+    url = f"/api/v1/chat/{path}"
+    response = await client.post(url, headers=_HEADERS, json={**body, "model_row_id": 2})
+    assert response.status_code == (202 if method else 200), response.text
+    if method is None:
+        assert response.json()["output_reserve"] == 2048
+    else:
+        assert seen["intent"]["model_row_id"] == 2
+        assert seen["model_name"] == second["model_name"]
+        assert seen["capability_snapshot"]["provider_id"] == 20
+        assert seen["capability_snapshot"]["model_id"] == 2
+
+    mismatch = await client.post(url, headers=_HEADERS, json={**body, "model_id": "wrong", "model_row_id": 2})
+    assert mismatch.status_code == 422
+    assert mismatch.json()["detail"] == "model_selection_mismatch"
+    legacy = await client.post(url, headers=_HEADERS, json={**body, "model_id": first["model_name"]})
+    assert legacy.status_code == 409
+
+
 class TestRetryFailedRun:
-    async def test_retry_preserves_agent_and_mcp_extensions(self, client, monkeypatch):
+    @pytest.mark.parametrize("model_row_id", [None, 2])
+    async def test_retry_preserves_agent_and_mcp_extensions(self, client, monkeypatch, model_row_id):
         await _patch_text_execution(monkeypatch)
+
+        async def resolve_exact(row_id, *, model_kind):
+            assert (row_id, model_kind) == (2, "text")
+            return {**_resolved(), "model_id": 2, "provider_id": 20}
+
+        monkeypatch.setattr(ps, "resolve_model_by_id", resolve_exact)
         monkeypatch.setattr(
             completions,
             "get_settings",
             lambda: SimpleNamespace(chat_execution_protocol_version=1, chat_credit_per_usd=1000.0),
+        )
+        monkeypatch.setattr(
+            cs, "get_active_path", lambda *args, **kwargs: _return({"messages": [], "active_leaf_id": "99"})
         )
 
         class FakeSourceRun:
@@ -1088,6 +1151,7 @@ class TestRetryFailedRun:
             project_id = "test-project-123"
             status = "failed"
             model_name = "gpt-3.5-turbo"
+            capability_snapshot = {"model_id": model_row_id, "provider_id": 20} if model_row_id is not None else {}
             agent_id = 7
             execution_mode = "chat"
             credit_ceiling = None
@@ -1130,7 +1194,9 @@ class TestRetryFailedRun:
         monkeypatch.setattr(
             chat_admission,
             "_resolve_agent",
-            lambda agent_id, user_id, project_id: _return({"id": 7, "instructions": "agent-7"}),
+            lambda agent_id, user_id, project_id, *, domain_id=None: _return(
+                {"id": 7, "instructions": "agent-7", "model_row_id": 3}
+            ),
         )
         mcp_item = {
             "id": 99,
@@ -1144,7 +1210,9 @@ class TestRetryFailedRun:
         monkeypatch.setattr(
             chat_admission,
             "_resolve_extension_selection",
-            lambda agent, features, *, user_id, project_id: _return({"tools": [], "mcp": [mcp_item]}),
+            lambda agent, features, *, user_id, project_id, token_info=None: _return(
+                {"tools": [], "mcp": [mcp_item]}
+            ),
         )
 
         async def fake_list_for_user(kind, **kwargs):
@@ -1166,7 +1234,7 @@ class TestRetryFailedRun:
         monkeypatch.setattr(
             cs,
             "path_ending_at",
-            lambda conversation_id, user_id, project_id, message_id: _return(
+            lambda conversation_id, user_id, project_id, message_id, *, domain_id: _return(
                 [{"role": "user", "content": "retry turn"}]
             ),
         )
@@ -1185,11 +1253,22 @@ class TestRetryFailedRun:
 
         monkeypatch.setattr(admission, "create_run", fake_create_run)
 
-        response = await client.post(f"{_BASE}/c1/runs/run-source-1/retry", headers=_HEADERS)
+        url = f"{_BASE}/c1/runs/run-source-1/retry"
+        mismatch = await client.post(url, headers=_HEADERS, json={"model_row_id": 3})
+        assert mismatch.status_code == 422
+        assert mismatch.json()["detail"] == "model_selection_mismatch"
+        assert not seen_create
+        response = await client.post(
+            url, headers=_HEADERS, **({"json": {"model_row_id": model_row_id}} if model_row_id else {}),
+        )
 
         assert response.status_code == 202, f"Failed with: {response.json()}"
+        assert seen_create["capability_snapshot"]["model_id"] == (model_row_id or 1)
+        assert seen_create["capability_snapshot"]["provider_id"] == (20 if model_row_id else 1)
         assert seen_create["request_payload"]["extension_snapshot"] == {"tools": [], "mcp": [mcp_item]}
         assert seen_create["request_payload"]["skill_ids"] == [3]
+        assert seen_create["user_message_id"] == 12
+        assert seen_create["expected_parent_id"] == 99
 
     async def test_retry_idempotency_returns_same_descriptor_on_lost_response(self, client, monkeypatch):
         await _patch_text_execution(monkeypatch)
@@ -1222,7 +1301,8 @@ class TestRetryFailedRun:
     async def test_retry_rejects_quota_exceeded_before_creating_run(self, client, monkeypatch):
         await _patch_text_execution(monkeypatch)
 
-        async def quota_exceeded(user_id, project_id=None, api_key_id=None):
+        async def quota_exceeded(user_id, project_id=None, api_key_id=None, *, payer=None):
+            del payer
             raise credit.QuotaExceeded("월간 사용량 쿼터를 초과했습니다")
 
         monkeypatch.setattr(credit, "precheck", quota_exceeded)
@@ -1343,7 +1423,8 @@ class TestApiKeyLimitAdmission:
         await _patch_text_execution(monkeypatch)
         recorded = []
 
-        async def spy_precheck(user_id, project_id=None, api_key_id=None):
+        async def spy_precheck(user_id, project_id=None, api_key_id=None, *, payer=None):
+            del payer
             recorded.append((user_id, project_id, api_key_id))
             raise HTTPException(status_code=418, detail="stop after precheck")
 
@@ -1366,7 +1447,7 @@ class TestApiKeyLimitAdmission:
                     "native:tools:execute",
                 ),
                 "source": "api",
-                "roles": [],
+                "roles": ["member", *SERVICE_CAPABILITIES],
                 "is_system_admin": False,
             }
 
@@ -1893,7 +1974,7 @@ class TestCompactionRoutes:
         self, client, monkeypatch, path, context_limit, tokens, reason
     ):
         from lumen.services import context_manager
-        from lumen.services.litellm_client import ContextTokenCount
+        from lumen.services.provider_metadata import ContextTokenCount
 
         monkeypatch.setattr(
             context_manager,
@@ -1984,6 +2065,259 @@ class TestCompactionRoutes:
         assert resp.json()["detail"] == "conversation_run_active"
 
 
+class TestContextOutputLimitFallback:
+    @pytest.fixture(
+        params=[
+            pytest.param(("compatible", None), id="compatible-null"),
+            pytest.param(("compatible", "omitted"), id="compatible-omitted"),
+            pytest.param(("untracked_native", None), id="untracked-native-null"),
+            pytest.param(("untracked_native", "omitted"), id="untracked-native-omitted"),
+        ]
+    )
+    async def context_route(self, request, monkeypatch):
+        """Keep the real HTTP planner and budget checks; replace storage and model resolution only."""
+        await _patch_text_execution(monkeypatch)
+        family, output_limit = request.param
+        resolved = _resolved()
+        resolved.update(
+            model_name="operator-model" if family == "compatible" else "perplexity/untracked-model",
+            provider_type="openai" if family == "compatible" else "perplexity",
+            provider_family="compatible" if family == "compatible" else "native",
+            api_base="https://compatible.example/v1" if family == "compatible" else None,
+        )
+        if output_limit == "omitted":
+            resolved["capabilities"].pop("max_output_tokens")
+        else:
+            resolved["capabilities"]["max_output_tokens"] = output_limit
+        monkeypatch.setattr(ps, "resolve_model", lambda *_args, **_kwargs: _return(resolved))
+        source = {
+            "messages": [
+                {"role": role, "content": f"turn {index}"}
+                for index, role in enumerate(["user", "assistant"] * 3, start=1)
+            ],
+            "message_ids": ["1", "2", "3", "4", "5", "6"],
+            "source_hashes": ["h1", "h2", "h3", "h4", "h5", "h6"],
+            "active_leaf_id": "6",
+            "revision": "rev-output-limit",
+            "checkpoint_id": None,
+            "checkpoint": None,
+        }
+
+        async def load_source(**kwargs):
+            assert kwargs["user_id"] == "test-user-123"
+            assert kwargs["project_id"] == "test-project-123"
+            assert (kwargs["conversation_id"], kwargs["temp_thread_id"]) in {("c1", None), (None, "t1")}
+            return source
+
+        monkeypatch.setattr(context_store, "load_context_source", load_source)
+        return resolved, source
+
+    @pytest.mark.parametrize("parent", ["conversations/c1", "temp-threads/t1"])
+    async def test_preview_without_output_limit_is_readonly(self, client, monkeypatch, context_route, parent):
+        resolved, source = context_route
+
+        async def forbidden_write(*_args, **_kwargs):
+            raise AssertionError("context preview must not mutate history or admit a run")
+
+        monkeypatch.setattr(cs, "add_message", forbidden_write)
+        monkeypatch.setattr(admission, "create_compaction_run", forbidden_write)
+        monkeypatch.setattr(admission, "create_persistent_run", forbidden_write)
+        monkeypatch.setattr(admission, "create_run", forbidden_write)
+        monkeypatch.setattr(admission, "create_temp_run", forbidden_write)
+
+        response = await client.post(
+            f"/api/v1/chat/{parent}/context-preview",
+            json={"model_id": resolved["model_name"], "features": {}, "parts": []},
+        )
+
+        assert response.status_code == 200
+        state = response.json()
+        assert state["model_name"] == resolved["model_name"]
+        assert state["revision"] == source["revision"]
+        assert state["output_reserve"] == 4096
+        assert state["input_budget"] == 16_000 - 4096 - state["safety_reserve"]
+        assert state["can_compact"] is True
+
+    @pytest.mark.parametrize("parent", ["conversations/c1", "temp-threads/t1"])
+    @pytest.mark.parametrize("exact", [False, True])
+    async def test_compaction_without_output_limit_admits_owned_run(
+        self, client, monkeypatch, context_route, parent, exact,
+    ):
+        from lumen.services import context_manager
+
+        resolved, source = context_route
+
+        async def resolve_exact(row_id, *, model_kind):
+            assert (row_id, model_kind) == (21, "text")
+            return {**resolved, "model_id": 21, "provider_id": 20}
+
+        monkeypatch.setattr(ps, "resolve_model_by_id", resolve_exact)
+        seen = {}
+        real_context_state = context_manager.context_state
+
+        def context_state(*args, **kwargs):
+            seen["output_reserve"] = kwargs["output_reserve"]
+            return real_context_state(*args, **kwargs)
+
+        async def create_run(**kwargs):
+            seen["run"] = kwargs
+            return ChatRunDescriptor(
+                run_id="run-output-limit",
+                run_kind="compaction",
+                status="queued",
+                events_url="/v1/runs/run-output-limit/events",
+                cancel_url="/v1/runs/run-output-limit/cancel",
+            )
+
+        monkeypatch.setattr(context_manager, "context_state", context_state)
+        monkeypatch.setattr(admission, "create_compaction_run", create_run)
+        response = await client.post(
+            f"/api/v1/chat/{parent}/compactions",
+            headers=_HEADERS,
+            json={
+                **({"model_row_id": 21} if exact else {"model_id": resolved["model_name"]}),
+                "features": {},
+                "expected_context_revision": source["revision"],
+            },
+        )
+
+        assert response.status_code == 202
+        assert response.json()["run_kind"] == "compaction"
+        assert seen["output_reserve"] == 4096
+        run = seen["run"]
+        assert (run["user_id"], run["project_id"]) == ("test-user-123", "test-project-123")
+        assert (run["conversation_id"], run["temp_thread_id"]) == (
+            ("c1", None) if parent.startswith("conversations/") else (None, "t1")
+        )
+        assert run["expected_context_revision"] == source["revision"]
+        assert run["request_payload"]["context_source"] == source
+        assert run["request_payload"]["max_tokens"] == 4096
+        if exact:
+            assert run["intent"]["model_row_id"] == 21
+            assert run["model_name"] == resolved["model_name"]
+            assert run["capability_snapshot"]["provider_id"] == 20
+            mismatch = await client.post(
+                f"/api/v1/chat/{parent}/compactions", headers=_HEADERS,
+                json={"model_id": "wrong", "model_row_id": 21, "expected_context_revision": source["revision"]},
+            )
+            assert mismatch.status_code == 422
+            assert mismatch.json()["detail"] == "model_selection_mismatch"
+
+    @pytest.mark.parametrize("parent", ["conversations/c1", "temp-threads/t1"])
+    @pytest.mark.parametrize(
+        ("guard", "status", "reason"),
+        [
+            ("revision", 409, "context_revision_changed"),
+            ("short_history", 422, "nothing_to_compact"),
+            ("unknown_context", 422, "context_window_unknown"),
+            ("retained_budget", 422, "context_limit_exceeded"),
+        ],
+    )
+    async def test_compaction_without_output_limit_keeps_safety_guards(
+        self, client, monkeypatch, context_route, parent, guard, status, reason
+    ):
+        resolved, source = context_route
+        revision = source["revision"]
+        if guard == "revision":
+            revision = "stale-revision"
+        elif guard == "short_history":
+            source["messages"] = [{"role": "user", "content": "only current turn"}]
+            source["message_ids"] = ["1"]
+            source["source_hashes"] = ["h1"]
+            source["active_leaf_id"] = "1"
+        elif guard == "unknown_context":
+            resolved["capabilities"].pop("context_limit")
+        elif guard == "retained_budget":
+            source["messages"][-1]["content"] = "required " * 16_000
+
+        async def forbidden_admission(**_kwargs):
+            raise AssertionError("unsafe compaction must not admit a run")
+
+        monkeypatch.setattr(admission, "create_compaction_run", forbidden_admission)
+        response = await client.post(
+            f"/api/v1/chat/{parent}/compactions",
+            headers=_HEADERS,
+            json={
+                "model_id": resolved["model_name"],
+                "features": {},
+                "expected_context_revision": revision,
+            },
+        )
+
+        assert response.status_code == status
+        assert response.json()["detail"] == reason
+
+    @pytest.mark.parametrize("parent", ["conversations/c1", "temp-threads/t1"])
+    @pytest.mark.parametrize("operation", ["context-preview", "compactions"])
+    async def test_context_without_output_limit_keeps_ownership_checks(
+        self, client, monkeypatch, context_route, parent, operation
+    ):
+        resolved, source = context_route
+
+        async def deny_conversation(_conversation_id, *, user_id, project_id, domain_id):
+            assert (user_id, project_id) == ("test-user-123", "test-project-123")
+            assert domain_id == "test-domain-123"
+            raise cs.ConversationForbidden("conversation is not accessible")
+
+        async def deny_thread(**kwargs):
+            assert (kwargs["user_id"], kwargs["project_id"]) == ("test-user-123", "test-project-123")
+            raise LookupError("temporary chat thread was not found")
+
+        async def forbidden_admission(**_kwargs):
+            raise AssertionError("inaccessible history must not admit a run")
+
+        monkeypatch.setattr(cs, "get_conversation", deny_conversation)
+        monkeypatch.setattr(context_store, "load_context_source", deny_thread)
+        monkeypatch.setattr(admission, "create_compaction_run", forbidden_admission)
+        body = {"model_id": resolved["model_name"], "features": {}}
+        if operation == "compactions":
+            body["expected_context_revision"] = source["revision"]
+        response = await client.post(
+            f"/api/v1/chat/{parent}/{operation}", headers=_HEADERS, json=body
+        )
+
+        assert response.status_code == (403 if parent.startswith("conversations/") else 404)
+
+    @pytest.mark.parametrize("parent", ["conversations/c1", "temp-threads/t1"])
+    @pytest.mark.parametrize("operation", ["context-preview", "compactions"])
+    async def test_context_without_output_limit_keeps_required_scopes(
+        self, client, monkeypatch, context_route, parent, operation
+    ):
+        resolved, source = context_route
+
+        async def principal():
+            return {
+                "auth_type": "api_key",
+                "user_id": "test-user-123",
+                "project_id": "test-project-123",
+                "api_key_id": "limited-key",
+                "scopes": ("models:read",),
+                "source": "api",
+                "roles": ["member"],
+                "is_system_admin": False,
+            }
+
+        async def forbidden_prepare(**_kwargs):
+            raise AssertionError("scope denial must precede context planning")
+
+        monkeypatch.setattr(completions, "prepare_context_input", forbidden_prepare)
+        body = {"model_id": resolved["model_name"], "features": {}}
+        if operation == "compactions":
+            body["expected_context_revision"] = source["revision"]
+        previous = app.dependency_overrides.copy()
+        app.dependency_overrides[get_principal] = principal
+        try:
+            response = await client.post(
+                f"/api/v1/chat/{parent}/{operation}", headers=_HEADERS, json=body
+            )
+        finally:
+            app.dependency_overrides.clear()
+            app.dependency_overrides.update(previous)
+
+        assert response.status_code == 403
+        assert "Required service action denied" in response.json()["detail"]
+
+
 class TestStatelessModalityBilling:
     """Exercise real request → usage split → cost → ledger boundary, without provider I/O."""
 
@@ -2023,7 +2357,7 @@ class TestStatelessModalityBilling:
         common = {"resolved": route, "user_id": "u1", "project_id": "p1", "api_key_id": 7}
         if protocol == "chat":
             if stream:
-                return [event async for event in core.complete_stream(
+                return [event async for event in await core.complete_stream(
                     **common, messages=messages, max_tokens=64, temperature=None,
                 )]
             return await core.complete_once(**common, messages=messages, max_tokens=64, temperature=None)
@@ -2065,15 +2399,13 @@ class TestStatelessModalityBilling:
             route["margin_multiplier"] = Decimal("99")
             if stream:
                 async def chunks():
-                    yield SimpleNamespace(usage=usage, choices=[])
+                    yield ProviderObject(usage=usage, choices=[])
                 return chunks()
-            return SimpleNamespace(
-                usage=usage, choices=[SimpleNamespace(
-                    message=SimpleNamespace(content="OK", tool_calls=None), finish_reason="stop",
-                )],
-            )
+            return ProviderObject(usage=usage, choices=[{
+                "message": {"content": "OK", "tool_calls": None}, "finish_reason": "stop",
+            }])
 
-        monkeypatch.setattr(core.litellm_client, "acompletion_stream" if stream else "acompletion", provider)
+        monkeypatch.setattr(core.provider_client, "acompletion_stream" if stream else "acompletion", provider)
         result = await self.invoke(core, route, self.media_messages(modality), stream=stream)
         assert calls == [("operator-selected-model", "https://private.example/v1", "saved-key")]
         assert len(recorded) == 1
@@ -2096,15 +2428,15 @@ class TestStatelessModalityBilling:
         async def provider(*args, **kwargs):
             calls.append(1)
             if protocol == "chat":
-                return SimpleNamespace(usage=None, choices=[SimpleNamespace(
-                    message=SimpleNamespace(content="OK", tool_calls=None), finish_reason="stop",
-                )])
+                return ProviderObject(usage=None, choices=[{
+                    "message": {"content": "OK", "tool_calls": None}, "finish_reason": "stop",
+                }])
             return {"output": [], "content": [{"type": "text", "text": "OK"}]}
 
-        monkeypatch.setattr(core.litellm_client, {
+        monkeypatch.setattr(core.provider_client, {
             "chat": "acompletion", "responses": "aresponses", "anthropic": "aanthropic_messages",
         }[protocol], provider)
-        monkeypatch.setattr(core.litellm_client, "count_tokens", lambda model, **kw: 50 if "text" in kw else 1000)
+        monkeypatch.setattr(core.provider_metadata, "count_tokens", lambda model, **kw: 50 if "text" in kw else 1000)
         await self.invoke(core, self.route(provider="anthropic"), [{"role": "user", "content": "text only"}], protocol)
         assert calls == [1]
         assert len(recorded) == 1
@@ -2120,7 +2452,7 @@ class TestStatelessModalityBilling:
         async def forbidden(*args, **kwargs):
             pytest.fail("unmeterable request reached provider")
 
-        monkeypatch.setattr(core.litellm_client, {
+        monkeypatch.setattr(core.provider_client, {
             "chat": "acompletion", "responses": "aresponses", "anthropic": "aanthropic_messages",
         }[protocol], forbidden)
         with pytest.raises(core.CompletionError, match="modality_usage_unavailable") as failure:
@@ -2155,17 +2487,17 @@ class TestStatelessModalityBilling:
             calls.append(1)
             if stream:
                 async def chunks():
-                    yield SimpleNamespace(usage=usage, choices=[SimpleNamespace(
-                        delta=SimpleNamespace(content="partial", reasoning_content=None, tool_calls=None),
-                        finish_reason="stop",
-                    )])
+                    yield ProviderObject(usage=usage, choices=[{
+                        "delta": {"content": "partial", "reasoning_content": None, "tool_calls": None},
+                        "finish_reason": "stop",
+                    }])
                 return chunks()
-            return SimpleNamespace(usage=usage, choices=[SimpleNamespace(
-                message=SimpleNamespace(content="OK", tool_calls=None), finish_reason="stop",
-            )])
+            return ProviderObject(usage=usage, choices=[{
+                "message": {"content": "OK", "tool_calls": None}, "finish_reason": "stop",
+            }])
 
-        monkeypatch.setattr(core.litellm_client, "count_tokens", no_estimate)
-        monkeypatch.setattr(core.litellm_client, "acompletion_stream" if stream else "acompletion", provider)
+        monkeypatch.setattr(core.provider_metadata, "count_tokens", no_estimate)
+        monkeypatch.setattr(core.provider_client, "acompletion_stream" if stream else "acompletion", provider)
         with pytest.raises(core.CompletionError, match="modality_usage_unavailable"):
             await self.invoke(core, self.route(), self.media_messages("audio"), stream=stream)
         assert calls == [1]
@@ -2191,7 +2523,7 @@ class TestStatelessModalityBilling:
                 return events()
             return payload
 
-        monkeypatch.setattr(core.litellm_client, "aresponses", provider)
+        monkeypatch.setattr(core.provider_client, "aresponses", provider)
         result = await self.invoke(core, self.route(provider="openai"), [{"role": "user", "content": "text"}],
                                    "responses", stream=stream)
         assert calls == [1]
@@ -2225,8 +2557,8 @@ class TestStatelessModalityBilling:
         def no_estimate(*args, **kwargs):
             pytest.fail("malformed native usage retried as local text")
 
-        monkeypatch.setattr(core.litellm_client, "count_tokens", no_estimate)
-        monkeypatch.setattr(core.litellm_client, "aresponses" if protocol == "responses" else "aanthropic_messages", provider)
+        monkeypatch.setattr(core.provider_metadata, "count_tokens", no_estimate)
+        monkeypatch.setattr(core.provider_client, "aresponses" if protocol == "responses" else "aanthropic_messages", provider)
         with pytest.raises(core.CompletionError, match="modality_usage_unavailable"):
             await self.invoke(core, self.route(provider="openai"), [{"role": "user", "content": "text"}],
                               protocol, stream=True)
@@ -2245,7 +2577,7 @@ class TestStatelessModalityBilling:
         async def forbidden(*args, **kwargs):
             pytest.fail("chat-only modality metering used for a native adapter")
 
-        monkeypatch.setattr(core.litellm_client, "aresponses" if protocol == "responses" else "aanthropic_messages", forbidden)
+        monkeypatch.setattr(core.provider_client, "aresponses" if protocol == "responses" else "aanthropic_messages", forbidden)
         with pytest.raises(core.CompletionError, match="image_input.*modality_usage_unavailable"):
             await self.invoke(core, self.route("image", provider="gemini"), [{"role": "user", "content": [part]}], protocol)
         assert recorded == []

@@ -1,4 +1,16 @@
-"""Bounded, identity-pinned internal HTTPS and per-generation dispatch capabilities."""
+"""Bounded, identity-pinned internal HTTPS and per-generation dispatch capabilities.
+
+Guest TLS contexts are loaded on access from one ``identity_version`` snapshot,
+validated by ``load_identity`` using LUMEN_GUEST_ROLE (default worker). No context
+is cached: each transport request and each external controller-context access
+observes credential rotation. Controller contexts retain hostname verification.
+
+Callers supply current and unexpired previous peer pins as a nonempty frozenset
+of SHA-256 hex fingerprints.
+Pins and the sole URI SAN are checked before sending HTTP on the same TLS socket.
+POST /v1/drain is API-only and capability-free, with an exact, bounded JSON body
+containing the addressed resource_id, generation and nonnegative integer fence.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -21,17 +33,22 @@ from cryptography import x509
 from lumen.services.infrastructure.config import RuntimeConfig, SecretRef
 
 _MAX_REQUEST_BYTES = 256 * 1024
-_MAX_RESPONSE_BYTES = 5 * 1024 * 1024
+_MAX_RESPONSE_BYTES = 8 * 1024 * 1024 + 64 * 1024  # MCP frame plus execution status envelope.
 _UUID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 _PATHS = (
     ("POST", re.compile(r"/v1/executions\Z")),
+    ("POST", re.compile(r"/v1/mcp/executions\Z")),
+    ("GET", re.compile(r"/v1/workspace\Z")),
     ("GET", re.compile(rf"/v1/executions/{_UUID}\Z")),
     ("DELETE", re.compile(rf"/v1/executions/{_UUID}\Z")),
     ("GET", re.compile(rf"/v1/artifacts/{_UUID}\Z")),
     ("GET", re.compile(r"/readyz\Z")),
     ("GET", re.compile(r"/v1/ready\Z")),
+    ("POST", re.compile(r"/v1/drain\Z")),
 )
 _POST_KEYS = {"run_id", "call_id", "fence", "language", "source", "timeout_seconds", "workspace_revision"}
+_MCP_POST_KEYS = {"run_id", "call_id", "fence", "profile", "tool", "arguments", "timeout_seconds", "workspace_revision"}
+_DRAIN_KEYS = {"resource_id", "generation", "fence"}
 
 
 class InternalTransportError(RuntimeError):
@@ -101,7 +118,7 @@ def sign_dispatch_capability(dispatch_key: bytes, *, resource_id: str, run_id: s
     if (not isinstance(dispatch_key, bytes) or not re.fullmatch(_UUID, run_id) or len(dispatch_key) < 32
             or type(fence) is not int or fence < 0 or type(ttl_seconds) is not int
             or not 1 <= ttl_seconds <= 15 or not _allowed(method, path)
-            or path in {"/readyz", "/v1/ready"}):
+            or path in {"/readyz", "/v1/ready", "/v1/drain"}):
         raise InternalTransportError("invalid dispatch scope")
     payload: dict[str, Any] = {
         "aud": "lumen-sandbox", "resource_id": resource_id, "run_id": run_id,
@@ -109,15 +126,23 @@ def sign_dispatch_capability(dispatch_key: bytes, *, resource_id: str, run_id: s
         "fence": fence, "exp": int(time.time()) + ttl_seconds,
     }
     if method == "POST":
-        if (not isinstance(body, dict) or set(body) != _POST_KEYS or body.get("run_id") != run_id
-                or body.get("fence") != fence or body.get("language") not in {"python", "javascript", "shell"}
-                or not isinstance(body.get("source"), str) or len(body["source"].encode("utf-8")) > 65_536
+        keys = _MCP_POST_KEYS if path == "/v1/mcp/executions" else _POST_KEYS
+        if (not isinstance(body, dict) or set(body) != keys or body.get("run_id") != run_id
+                or type(body.get("fence")) is not int or body["fence"] != fence
                 or type(body.get("timeout_seconds")) not in (int, float)
                 or not 0 < body["timeout_seconds"] <= 300
                 or type(body.get("workspace_revision")) is not int or body["workspace_revision"] < 0
                 or not isinstance(body.get("call_id"), str) or not 0 < len(body["call_id"]) <= 128
                 or body["call_id"] != call_id or body["workspace_revision"] != workspace_revision):
             raise InternalTransportError("invalid execution scope")
+        if path == "/v1/mcp/executions":
+            if (not isinstance(body["profile"], str) or not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", body["profile"])
+                    or not isinstance(body["tool"], str) or not 0 < len(body["tool"]) <= 128
+                    or not isinstance(body["arguments"], dict) or len(_canonical(body)) > 65_536):
+                raise InternalTransportError("invalid MCP execution scope")
+        elif (body["language"] not in {"python", "javascript", "shell"}
+                or not isinstance(body["source"], str) or len(body["source"].encode("utf-8")) > 65_536):
+            raise InternalTransportError("invalid code execution scope")
         payload.update(call_id=call_id, workspace_revision=workspace_revision,
                        fingerprint=hashlib.sha256(_canonical(body)).hexdigest())
     elif body is not None or call_id is not None or workspace_revision is not None:
@@ -135,19 +160,22 @@ class InternalTransport:
     """
 
     def __init__(self, config: RuntimeConfig, *, managed_networks: tuple[str, ...] | None = None,
-                 max_request_bytes: int = _MAX_REQUEST_BYTES,
+                 worker_client: bool = False, max_request_bytes: int = _MAX_REQUEST_BYTES,
                  max_response_bytes: int = _MAX_RESPONSE_BYTES):
+        self._fixed_worker_config = config if worker_client else None
         guest_dir = os.environ.get("LUMEN_GUEST_IDENTITY_DIR")
-        if guest_dir:
-            from lumen.services.infrastructure.guest_bootstrap import load_identity
-            directory = Path(guest_dir)
-            load_identity(directory, role="worker", resource_id=os.environ.get("LUMEN_RESOURCE_ID"),
-                          generation=int(os.environ["LUMEN_RESOURCE_GENERATION"]))
-            ca_file = str(directory / "ca.pem")
-            cert_file, key_file = str(directory / "cert.pem"), str(directory / "key.pem")
-        elif config.tls is not None and config.tls.operator_client_cert_file:
-            ca_file = config.tls.ca_file
-            cert_file, key_file = config.tls.operator_client_cert_file, config.tls.operator_client_key_file
+        self._guest_directory = Path(guest_dir) if guest_dir else None
+        if self._guest_directory is not None:
+            self._guest_role = os.environ.get("LUMEN_GUEST_ROLE", "worker")
+            self._guest_resource_id = os.environ.get("LUMEN_RESOURCE_ID")
+            self._guest_generation = int(os.environ["LUMEN_RESOURCE_GENERATION"])
+            self._operator_files = None
+        elif worker_client and config.tls is not None and config.tls.worker_client_cert_file:
+            self._operator_files = (config.tls.ca_file, config.tls.worker_client_cert_file,
+                                    config.tls.worker_client_key_file)
+        elif not worker_client and config.tls is not None and config.tls.operator_client_cert_file:
+            self._operator_files = (config.tls.ca_file, config.tls.operator_client_cert_file,
+                                    config.tls.operator_client_key_file)
         else:
             raise InternalTransportError("dedicated internal client identity missing")
         networks = managed_networks if managed_networks is not None else config.managed_networks
@@ -158,20 +186,49 @@ class InternalTransport:
         self.max_response_bytes = min(max_response_bytes, _MAX_RESPONSE_BYTES)
         if self.max_request_bytes < 1 or self.max_response_bytes < 1:
             raise InternalTransportError("invalid payload bound")
+
+    def _load_context(self, *, check_hostname: bool) -> ssl.SSLContext:
+        """Load one immutable credential snapshot for one new connection.
+
+        Resolve ``current`` only once, then validate and load every file from that
+        version directory. Never retain a guest context across connections.
+        """
+        if self._guest_directory is not None:
+            from lumen.services.infrastructure.guest_bootstrap import identity_version, load_identity
+
+            directory = identity_version(self._guest_directory)
+            load_identity(directory, role=self._guest_role, resource_id=self._guest_resource_id,
+                          generation=self._guest_generation)
+            ca_file = str(directory / "ca.pem")
+            cert_file, key_file = str(directory / "cert.pem"), str(directory / "key.pem")
+        else:
+            if self._fixed_worker_config is not None:
+                from lumen.services.infrastructure.fixed_worker import FixedWorkerIdentityError, load_identity
+
+                try:
+                    if load_identity(self._fixed_worker_config) is None:
+                        raise FixedWorkerIdentityError("fixed worker identity unavailable")
+                except FixedWorkerIdentityError as exc:
+                    raise InternalTransportError("fixed worker identity unavailable") from exc
+            ca_file, cert_file, key_file = self._operator_files
         try:
             context = ssl.create_default_context(cafile=ca_file)
             context.load_cert_chain(cert_file, key_file)
         except (OSError, ssl.SSLError) as exc:
             raise InternalTransportError("internal TLS material unavailable") from exc
         context.minimum_version = ssl.TLSVersion.TLSv1_2
-        # The guest address may not exist when its CSR is exchanged. Validate
-        # the chain in TLS and enforce the pinned URI SAN and fingerprint below.
-        context.check_hostname = False
-        self.context = context
-        controller_context = ssl.create_default_context(cafile=ca_file)
-        controller_context.load_cert_chain(cert_file, key_file)
-        controller_context.minimum_version = ssl.TLSVersion.TLSv1_2
-        self.controller_context = controller_context
+        context.check_hostname = check_hostname
+        return context
+
+    @property
+    def context(self) -> ssl.SSLContext:
+        """Fresh client context; peer URI SAN and pins replace hostname matching."""
+        return self._load_context(check_hostname=False)
+
+    @property
+    def controller_context(self) -> ssl.SSLContext:
+        """Fresh client context for controller callers, retaining hostname checks."""
+        return self._load_context(check_hostname=True)
 
     def _address(self, address: str, port: int) -> str:
         try:
@@ -185,24 +242,35 @@ class InternalTransport:
         return f"[{ip}]" if ip.version == 6 else str(ip)
 
     async def request(self, *, address: str, port: int, role: str, resource_id: str,
-                      generation: int, certificate_fingerprint: str, method: str, path: str,
-                      deadline: datetime, capability: str | None = None,
+                      generation: int, method: str, path: str, deadline: datetime,
+                      certificate_fingerprints: frozenset[str], capability: str | None = None,
                       body: dict[str, Any] | None = None) -> bytes:
         """One bounded request; bytes returned only for an authenticated peer.
 
-        Caller authorizes run/resource/fence before invoking this method. The
-        role-specific readiness probes are mTLS-only; dispatch requires capability.
+        Caller authorizes run/resource/fence and supplies current plus still-valid
+        previous pins. Readiness and API drain are mTLS-only; dispatch requires a
+        capability.
         """
         host = self._address(address, port)
         identity = resource_identity(role, resource_id, generation)
+        if not isinstance(certificate_fingerprints, frozenset) or not certificate_fingerprints:
+            raise InternalTransportError("invalid internal request")
+        pins = certificate_fingerprints
+        if any(not isinstance(pin, str) or not re.fullmatch(r"[a-fA-F0-9]{64}", pin) for pin in pins):
+            raise InternalTransportError("invalid internal request")
+        pins = frozenset(pin.lower() for pin in pins)
         if (not _allowed(method, path)
-                or (role == "sandbox" and path == "/v1/ready")
-                or (role == "api" and path != "/v1/ready")
+                or (role == "sandbox" and path in {"/v1/ready", "/v1/drain"})
+                or (role == "api" and path not in {"/v1/ready", "/v1/drain"})
                 or (role == "worker" and path != "/readyz")
-                or (path in {"/readyz", "/v1/ready"}) != (capability is None)
-                or not re.fullmatch(r"[a-f0-9]{64}", certificate_fingerprint)):
+                or (path in {"/readyz", "/v1/ready", "/v1/drain"}) != (capability is None)):
             raise InternalTransportError("invalid internal request")
         if (method == "POST" and not isinstance(body, dict)) or (method != "POST" and body is not None):
+            raise InternalTransportError("invalid internal payload")
+        if path == "/v1/drain" and (
+                set(body) != _DRAIN_KEYS or body["resource_id"] != resource_id
+                or type(body["generation"]) is not int or body["generation"] != generation
+                or type(body["fence"]) is not int or body["fence"] < 0):
             raise InternalTransportError("invalid internal payload")
         encoded = _canonical(body) if body is not None else None
         if encoded is not None and len(encoded) > self.max_request_bytes:
@@ -210,8 +278,12 @@ class InternalTransport:
         remaining = (deadline - datetime.now(UTC)).total_seconds()
         if remaining <= 0:
             raise InternalTransportError("internal request deadline exceeded")
-        response_limit = min(self.max_response_bytes,
-                             _MAX_RESPONSE_BYTES if path.startswith("/v1/artifacts/") else 1024 * 1024)
+        response_bound = 1024 * 1024
+        if path.startswith("/v1/executions/"):
+            response_bound = _MAX_RESPONSE_BYTES
+        elif path.startswith("/v1/artifacts/"):
+            response_bound = 5 * 1024 * 1024
+        response_limit = min(self.max_response_bytes, response_bound)
         writer = None
         try:
             # Pin the peer on the *same* TLS connection before writing source or
@@ -224,11 +296,12 @@ class InternalTransport:
             )
             ssl_object = writer.get_extra_info("ssl_object")
             peer = ssl_object.getpeercert(binary_form=True) if ssl_object else None
-            if not peer or not hmac.compare_digest(hashlib.sha256(peer).hexdigest(), certificate_fingerprint):
+            fingerprint = hashlib.sha256(peer).hexdigest() if peer else None
+            if fingerprint is None or not any(hmac.compare_digest(fingerprint, pin) for pin in pins):
                 raise InternalTransportError("resource certificate mismatch")
             certificate = x509.load_der_x509_certificate(peer)
             san = certificate.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
-            if identity not in san.get_values_for_type(x509.UniformResourceIdentifier):
+            if san.get_values_for_type(x509.UniformResourceIdentifier) != [identity]:
                 raise InternalTransportError("resource generation mismatch")
 
             connection = h11.Connection(h11.CLIENT, max_incomplete_event_size=16 * 1024)

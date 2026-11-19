@@ -1,6 +1,6 @@
 """빌트인 AI 채팅 사용량 엔드포인트(/api/v1/chat/usage) 단위 테스트.
 
-chat_usage_logs 원장 집계를 user_usage_summary 로 위임 — token_info 의 user_id/project_id 로만 스코프.
+Usage routes delegate to payer-scoped ledger queries.
 """
 
 import pytest
@@ -33,7 +33,10 @@ async def test_get_chat_usage_summary(client, monkeypatch):
         "request_count": 7,
     }
 
-    async def fake_summary(user_id, project_id):
+    async def fake_summary(view, *, member_domain_id):
+        assert view == usage_service.UsageView("test-user-123")
+        # The session's verified domain is passed for the read-only pool aggregates.
+        assert member_domain_id == "test-domain-123"
         return summary
 
     monkeypatch.setattr(usage_mod, "user_usage_summary", fake_summary)
@@ -46,9 +49,9 @@ async def test_get_chat_usage_summary(client, monkeypatch):
 async def test_get_chat_usage_scoped_to_token(client, monkeypatch):
     captured = {}
 
-    async def fake_summary(user_id, project_id):
-        captured["user_id"] = user_id
-        captured["project_id"] = project_id
+    async def fake_summary(view, *, member_domain_id):
+        captured["user_id"] = view.user_id
+        captured["scope"] = view.scope
         return {
             "found": False,
             "total_credited_cost": 0.0,
@@ -61,7 +64,8 @@ async def test_get_chat_usage_scoped_to_token(client, monkeypatch):
     resp = await client.get("/api/v1/chat/usage")
     assert resp.status_code == 200
     assert captured["user_id"] == "test-user-123"
-    assert captured["project_id"] == "test-project-123"
+    # The default view is the caller's own usage, not the domain pool.
+    assert captured["scope"] == "self"
 
 
 @pytest.mark.asyncio
@@ -70,8 +74,8 @@ async def test_usage_timeseries(client, monkeypatch):
 
     captured = {}
 
-    async def fake_ts(bucket, rng, pid, *, user_id, include_system):
-        captured.update(bucket=bucket, rng=rng, user_id=user_id, include_system=include_system)
+    async def fake_ts(bucket, rng, pid, *, include_system, view):
+        captured.update(bucket=bucket, rng=rng, user_id=view.user_id, include_system=include_system)
         return [{"bucket": "2026-07-21", "source": "api", "total_tokens": 10, "credited_cost": 0.1, "request_count": 2}]
 
     monkeypatch.setattr(stats_service, "timeseries", fake_ts)
@@ -89,7 +93,7 @@ async def test_usage_timeseries_bucket_normalized(client, monkeypatch):
 
     seen = {}
 
-    async def fake_ts(bucket, rng, pid, *, user_id, include_system):
+    async def fake_ts(bucket, rng, pid, *, include_system, view):
         seen["bucket"] = bucket
         return []
 
@@ -104,8 +108,8 @@ async def test_usage_keys(client, monkeypatch):
 
     captured = {}
 
-    async def fake_keys(rng, pid, *, user_id, limit=50):
-        captured["user_id"] = user_id
+    async def fake_keys(rng, pid, *, view):
+        captured["user_id"] = view.user_id
         return [{"api_key_id": 3, "name": "k", "total_tokens": 5}]
 
     monkeypatch.setattr(stats_service, "by_api_key", fake_keys)

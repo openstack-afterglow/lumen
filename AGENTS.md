@@ -15,4 +15,4 @@
 ## CI·릴리스
 
 - public GitHub-hosted runner에서는 wall-clock을 최적화한다. [CI spec](openspec/specs/ci-performance/spec.md)의 20회 이상 실측·dedup·병렬 게이트·cache·보안을 따른다. 2026-09 `docker-build.yml` 테스트 중앙값 176초/p90 217초가 기준이다.
-- `main`/`dev` push·PR은 `docker-build.yml`→`ci.yml` 성공 후 게시한다. 동일 트리 PR skip은 head SHA push check를 확인 후 merge한다. `v*` tag는 `release.yml`도 테스트한다(중복). 첫 `dev` push 잡/게시, PR dedup 비용과 tag 게시 증거는 미확인이다.
+- `main`/`dev` push·PR은 `docker-build.yml`→`ci.yml` 성공 후 게시한다. 동일 트리 PR skip은 head SHA push check를 확인 후 merge한다. `v*` tag는 `release.yml`도 테스트한다(중복). 첫 `dev` push의 실제 test/image publish와 초기 non-duplicate PR dedup 비용은 2026-10-07 [CI tasks](openspec/changes/ci-review-round-1/tasks.md)에 GitHub receipts로 확인했다. 새 release의 CI·tag 게시·운영 수용은 각 SHA별로 별도 확인한다.

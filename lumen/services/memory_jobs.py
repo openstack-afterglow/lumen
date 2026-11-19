@@ -9,8 +9,12 @@ from sqlalchemy import or_, select
 
 from lumen.models.chat_jobs import ChatJob
 from lumen.models.chat_runs import ChatRun
+from lumen.services import auxiliary
 from lumen.services import memory_store as ms
 from lumen.services.memory_extract import generate_memory_if_applicable
+from lumen.services.providers.relay_history import receipt_owner
+from lumen.services.vault_store import VaultError, VaultScope, frozen_run_domain, revalidate
+from lumen.services.worker_routing import use_read_committed
 
 _KIND = "memory_extract"
 _LEASE_SECONDS = 120
@@ -28,6 +32,7 @@ async def enqueue_completed_run_in_transaction(session, run: ChatRun, *, memory_
         or run.run_scope != "persistent"
         or run.parent_run_id is not None
         or run.conversation_id is None
+        or frozen_run_domain(run) is None
     ):
         return
     idempotency_key = f"{_KIND}:{run.id}"
@@ -47,7 +52,8 @@ async def enqueue_completed_run_in_transaction(session, run: ChatRun, *, memory_
         )
 
 
-async def _claim_one(*, owner: str) -> tuple[str, str, str, str, str] | None:
+@auxiliary.retry_db
+async def _claim_one(*, owner: str) -> tuple[str, str, str, str, str, str] | None:
     from lumen.db import get_session_factory
 
     factory = get_session_factory()
@@ -55,6 +61,9 @@ async def _claim_one(*, owner: str) -> tuple[str, str, str, str, str] | None:
         return None
     now = _now()
     async with factory() as session, session.begin():
+        await use_read_committed(session)
+        if await auxiliary.lock_admission(session, owner) is None:
+            return None
         job = (
             await session.execute(
                 select(ChatJob)
@@ -70,6 +79,7 @@ async def _claim_one(*, owner: str) -> tuple[str, str, str, str, str] | None:
                 .order_by(ChatJob.next_at, ChatJob.created_at)
                 .limit(1)
                 .with_for_update(skip_locked=True)
+                .execution_options(populate_existing=True)
             )
         ).scalar_one_or_none()
         if job is None or job.run_id is None or job.conversation_id is None:
@@ -79,11 +89,16 @@ async def _claim_one(*, owner: str) -> tuple[str, str, str, str, str] | None:
             job.status = "failed"
             job.error_code = "run_unavailable"
             return None
+        domain_id = frozen_run_domain(run)
+        if domain_id is None:
+            job.status = "failed"
+            job.error_code = "vault_dashboard_required"
+            return None
         job.status = "running"
         job.lease_owner = owner
         job.lease_expires_at = now + timedelta(seconds=_LEASE_SECONDS)
         job.attempts += 1
-        return job.id, job.run_id, job.conversation_id, run.project_id, run.user_id
+        return job.id, job.run_id, job.conversation_id, run.project_id, run.user_id, domain_id
 
 
 async def _apply_and_complete(
@@ -92,6 +107,7 @@ async def _apply_and_complete(
     owner: str,
     project_id: str,
     user_id: str,
+    domain_id: str,
     ops: list[dict] | None,
 ) -> bool:
     """Commit the owner-checked memory mutation and terminal job state together."""
@@ -101,7 +117,7 @@ async def _apply_and_complete(
     if factory is None:
         raise RuntimeError("chat DB is unavailable")
     async with factory() as session, session.begin():
-        job = await session.get(ChatJob, job_id, with_for_update=True)
+        job = await session.get(ChatJob, job_id, with_for_update=True, populate_existing=True)
         if job is None or job.status != "running" or job.lease_owner != owner:
             return False
         applied = {"add": 0, "update": 0, "delete": 0}
@@ -111,6 +127,7 @@ async def _apply_and_complete(
                 ops=ops,
                 user_id=user_id,
                 project_id=project_id,
+                domain_id=domain_id,
             )
         job.status = "completed"
         job.lease_owner = None
@@ -119,6 +136,7 @@ async def _apply_and_complete(
         return True
 
 
+@auxiliary.retry_db
 async def _retry(job_id: str, *, owner: str) -> None:
     from lumen.db import get_session_factory
 
@@ -126,7 +144,7 @@ async def _retry(job_id: str, *, owner: str) -> None:
     if factory is None:
         return
     async with factory() as session, session.begin():
-        job = await session.get(ChatJob, job_id, with_for_update=True)
+        job = await session.get(ChatJob, job_id, with_for_update=True, populate_existing=True)
         if job is None or job.status != "running" or job.lease_owner != owner:
             return
         job.status = "queued"
@@ -136,26 +154,38 @@ async def _retry(job_id: str, *, owner: str) -> None:
         job.next_at = _now() + timedelta(seconds=min(60, 2 ** min(job.attempts, 6)))
 
 
+@auxiliary.worker_step
 async def process_one(*, owner: str) -> bool:
     """Claim and process at most one completed-response memory job."""
     claimed = await _claim_one(owner=owner)
     if claimed is None:
         return False
-    job_id, run_id, conversation_id, project_id, user_id = claimed
+    async with auxiliary.keep_lease(owner=owner, model=ChatJob, key=claimed[0]):
+        return await _process_claimed(claimed, owner=owner)
+
+
+@receipt_owner
+async def _process_claimed(claimed: tuple[str, str, str, str, str, str], *, owner: str) -> bool:
+    job_id, run_id, conversation_id, project_id, user_id, domain_id = claimed
+    scope = VaultScope(user_id, domain_id, project_id)
     try:
+        await revalidate(scope, "read")
         ops = await generate_memory_if_applicable(
-            conversation_id=conversation_id,
-            project_id=project_id,
-            run_id=run_id,
-            user_id=user_id,
+            conversation_id=conversation_id, project_id=project_id, run_id=run_id,
+            user_id=user_id, domain_id=domain_id,
         )
+        if ops:
+            await revalidate(scope, "write")
         await _apply_and_complete(
-            job_id,
-            owner=owner,
-            project_id=project_id,
-            user_id=user_id,
-            ops=ops,
+            job_id, owner=owner, project_id=project_id, user_id=user_id, domain_id=domain_id, ops=ops,
         )
+    except VaultError as exc:
+        if exc.status == 403:
+            await _apply_and_complete(
+                job_id, owner=owner, project_id=project_id, user_id=user_id, domain_id=domain_id, ops=None,
+            )
+        else:
+            await _retry(job_id, owner=owner)
     except Exception:
         await _retry(job_id, owner=owner)
     return True

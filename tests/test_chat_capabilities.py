@@ -7,10 +7,76 @@ import lumen.services.capabilities as capability_service
 import lumen.services.providers.credentials as provider_credentials
 import lumen.services.providers.pricing as provider_pricing
 import lumen.services.providers.routing as provider_store
-from lumen.services.capabilities import litellm_capabilities, normalize_capabilities
+from lumen.services.capabilities import normalize_capabilities, provider_capabilities
 from lumen.services.providers.pricing import _effective_capabilities, _model_public, _pricing_aware_capabilities
 from lumen.services.providers.routing import _resolved_model, _resolved_provider
 
+
+@pytest.fixture
+def native_catalog(monkeypatch):
+    from lumen.services import provider_metadata
+
+    def install(provider_type=None, model_name="example-model", **fields):
+        providers = {}
+        if provider_type is not None:
+            source_url = {
+                "openai": "https://developers.openai.com/api/docs/pricing",
+                "anthropic": "https://docs.anthropic.com/en/docs/about-claude/pricing",
+                "gemini": "https://ai.google.dev/gemini-api/docs/pricing",
+                "perplexity": "https://docs.perplexity.ai/guides/pricing",
+            }[provider_type]
+            flags = fields.pop("capabilities", {})
+            entry = {
+                "id": model_name,
+                "aliases": [],
+                "kind": "text",
+                "display_name": model_name,
+                "status": "active",
+                "context_window": None,
+                "max_output_tokens": None,
+                "input_modalities": ["text"],
+                "output_modalities": ["text"],
+                "capabilities": {
+                    flag: flags.get(flag, False)
+                    for flag in (
+                        "vision", "tool_call", "reasoning", "prompt_caching",
+                        "structured_output", "web_search", "decisions",
+                    )
+                },
+                "token_pricing": None,
+                "media_pricing": None,
+                "source_urls": [source_url],
+                "verified_at": "2026-11-17",
+                "notes": None,
+                **fields,
+            }
+            providers[provider_type] = {
+                "display_name": provider_type,
+                "pricing_sources": [source_url],
+                "models": [entry],
+            }
+        catalog = {"schema_version": 1, "catalog_version": "2099-01-01", "providers": providers}
+        monkeypatch.setattr(provider_metadata, "native_catalog", lambda: catalog)
+        return catalog
+
+    return install
+
+
+def _attach_credentials(provider):
+    credential = SimpleNamespace(
+        id=11, account_id=9, auth_mode="api_key", generation=0, is_active=True,
+        allowed_model_ids=None, allowed_capabilities=None, encrypted_api_key="ciphertext",
+        api_key_env=None, subscription_status="configured", priority=0, weight=1,
+    )
+    account = SimpleNamespace(
+        id=9, provider_id=provider.id, credentials=[credential], is_active=True,
+        allowed_model_ids=None, allowed_capabilities=None, priority=0, weight=1, quota_group=None,
+    )
+    provider.accounts = [account]
+    provider.auth_mode = "api_key"
+    provider.selection_policy = "priority"
+    provider.selected_credential_id = None
+    return credential
 
 def _model(*, metadata: dict, input_price: str | None = "0.000001", output_price: str | None = "0.000002"):
     return SimpleNamespace(price_metadata=metadata, input_price=input_price, output_price=output_price)
@@ -21,7 +87,7 @@ def _capabilities():
         "feature_gates": {
             "text": {"available": True, "pricing_available": True},
             "structured_output": {"available": True, "pricing_available": True},
-            "web_search": {"available": True, "pricing_available": True},
+            "web_search": {"available": True, "mode": "managed", "pricing_available": True},
             "web_fetch": {"available": True, "pricing_available": True},
             "image_output": {"available": True, "pricing_available": True},
         }
@@ -32,6 +98,7 @@ def _detected_native_search_capabilities(*, available: bool, required: bool = Fa
     return {
         "web_search": available,
         "web_search_required": required,
+        "native_web_search_transport_supported": available,
         "feature_gates": {
             "web_search": {
                 "available": available,
@@ -43,39 +110,26 @@ def _detected_native_search_capabilities(*, available: bool, required: bool = Fa
     }
 
 
-def test_perplexity_catalog_context_limit_uses_canonical_agent_identifier(monkeypatch):
-    import litellm
+def test_perplexity_catalog_context_limit_uses_canonical_agent_identifier(native_catalog):
+    native_catalog("perplexity", "perplexity/sonar", context_window=128_000)
 
-    monkeypatch.setattr(
-        litellm,
-        "model_cost",
-        {"perplexity/sonar": {"max_input_tokens": 128_000}},
-    )
-    monkeypatch.setattr(capability_service, "_probe", lambda *_args, **_kwargs: False)
-
-    capabilities = litellm_capabilities("perplexity/perplexity/sonar", "perplexity")
+    capabilities = provider_capabilities("perplexity/perplexity/sonar", "perplexity")
 
     assert capabilities["context_limit"] == 128_000
 
 
-def test_unknown_perplexity_catalog_context_limit_remains_unknown(monkeypatch):
-    import litellm
+def test_unknown_perplexity_catalog_context_limit_remains_unknown(native_catalog):
+    native_catalog()
 
-    monkeypatch.setattr(litellm, "model_cost", {})
-    monkeypatch.setattr(capability_service, "_probe", lambda *_args, **_kwargs: False)
-
-    capabilities = litellm_capabilities("perplexity/perplexity/glm-5.3", "perplexity")
+    capabilities = provider_capabilities("perplexity/perplexity/glm-5.3", "perplexity")
 
     assert capabilities["context_limit"] is None
 
 
-def test_admin_override_without_a_window_keeps_the_exact_catalog_limit(monkeypatch):
+def test_admin_override_without_a_window_keeps_the_exact_catalog_limit(native_catalog):
     """CapabilitiesInput always serializes context_limit, so null must not erase detection."""
-    import litellm
-
-    monkeypatch.setattr(litellm, "model_cost", {"perplexity/sonar": {"max_input_tokens": 128_000}})
-    monkeypatch.setattr(capability_service, "_probe", lambda *_args, **_kwargs: False)
-    detected = litellm_capabilities("perplexity/perplexity/sonar", "perplexity")
+    native_catalog("perplexity", "perplexity/sonar", context_window=128_000)
+    detected = provider_capabilities("perplexity/perplexity/sonar", "perplexity")
 
     stored_flag_only = normalize_capabilities({"tool_call": False, "context_limit": None}, detected)
     assert stored_flag_only["context_limit"] == 128_000
@@ -86,14 +140,103 @@ def test_admin_override_without_a_window_keeps_the_exact_catalog_limit(monkeypat
     assert normalize_capabilities({"context_limit": 64_000}, detected)["context_limit"] == 64_000
 
 
-def test_admin_override_cannot_invent_a_window_for_an_uncatalogued_model(monkeypatch):
-    import litellm
-
-    monkeypatch.setattr(litellm, "model_cost", {})
-    monkeypatch.setattr(capability_service, "_probe", lambda *_args, **_kwargs: False)
-    detected = litellm_capabilities("perplexity/perplexity/glm-5.3", "perplexity")
+def test_admin_override_cannot_invent_a_window_for_an_uncatalogued_model(native_catalog):
+    native_catalog()
+    detected = provider_capabilities("perplexity/perplexity/glm-5.3", "perplexity")
 
     assert normalize_capabilities({"tool_call": True, "context_limit": None}, detected)["context_limit"] is None
+
+
+@pytest.mark.parametrize("available", (False, True))
+def test_native_catalog_flags_map_to_canonical_capabilities_and_gates(native_catalog, available):
+    flags = {
+        flag: available
+        for flag in (
+            "vision", "tool_call", "reasoning", "prompt_caching",
+            "structured_output", "web_search", "decisions",
+        )
+    }
+    native_catalog(
+        "openai", "catalog-model", capabilities=flags,
+        context_window=128_000, max_output_tokens=16_000,
+        input_modalities=["text", "image"] if available else ["text"],
+    )
+
+    capabilities = provider_capabilities("catalog-model", "openai", "https://api.openai.com/v1")
+
+    for flag in flags:
+        assert capabilities[flag] is available
+    assert capabilities["function_calling"] is available
+    assert capabilities["attachment"] is available
+    assert capabilities["context_limit"] == 128_000
+    assert capabilities["max_output_tokens"] == 16_000
+    assert capabilities["metadata_source"] == "catalog"
+    assert capabilities["metadata_status"] == "observed"
+    assert capabilities["metadata_version"] == "2099-01-01"
+    for feature in ("image_input", "structured_output", "decisions"):
+        assert capabilities["feature_gates"][feature] == {
+            "available": available,
+            "mode": "native" if available else "none",
+            "reason_code": None if available else "provider_unsupported",
+            "pricing_available": available,
+        }
+    assert capabilities["feature_gates"]["web_search"] == {
+        "available": False, "mode": "none",
+        "reason_code": "pricing_unavailable" if available else "provider_unsupported",
+        "pricing_available": False,
+    }
+
+
+@pytest.mark.parametrize("provider_type", ("openai", "anthropic"))
+def test_compatible_capabilities_never_read_native_catalog(monkeypatch, provider_type):
+    from lumen.services import provider_metadata
+
+    def forbidden_catalog():
+        raise AssertionError("compatible routes must not read native catalog")
+
+    monkeypatch.setattr(provider_metadata, "native_catalog", forbidden_catalog)
+
+    capabilities = provider_capabilities("gpt-6-luna", provider_type, "https://compatible.example.test/v1")
+
+    for flag in (
+        "vision", "tool_call", "function_calling", "reasoning", "prompt_caching",
+        "structured_output", "web_search", "decisions",
+    ):
+        assert capabilities[flag] is False
+    assert capabilities["context_limit"] is None
+    assert capabilities["metadata_source"] is None
+    assert capabilities["metadata_status"] == "missing"
+    assert capabilities["metadata_version"] is None
+
+
+@pytest.mark.parametrize("available", (False, True))
+def test_decisions_override_updates_boolean_and_gate(native_catalog, available):
+    native_catalog("openai", "decision-model", capabilities={"decisions": not available})
+    detected = provider_capabilities("decision-model", "openai")
+
+    normalized = normalize_capabilities({"decisions": available}, detected)
+
+    assert normalized["decisions"] is available
+    assert normalized["feature_gates"]["decisions"] == {
+        "available": available,
+        "mode": "native" if available else "none",
+        "reason_code": None if available else "provider_unsupported",
+        "pricing_available": available,
+    }
+
+
+@pytest.mark.parametrize("input_price", (None, "0.000001"))
+def test_decisions_pricing_requires_only_input_rate(native_catalog, input_price):
+    native_catalog("openai", "decision-model", capabilities={"decisions": True})
+    detected = provider_capabilities("decision-model", "openai")
+
+    capabilities = _pricing_aware_capabilities(
+        _model(metadata={}, input_price=input_price, output_price=None), detected,
+    )
+
+    assert capabilities["decisions"] is True
+    assert capabilities["feature_gates"]["decisions"]["available"] is True
+    assert capabilities["feature_gates"]["decisions"]["pricing_available"] is (input_price is not None)
 
 
 def test_feature_gate_pricing_is_derived_from_model_prices_and_components():
@@ -117,13 +260,15 @@ def test_feature_gate_pricing_is_derived_from_model_prices_and_components():
     assert gates["image_output"]["pricing_available"] is False
 
 
-def test_native_search_uses_selected_model_price_not_managed_component_prices():
+def test_native_search_remains_unpriced_until_search_fees_are_billable():
     caps = _capabilities()
     caps["feature_gates"]["web_search"]["mode"] = "native"
 
     gated = _pricing_aware_capabilities(_model(metadata={}), caps)
 
-    assert gated["feature_gates"]["web_search"]["pricing_available"] is True
+    assert gated["feature_gates"]["web_search"]["pricing_available"] is False
+    assert gated["feature_gates"]["web_search"]["available"] is False
+    assert gated["feature_gates"]["web_search"]["reason_code"] == "pricing_unavailable"
 
     unpriced = _pricing_aware_capabilities(_model(metadata={}, input_price=None, output_price=None), caps)
     assert unpriced["feature_gates"]["web_search"]["pricing_available"] is False
@@ -221,7 +366,7 @@ def test_models_dev_legacy_capabilities_are_normalized_to_feature_gates():
             "tool_call": True,
             "modalities": {"input": ["text", "image"], "output": ["text", "image"]},
         },
-        litellm_capabilities("example-model", "openai"),
+        provider_capabilities("example-model", "openai"),
     )
 
     assert normalized["function_calling"] is True
@@ -234,7 +379,7 @@ def test_models_dev_pdf_modality_enables_the_document_input_gate():
         {
             "modalities": {"input": ["text", "pdf"], "output": ["text"]},
         },
-        litellm_capabilities("example-model", "openai"),
+        provider_capabilities("example-model", "openai"),
     )
 
     assert normalized["input_modalities"] == ["text", "pdf"]
@@ -242,7 +387,7 @@ def test_models_dev_pdf_modality_enables_the_document_input_gate():
 
 
 def test_stored_canonical_gates_and_detected_modalities_are_preserved():
-    detected = litellm_capabilities("example-model", "openai")
+    detected = provider_capabilities("example-model", "openai")
     detected["input_modalities"] = ["text"]
     detected["output_modalities"] = ["text"]
     normalized = normalize_capabilities(
@@ -265,7 +410,7 @@ def test_stored_canonical_gates_and_detected_modalities_are_preserved():
     assert normalized["output_modalities"] == ["text"]
 
 
-def test_managed_search_does_not_retain_native_sonar_requirement():
+def test_managed_search_does_not_remove_intrinsic_sonar_scope_floor():
     normalized = normalize_capabilities(
         {
             "feature_gates": {
@@ -281,7 +426,7 @@ def test_managed_search_does_not_retain_native_sonar_requirement():
     )
 
     assert normalized["feature_gates"]["web_search"]["mode"] == "managed"
-    assert normalized["web_search_required"] is False
+    assert normalized["web_search_required"] is True
 
 
 def test_stored_native_search_gate_cannot_enable_unsupported_transport():
@@ -341,10 +486,10 @@ def test_legacy_native_search_enable_preserves_detected_api_support():
 
     assert normalized["web_search"] is True
     assert normalized["feature_gates"]["web_search"] == {
-        "available": True,
-        "mode": "native",
-        "reason_code": None,
-        "pricing_available": True,
+        "available": False,
+        "mode": "none",
+        "reason_code": "pricing_unavailable",
+        "pricing_available": False,
     }
 
 
@@ -356,14 +501,14 @@ def test_stored_canonical_modality_gates_are_not_clobbered_without_legacy_fields
                 "audio_output": {"available": True, "mode": "managed", "reason_code": None, "pricing_available": True},
             }
         },
-        litellm_capabilities("example-model", "openai"),
+        provider_capabilities("example-model", "openai"),
     )
 
     assert normalized["feature_gates"]["image_input"]["mode"] == "managed"
     assert normalized["feature_gates"]["audio_output"]["mode"] == "managed"
 
 
-def test_resolved_model_uses_a_secret_keyed_config_version_hash(monkeypatch):
+def test_resolved_model_fences_selected_credential_generation_without_decrypting(monkeypatch):
     model = SimpleNamespace(
         id=7,
         model_name="gpt-test",
@@ -381,39 +526,41 @@ def test_resolved_model_uses_a_secret_keyed_config_version_hash(monkeypatch):
         provider_type="openai",
         api_provider="openai",
         api_base="https://api.example.test/v1",
-        encrypted_api_key="ciphertext",
+        selection_policy="priority",
         is_active=True,
         margin_multiplier="1.25",
     )
-    decrypted_key = {"value": "first-secret"}
-    monkeypatch.setattr(provider_credentials, "decrypt_llm_provider_key", lambda _: decrypted_key["value"])
+    credential = _attach_credentials(provider)
+    monkeypatch.setattr(provider_credentials, "decrypt_llm_provider_key", lambda _: (_ for _ in ()).throw(AssertionError("route must be secret-free")))
     monkeypatch.setattr(provider_store, "derive_encryption_subkey", lambda _: b"test-hmac-key")
 
     first = _resolved_model(model, provider)
-    decrypted_key["value"] = "rotated-secret"
+    credential.generation += 1
     second = _resolved_model(model, provider)
 
     assert first["config_version_hash"] != second["config_version_hash"]
     assert first["config_version_hash"] != "first-secret"
     assert "first-secret" not in first["config_version_hash"]
+    assert first["provider_auth"]["credential_id"] == credential.id
+    assert first["api_key"] is None
 
 
-def test_resolved_provider_uses_secret_keyed_config_version_hash(monkeypatch):
+def test_resolved_provider_fences_selected_credential_generation_without_decrypting(monkeypatch):
     provider = SimpleNamespace(
         id=3,
         name="search-provider",
         provider_type="perplexity",
-        api_base="https://search.example.test",
-        encrypted_api_key="ciphertext",
+        api_base="https://api.perplexity.ai",
+        selection_policy="priority",
         is_active=True,
         margin_multiplier="1.25",
     )
-    decrypted_key = {"value": "first-secret"}
-    monkeypatch.setattr(provider_credentials, "decrypt_llm_provider_key", lambda _: decrypted_key["value"])
+    credential = _attach_credentials(provider)
+    monkeypatch.setattr(provider_credentials, "decrypt_llm_provider_key", lambda _: (_ for _ in ()).throw(AssertionError("route must be secret-free")))
     monkeypatch.setattr(provider_store, "derive_encryption_subkey", lambda _: b"test-hmac-key")
 
     first = _resolved_provider(provider)
-    decrypted_key["value"] = "rotated-secret"
+    credential.generation += 1
     second = _resolved_provider(provider)
 
     assert first["config_version_hash"] != second["config_version_hash"]
@@ -421,7 +568,7 @@ def test_resolved_provider_uses_secret_keyed_config_version_hash(monkeypatch):
     assert first["provider_name"] == "search-provider"
 
 
-def test_resolved_model_gates_litellm_fallback_prices(monkeypatch):
+def test_resolved_model_gates_frozen_catalog_prices(monkeypatch):
     model = SimpleNamespace(
         id=7,
         model_name="fallback-model",
@@ -439,21 +586,26 @@ def test_resolved_model_gates_litellm_fallback_prices(monkeypatch):
         provider_type="openai",
         api_provider="openai",
         api_base=None,
-        encrypted_api_key=None,
+        selection_policy="priority",
         margin_multiplier="1",
         is_active=True,
     )
+    _attach_credentials(provider)
     monkeypatch.setattr(provider_pricing, "effective_prices_per_million", lambda *_, **__: (Decimal("1"), Decimal("2")))
 
     resolved = _resolved_model(model, provider)
 
-    assert resolved["price_source"] == "litellm"
+    assert resolved["price_source"] == "native_catalog"
     assert resolved["input_price_per_token"] == Decimal("0.0000010000")
     assert resolved["output_price_per_token"] == Decimal("0.0000020000")
     assert resolved["capabilities"]["feature_gates"]["text"]["pricing_available"] is True
 
 
-def test_perplexity_agent_prices_resolve_from_canonical_or_documented_exact_routes():
+def test_perplexity_agent_prices_resolve_from_canonical_native_catalog(native_catalog):
+    native_catalog(
+        "perplexity", "perplexity/sonar",
+        token_pricing={"input": "0.25", "output": "2.50"},
+    )
     provider = SimpleNamespace(provider_type="perplexity", api_base="https://api.perplexity.ai/v1")
     sonar = SimpleNamespace(
         model_name="perplexity/perplexity/sonar",
@@ -475,12 +627,16 @@ def test_perplexity_agent_prices_resolve_from_canonical_or_documented_exact_rout
     assert provider_pricing._resolved_base_prices(sonar, provider)[:3] == (
         Decimal("0.0000002500"),
         Decimal("0.0000025000"),
-        "perplexity_agent_api_2026-09",
+        "native_catalog",
+    )
+    native_catalog(
+        "perplexity", "perplexity/glm-5.3",
+        token_pricing={"input": "1.40", "output": "4.40"},
     )
     assert provider_pricing._resolved_base_prices(glm, provider)[:3] == (
         Decimal("0.0000014000"),
         Decimal("0.0000044000"),
-        "perplexity_agent_api_2026-09",
+        "native_catalog",
     )
 
 
@@ -510,24 +666,168 @@ def test_public_model_marks_unpriced_text_route_unavailable():
     assert public["effective_capabilities"]["feature_gates"]["text"]["pricing_available"] is False
 
 
-def test_chatgpt_subscription_capabilities_use_static_metadata_without_provider_probe(monkeypatch):
-    monkeypatch.setattr(
-        capability_service,
-        "_probe",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("provider probe is forbidden")),
+def _priced_compatible_model(capabilities=None, capability_source=None):
+    return SimpleNamespace(
+        id=8, provider_id=3, model_name="custom-compatible-model", display_name=None, sort_order=0,
+        is_active=True, is_title_model=False, is_memory_model=False,
+        input_price=Decimal("0.000001"), output_price=Decimal("0.000002"), price_source="manual",
+        price_metadata=None, capabilities=capabilities, capability_source=capability_source,
+        models_dev_model_id=None, created_at=None, updated_at=None,
     )
 
-    capabilities = litellm_capabilities("chatgpt/gpt-5.2-codex", "chatgpt")
+
+def test_domain_billing_reports_unknown_context_limit_until_admin_override(native_catalog):
+    native_catalog()
+    public = _model_public(_priced_compatible_model(), provider_type="openai", api_provider="openai",
+                           api_base="https://compatible.example/v1")
+    assert public["effective_capabilities"]["context_limit"] is None
+    assert public["domain_billing"] == {"ready": False, "reason_code": "context_limit_unknown"}
+
+    overridden = _model_public(
+        _priced_compatible_model({"context_limit": 32_000}, "override"),
+        provider_type="openai", api_provider="openai", api_base="https://compatible.example/v1",
+    )
+    assert overridden["effective_capabilities"]["context_limit"] == 32_000
+    assert overridden["domain_billing"] == {"ready": True, "reason_code": None}
+
+
+def test_malformed_stored_token_rates_mark_one_model_unready_without_breaking_catalog(native_catalog, monkeypatch):
+    native_catalog()
+
+    def invalid(_route):
+        raise provider_pricing.ProviderValidationError("token_rates invalid")
+
+    monkeypatch.setattr(provider_pricing, "route_token_rates", invalid)
+    public = _model_public(_priced_compatible_model({"context_limit": 32_000}, "override"),
+                           provider_type="openai", api_provider="openai", api_base="https://compatible.example/v1")
+    assert public["domain_billing"] == {"ready": False, "reason_code": "pricing_unavailable"}
+
+
+@pytest.mark.parametrize(("capabilities", "prices", "reason"), [
+    ({"context_limit": 8000}, (None, Decimal("1")), "pricing_unavailable"),
+    ({"context_limit": 8000, "output_budget_enforced": False}, (Decimal("1"), Decimal("1")), "output_budget_unenforced"),
+    ({"context_limit": None}, (Decimal("1"), Decimal("1")), "context_limit_unknown"),
+    ({"context_limit": 8000}, (Decimal("1"), Decimal("1")), None),
+    # A zero-rate route reserves nothing at provider start, so neither bound is needed.
+    ({"context_limit": None, "output_budget_enforced": False}, (Decimal("0"), Decimal("0")), None),
+])
+def test_domain_paid_admission_rejects_unready_model_before_run(capabilities, prices, reason):
+    from fastapi import HTTPException
+
+    from lumen.models.chat_contracts import ChatFeatureOptions
+    from lumen.services.chat_admission import _require_execution_capability
+
+    gates = {"text": {"available": True, "mode": "native", "reason_code": None, "pricing_available": True}}
+    resolved = {"capabilities": {**capabilities, "feature_gates": gates},
+                "input_price_per_token": prices[0], "output_price_per_token": prices[1]}
+    if prices[0] is not None:
+        # A user-funded run keeps today's admission; only domain-paid calls need the prepaid bound.
+        _require_execution_capability(ChatFeatureOptions(), resolved)
+    if reason is None:
+        _require_execution_capability(ChatFeatureOptions(), resolved, domain_paid=True)
+        return
+    with pytest.raises(HTTPException) as error:
+        _require_execution_capability(ChatFeatureOptions(), resolved, domain_paid=True)
+    assert error.value.status_code == 422
+    # Unpriced text is already refused by the text gate for every payer.
+    expected = "text (pricing_unavailable)" if reason == "pricing_unavailable" else f"domain_billing ({reason})"
+    assert error.value.detail.endswith(expected)
+
+
+@pytest.mark.parametrize("advisor_limit", [None, 4000])
+def test_domain_paid_advisor_route_needs_frozen_bounds(advisor_limit):
+    from fastapi import HTTPException
+
+    from lumen.models.chat_contracts import ChatFeatureOptions
+    from lumen.services.chat_admission import _require_execution_capability
+
+    gates = {"text": {"available": True, "mode": "native", "reason_code": None, "pricing_available": True}}
+    resolved = {"capabilities": {"context_limit": 8000, "function_calling": True, "feature_gates": gates},
+                "input_price_per_token": Decimal("0.000001"), "output_price_per_token": Decimal("0.000002")}
+    routes = {"advisor": {"provider_id": 7, "model_id": 9, "input_price_per_token": "0.0003",
+                          "output_price_per_token": "0.0004", "capabilities": {"context_limit": advisor_limit}}}
+    features = ChatFeatureOptions(advisor={"enabled": True, "model_id": 9})
+    _require_execution_capability(features, resolved, feature_routes=routes)
+    if advisor_limit is not None:
+        _require_execution_capability(features, resolved, feature_routes=routes, domain_paid=True)
+        return
+    with pytest.raises(HTTPException) as error:
+        _require_execution_capability(features, resolved, feature_routes=routes, domain_paid=True)
+    assert error.value.detail.endswith("advisor (context_limit_unknown)")
+
+
+def test_zero_base_input_with_priced_cache_still_needs_context_limit():
+    from lumen.services.providers.pricing import domain_billing_readiness
+
+    pricing = {"input_price_per_token": "0", "output_price_per_token": "0", "cache_read_price_per_token": "0.000001"}
+    assert domain_billing_readiness({"context_limit": None}, pricing) == {
+        "ready": False, "reason_code": "context_limit_unknown",
+    }
+
+
+@pytest.mark.parametrize(("domain_paid", "title_ready", "expected"), [
+    (False, False, "title"), (True, True, "title"), (True, False, "execution"),
+])
+async def test_domain_paid_compaction_never_uses_unready_title_route(monkeypatch, domain_paid, title_ready, expected):
+    from lumen.services import chat_admission
+
+    title = {"model_name": "title", "input_price_per_token": Decimal("0.000001"),
+             "output_price_per_token": Decimal("0.000002"),
+             "capabilities": {"context_limit": 4000 if title_ready else None}}
+    execution = {"model_name": "execution"}
+
+    async def resolve_title_model():
+        return title
+
+    monkeypatch.setattr(chat_admission.ps, "resolve_title_model", resolve_title_model)
+    route = await chat_admission.resolve_summary_route(execution, domain_paid=domain_paid)
+    assert route["model_name"] == expected
+
+
+@pytest.mark.parametrize("title_ready", [False, True])
+async def test_admin_title_model_reports_domain_compaction_route(monkeypatch, title_ready):
+    from lumen.api import models as admin_models
+
+    async def resolve_title_model():
+        return {"model_id": 9, "model_name": "title", "input_price_per_token": Decimal("0.000001"),
+                "output_price_per_token": Decimal("0.000002"),
+                "capabilities": {"context_limit": 4000 if title_ready else None}}
+
+    monkeypatch.setattr(admin_models.routing, "resolve_title_model", resolve_title_model)
+    report = await admin_models.get_title_model()
+    assert report["model_id"] == 9
+    assert report["domain_billing"] == ({"ready": True, "reason_code": None} if title_ready
+                                        else {"ready": False, "reason_code": "context_limit_unknown"})
+    assert report["domain_compaction_route"] == ("title_model" if title_ready else "execution_model")
+
+
+def test_chatgpt_subscription_uses_catalog_capabilities_without_api_prices(monkeypatch):
+    original = capability_service.catalog_model_metadata
+    observed = []
+
+    def metadata(model_name, provider_type, api_base=None):
+        observed.append((model_name, provider_type))
+        return original(model_name, provider_type, api_base)
+
+    monkeypatch.setattr(capability_service, "catalog_model_metadata", metadata)
+    capabilities = provider_capabilities("chatgpt/gpt-5.5", "chatgpt")
+    assert observed == [("gpt-5.5", "openai")]
+    assert capabilities["vision"] is True
+    assert capabilities["function_calling"] is True
+    assert capabilities["reasoning"] is True
+    assert capabilities["context_limit"] == 1050000
+    assert capabilities["max_output_tokens"] == 128000
 
     assert capabilities["responses_api"] is True
     assert capabilities["endpoints"] == ["responses"]
     assert capabilities["structured_output"] is False
+    assert capabilities["output_budget_enforced"] is False
 
 
 def test_chatgpt_subscription_override_cannot_enable_structured_output():
     model = SimpleNamespace(
         model_name="chatgpt/gpt-5.2-codex",
-        capabilities={"structured_output": True, "tools": True},
+        capabilities={"structured_output": True, "tools": True, "output_budget_enforced": True},
         capability_source="override",
     )
 
@@ -536,6 +836,7 @@ def test_chatgpt_subscription_override_cannot_enable_structured_output():
     assert source == "override"
     assert capabilities["tools"] is True
     assert capabilities["structured_output"] is False
+    assert capabilities["output_budget_enforced"] is False
 
 
 @pytest.mark.parametrize("auth_mode", ("chatgpt_device", "anthropic_subscription"))

@@ -25,6 +25,13 @@ def _provider(
         encrypted_api_key="ciphertext",
         encrypted_billing_admin_key="billing-ciphertext" if has_billing_admin_key else None,
         api_key_env=None,
+        selection_policy="priority",
+        accounts=[SimpleNamespace(id=provider_id, provider_id=provider_id, is_active=True,
+            priority=0, weight=1, allowed_model_ids=None, allowed_capabilities=None,
+            credentials=[SimpleNamespace(id=provider_id, account_id=provider_id, auth_mode=auth_mode,
+                generation=0, is_active=True, priority=0, weight=1, allowed_model_ids=None,
+                allowed_capabilities=None, encrypted_api_key="ciphertext", api_key_env=None,
+                subscription_status="disconnected")])],
     )
 
 
@@ -44,49 +51,29 @@ async def test_provider_billing_route_requires_admin(non_admin_client):
 
 async def test_provider_billing_route_returns_safe_bulk_snapshot(admin_client, monkeypatch):
     async def fake_snapshots():
-        return [
-            {
-                "provider_id": 3,
-                "provider_name": "openrouter-prod",
-                "provider_type": "openrouter",
-                "capability": "openrouter_key",
-                "status": "available",
-                "reason": None,
-                "fetched_at": "2026-09-11T00:00:00+00:00",
-                "billing_url": "https://openrouter.ai/settings/credits",
-                "usage_url": "https://openrouter.ai/activity",
-                "has_billing_admin_key": False,
-                "provider_usage": None,
-                "local_usage": _usage(monthly_cost="12.5"),
-                "is_available": None,
-                "is_free_tier": False,
-                "limit": "100",
-                "remaining": "75",
-                "usage_total": "25",
-                "usage_daily": "1",
-                "usage_weekly": "5",
-                "usage_monthly": "20",
-                "balances": [],
-            }
-        ]
+        return [{
+            **billing._base(_provider(3, "openai-prod", "openai"), "openai_admin_usage", _usage(monthly_cost="12.5")),
+            "status": "available",
+            "reason": None,
+        }]
 
     monkeypatch.setattr(billing, "list_provider_billing", fake_snapshots)
     response = await admin_client.get("/v1/admin/providers/billing")
 
     assert response.status_code == 200
-    assert response.json()[0]["remaining"] == "75"
+    assert response.json()[0]["remaining"] is None
     assert response.json()[0]["local_usage"]["raw_cost"]["monthly"] == "12.5"
     assert "api_key" not in response.text
     assert "ciphertext" not in response.text
 
 
 def test_only_documented_provider_billing_endpoints_are_supported():
-    assert billing.billing_capability_for("openrouter") == "openrouter_key"
-    assert billing.billing_capability_for("deepseek") == "deepseek_balance"
+    assert billing.billing_capability_for("openrouter") is None
+    assert billing.billing_capability_for("deepseek") is None
     assert billing.billing_capability_for("openai") == "openai_admin_usage"
     assert billing.billing_capability_for("anthropic") == "anthropic_admin_usage"
     assert billing.billing_capability_for("openai", api_base="https://proxy.example/v1") is None
-    assert billing.billing_capability_for("openrouter", "chatgpt_device") is None
+    assert billing.billing_capability_for("openai", "chatgpt_device") is None
 
 
 async def test_openai_admin_reports_normalize_current_period_cost_requests_and_tokens(monkeypatch):
@@ -288,52 +275,23 @@ def test_provider_portals_are_fixed_and_exclude_custom_or_subscription_routes():
     ) == (None, None)
 
 
-def test_openrouter_snapshot_maps_period_usage_and_limit():
-    provider = _provider(1, "openrouter", "openrouter")
-    base = billing._base(provider, "openrouter_key")
+@pytest.mark.parametrize("provider_type", [
+    "groq", "deepseek", "mistral", "together_ai", "openrouter", "xai", "ollama",
+    "azure", "bedrock", "vertex", "cohere", "tavily", "exa_ai", "brave", "searxng", "duckduckgo",
+])
+async def test_removed_inference_and_search_types_have_no_billing_transport(monkeypatch, provider_type):
+    async def no_request(*_args, **_kwargs):
+        pytest.fail("unsupported provider must not call a billing transport")
 
-    snapshot = billing._openrouter_snapshot(
-        base,
-        {
-            "data": {
-                "limit": 100,
-                "limit_remaining": 72.5,
-                "usage": 27.5,
-                "usage_daily": 1.25,
-                "usage_weekly": 4.5,
-                "usage_monthly": 10.5,
-                "is_free_tier": False,
-            }
-        },
-    )
+    monkeypatch.setattr(billing, "_request_json", no_request)
+    provider = _provider(1, provider_type, provider_type)
+    snapshot = await billing._provider_snapshot(provider, _usage(monthly_cost="2.5"))
 
-    assert snapshot["status"] == "available"
-    assert snapshot["remaining"] == "72.5"
-    assert snapshot["usage_weekly"] == "4.5"
-    assert snapshot["usage_monthly"] == "10.5"
-
-
-def test_deepseek_snapshot_keeps_purchased_and_granted_balances_separate():
-    provider = _provider(2, "deepseek", "deepseek")
-    base = billing._base(provider, "deepseek_balance")
-
-    snapshot = billing._deepseek_snapshot(
-        base,
-        {
-            "is_available": True,
-            "balance_infos": [
-                {
-                    "currency": "USD",
-                    "total_balance": "110.00",
-                    "granted_balance": "10.00",
-                    "topped_up_balance": "100.00",
-                }
-            ],
-        },
-    )
-
-    assert snapshot["is_available"] is True
-    assert snapshot["balances"] == [{"currency": "USD", "total": "110.00", "granted": "10.00", "purchased": "100.00"}]
+    assert snapshot["status"] == "unsupported"
+    assert snapshot["reason"] == "billing_endpoint_unsupported"
+    assert snapshot["local_usage"]["raw_cost"]["monthly"] == "2.5"
+    assert billing.billing_capability_for(provider_type) is None
+    assert billing.billing_portals_for(provider) == (None, None)
 
 
 async def test_local_usage_aggregates_all_periods_and_keeps_missing_providers_zero(monkeypatch):
@@ -426,8 +384,8 @@ async def test_local_usage_aggregates_all_periods_and_keeps_missing_providers_ze
 async def test_bulk_status_isolates_live_failure_and_never_calls_unsupported_provider(monkeypatch):
     providers = [
         _provider(1, "gemini-prod", "gemini"),
-        _provider(2, "openrouter-prod", "openrouter"),
-        _provider(3, "deepseek-prod", "deepseek"),
+        _provider(2, "openai-prod", "openai", has_billing_admin_key=True),
+        _provider(3, "anthropic-prod", "anthropic", has_billing_admin_key=True),
     ]
 
     async def fake_load():
@@ -435,26 +393,16 @@ async def test_bulk_status_isolates_live_failure_and_never_calls_unsupported_pro
 
     calls: list[str] = []
 
-    async def fake_request(capability: str, _api_key: str):
-        calls.append(capability)
-        if capability == "openrouter_key":
-            request = billing.httpx.Request("GET", "https://openrouter.ai/api/v1/key")
+    async def fake_request(endpoint: str, _api_key: str, *, params=None):
+        calls.append(endpoint)
+        if endpoint.startswith("openai_"):
+            request = billing.httpx.Request("GET", "https://api.openai.com/v1/organization/costs")
             response = billing.httpx.Response(503, request=request, text="secret upstream body")
             raise billing.httpx.HTTPStatusError("failed", request=request, response=response)
-        return {
-            "is_available": True,
-            "balance_infos": [
-                {
-                    "currency": "USD",
-                    "total_balance": "9",
-                    "granted_balance": "1",
-                    "topped_up_balance": "8",
-                }
-            ],
-        }
+        return {"data": []}
 
     monkeypatch.setattr(billing, "_load_providers_and_usage", fake_load)
-    monkeypatch.setattr(billing, "resolve_api_key", lambda _provider: "secret-key")
+    monkeypatch.setattr(billing, "decrypt_llm_provider_billing_admin_key", lambda _value: "secret-admin-key")
     monkeypatch.setattr(billing, "_request_json", fake_request)
 
     result = await billing.list_provider_billing()
@@ -467,6 +415,7 @@ async def test_bulk_status_isolates_live_failure_and_never_calls_unsupported_pro
     assert result[1]["status"] == "unavailable"
     assert result[1]["reason"] == "provider_request_failed"
     assert result[2]["status"] == "available"
-    assert result[2]["balances"][0]["total"] == "9"
-    assert sorted(calls) == ["deepseek_balance", "openrouter_key"]
+    assert result[2]["provider_usage"]["cost"]["monthly"] is None  # Empty reports do not fabricate a zero.
+    assert result[2]["provider_usage"]["cost"]["total"] is None
+    assert sorted(calls) == ["anthropic_costs", "anthropic_usage", "openai_costs", "openai_usage"]
     assert "secret" not in str(result)

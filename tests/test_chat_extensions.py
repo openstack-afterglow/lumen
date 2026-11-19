@@ -6,6 +6,8 @@ DB 없이 extensions_store 를 monkeypatch 하여:
 - 검증 실패 400, 저장소 장애 503
 """
 
+import pytest
+
 from lumen.api import extensions
 from lumen.services import extensions_store as es
 
@@ -289,3 +291,61 @@ class TestErrors:
         response = await client.put(f"{_USER_MCP}/7/credentials", json={"values": {"Authorization": "x"}})
 
         assert response.status_code == 404
+
+
+class TestMcpActivation:
+    async def test_activation_uses_authenticated_owner_not_admin_mutation(self, client, monkeypatch):
+        captured = {}
+
+        async def activate(item_id, **kwargs):
+            captured.update(item_id=item_id, **kwargs)
+            return {"id": item_id, "is_active": True, "server_is_active": True, "config_version": 2}
+
+        monkeypatch.setattr(es, "set_mcp_activation", activate)
+        response = await client.patch(f"{_USER_MCP}/7/activation", json={"is_active": True, "config_version": 2})
+        assert response.status_code == 200
+        assert captured == {
+            "item_id": 7, "user_id": "test-user-123", "project_id": "test-project-123",
+            "is_active": True, "config_version": 2,
+        }
+
+    @pytest.mark.parametrize("payload", [
+        {}, {"is_active": True}, {"is_active": "true", "config_version": 1},
+        {"is_active": True, "config_version": True}, {"is_active": True, "config_version": 0},
+        {"is_active": True, "config_version": "1"},
+        {"is_active": True, "config_version": 1, "owner_user_id": "other"},
+        {"is_active": True, "config_version": 1, "headers": {"Authorization": "secret"}},
+    ])
+    async def test_activation_rejects_invalid_or_owner_controlled_input(self, client, monkeypatch, payload):
+        async def unexpected(*args, **kwargs):
+            raise AssertionError("invalid activation must not reach storage")
+
+        monkeypatch.setattr(es, "set_mcp_activation", unexpected)
+        assert (await client.patch(f"{_USER_MCP}/7/activation", json=payload)).status_code == 422
+
+    @pytest.mark.parametrize("error,status", [
+        (es.ExtensionNotFound("missing"), 404), (es.ExtensionForbidden("user row"), 403),
+        (es.ExtensionValidationError("stale"), 400), (es.ChatStorageUnavailable("db"), 503),
+    ])
+    async def test_activation_maps_storage_errors(self, client, monkeypatch, error, status):
+        async def fail(*args, **kwargs):
+            raise error
+
+        monkeypatch.setattr(es, "set_mcp_activation", fail)
+        response = await client.patch(f"{_USER_MCP}/7/activation", json={"is_active": True, "config_version": 1})
+        assert response.status_code == status
+
+    async def test_admin_activation_endpoint_does_not_exist(self, admin_client):
+        response = await admin_client.patch(f"{_ADMIN_MCP}/7/activation", json={"is_active": True, "config_version": 1})
+        assert response.status_code == 404
+
+
+@pytest.mark.parametrize("query,active_only", [("", False), ("?active_only=true", True)])
+async def test_user_mcp_listing_forwards_execution_filter(client, monkeypatch, query, active_only):
+    async def list_visible(kind, **kwargs):
+        assert kind == "mcp"
+        assert kwargs == {"user_id": "test-user-123", "project_id": "test-project-123", "active_only": active_only}
+        return []
+
+    monkeypatch.setattr(es, "list_for_user", list_visible)
+    assert (await client.get(f"{_USER_MCP}{query}")).status_code == 200

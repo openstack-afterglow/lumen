@@ -166,6 +166,7 @@ async def load_context_source(
     temp_thread_id: str | None,
     user_id: str,
     project_id: str,
+    domain_id: str | None = None,
     session: AsyncSession | None = None,
     leaf_id: int | None = None,
 ) -> dict[str, Any]:
@@ -175,7 +176,7 @@ async def load_context_source(
     async with _session_scope(session) as db:
         active_leaf_id: str | None = None
         if conversation_id is not None:
-            conversation = await cs._load_owned(db, conversation_id, user_id, project_id)
+            conversation = await cs._load_owned(db, conversation_id, user_id, project_id, domain_id=domain_id)
             selected_leaf = leaf_id if leaf_id is not None else conversation.active_leaf_id
             if leaf_id is None:
                 if not conversation.history_index_ready:

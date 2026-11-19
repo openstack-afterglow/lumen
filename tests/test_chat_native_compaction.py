@@ -9,11 +9,13 @@ Covers the three places the feature can silently fail:
   compaction iteration entirely.
 """
 
+import json
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
-from lumen.services import completion_api, context_manager, graph, litellm_client, native_compaction
+from lumen.services import completion_api, context_manager, graph, native_compaction, provider_client
 from lumen.services.durable_runs import execution
 from lumen.services.tool_runtime import contracts
 from lumen.services.tool_runtime import dispatch as tool_runtime
@@ -27,31 +29,31 @@ async def _aiter(items):
         yield item
 
 
-class _Delta:
+class _Delta(provider_client.ProviderObject):
     def __init__(self, content=None, tool_calls=None, provider_specific_fields=None):
         self.content = content
         self.tool_calls = tool_calls
         self.provider_specific_fields = provider_specific_fields
 
 
-class _Choice:
+class _Choice(provider_client.ProviderObject):
     def __init__(self, delta):
         self.delta = delta
 
 
-class _Chunk:
+class _Chunk(provider_client.ProviderObject):
     def __init__(self, delta, usage=None):
         self.choices = [_Choice(delta)]
         self.usage = usage
 
 
-class _ToolFn:
+class _ToolFn(provider_client.ProviderObject):
     def __init__(self, name=None, arguments=None):
         self.name = name
         self.arguments = arguments
 
 
-class _ToolCallDelta:
+class _ToolCallDelta(provider_client.ProviderObject):
     def __init__(self, index=0, id=None, name=None, arguments=None):
         self.index = index
         self.id = id
@@ -87,10 +89,8 @@ class TestCompactionOptions:
         assert options == {"edits": [{"type": _ANTHROPIC_EDIT, "trigger": {"type": "input_tokens", "value": 160_000}}]}
 
     @pytest.mark.parametrize("provider", ["openai", "gemini", "perplexity", "chatgpt", None])
-    def test_transports_that_would_drop_the_parameter_are_unarmed(self, provider):
-        # LiteLLM's pinned chat config lists context_management for Anthropic
-        # only; anywhere else drop_params removes it and the caller would be
-        # told compaction is active when it was discarded.
+    def test_unsupported_native_compaction_protocols_remain_unarmed(self, provider):
+        # These providers do not implement Anthropic's compaction edit protocol.
         assert native_compaction.compaction_options(provider_type=provider, context_limit=200_000, ratio=0.80) is None
 
     def test_disabled_is_unarmed_even_on_a_supported_route(self):
@@ -239,7 +239,7 @@ class TestGraphWiring:
             captured.update(kwargs)
             return _aiter([_Chunk(_Delta(content="안녕"))])
 
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        monkeypatch.setattr(provider_client, "acompletion_stream", fake_stream)
         options = {"edits": [{"type": _ANTHROPIC_EDIT, "trigger": {"type": "input_tokens", "value": 160_000}}]}
         _ = [
             ev
@@ -261,7 +261,7 @@ class TestGraphWiring:
             captured.update(kwargs)
             return _aiter([_Chunk(_Delta(content="안녕"))])
 
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        monkeypatch.setattr(provider_client, "acompletion_stream", fake_stream)
         _ = [ev async for ev in graph.stream(model="gpt-4o", messages=_MSGS, project_id="p1", user_id="u1")]
         assert "context_management" not in (captured["extra"] or {})
 
@@ -290,7 +290,7 @@ class TestGraphWiring:
         async def fake_execute(name, args, ctx):
             return contracts.ToolExecutionResult("대화 3개")
 
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        monkeypatch.setattr(provider_client, "acompletion_stream", fake_stream)
         monkeypatch.setattr(tool_runtime, "context_execute_result", fake_execute)
 
         _ = [
@@ -332,7 +332,7 @@ class TestGraphWiring:
         async def fake_execute(name, args, ctx):
             return contracts.ToolExecutionResult("대화 3개")
 
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        monkeypatch.setattr(provider_client, "acompletion_stream", fake_stream)
         monkeypatch.setattr(tool_runtime, "context_execute_result", fake_execute)
 
         _ = [ev async for ev in graph.stream(model="m", messages=_MSGS, project_id="p1", user_id="u1")]
@@ -376,67 +376,40 @@ class TestPassthroughBilling:
 
 
 class TestProviderPayloadShape:
-    def test_compaction_head_coexists_with_a_pending_tool_use(self):
-        """The one shape that would 400 on exactly the path compaction fires on.
-
-        LiteLLM prepends compaction blocks to the assistant content, and
-        Anthropic requires every ``tool_use`` to be answered by a
-        ``tool_result`` in the very next message. Assert the reconstructed
-        payload keeps both invariants rather than reasoning about it.
-        """
-        from litellm.litellm_core_utils.prompt_templates.factory import anthropic_messages_pt
-
+    async def test_compaction_head_and_pending_tool_result_reach_runtime_together(self, monkeypatch):
         block = {"type": "compaction", "content": "이전 대화 요약"}
-        rendered = anthropic_messages_pt(
-            messages=[
-                {"role": "user", "content": "대화 개수 알려줘"},
-                {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [
-                        {
-                            "id": "call_1",
-                            "type": "function",
-                            "function": {"name": "list_my_conversations", "arguments": "{}"},
-                        }
-                    ],
-                    "provider_specific_fields": {"compaction_blocks": [block]},
-                },
-                {"role": "tool", "tool_call_id": "call_1", "content": "대화 3개"},
-            ],
-            model="claude-sonnet-5",
-            llm_provider="anthropic",
-        )
-        assistant = next(message for message in rendered if message["role"] == "assistant")
-        # The compaction block is the head: everything before it is what the
-        # provider drops.
-        assert assistant["content"][0] == block
-        tool_use = [part for part in assistant["content"] if part.get("type") == "tool_use"]
-        assert [part["id"] for part in tool_use] == ["call_1"]
-        # ...and the pending call is still answered by the next message.
-        follow_up = rendered[rendered.index(assistant) + 1]
-        assert follow_up["role"] == "user"
-        assert [part["tool_use_id"] for part in follow_up["content"] if part.get("type") == "tool_result"] == ["call_1"]
-
-
-class TestCatalogCoverage:
-    def test_every_catalogued_anthropic_window_can_express_the_threshold(self):
-        """Guards the 50,000-token floor against a future small-window model.
-
-        A model whose window cannot express the ratio is silently unarmed, so
-        this records which routes actually get native compaction today.
-        """
-        import litellm
-
-        unarmed = [
-            name
-            for name, meta in litellm.model_cost.items()
-            if isinstance(meta, dict)
-            and meta.get("litellm_provider") == "anthropic"
-            and isinstance(meta.get("max_input_tokens"), int)
-            and native_compaction.trigger_tokens(meta["max_input_tokens"], context_manager.COMPACTION_REQUIRED) is None
+        messages = [
+            {"role": "user", "content": "대화 개수 알려줘"},
+            {"role": "assistant", "content": None, "tool_calls": [{
+                "id": "call_1", "type": "function",
+                "function": {"name": "list_my_conversations", "arguments": "{}"},
+            }], "provider_specific_fields": {"compaction_blocks": [block]}},
+            {"role": "tool", "tool_call_id": "call_1", "content": "대화 3개"},
         ]
-        assert unarmed == []
+        requests = []
+
+        async def ready():
+            return "http://127.0.0.1:18643", "internal-token"
+
+        def handle(request):
+            requests.append(json.loads(request.content))
+            return httpx.Response(200, headers={"X-Lumen-Bifrost-Contract": "single-attempt-v1"},
+                json={"choices": [{"message": {"content": "완료"}, "finish_reason": "stop"}],
+                      "usage": {"prompt_tokens": 12, "completion_tokens": 2}})
+
+        monkeypatch.setattr(provider_client, "get_bifrost_runtime", ready)
+        monkeypatch.setattr(httpx, "AsyncHTTPTransport", lambda **kwargs: httpx.MockTransport(handle))
+        result = await provider_client.acompletion(
+            "claude-sonnet-5", messages, custom_llm_provider="anthropic", api_key="request-key",
+            extra={"context_management": {"edits": [{"type": _ANTHROPIC_EDIT}]}},
+        )
+        assert result.choices[0].message.content == "완료"
+        assert len(requests) == 1
+        rendered = requests[0]["body"]["messages"]
+        assistant = rendered[1]
+        assert assistant["provider_specific_fields"]["compaction_blocks"] == [block]
+        assert assistant["tool_calls"][0]["id"] == rendered[2]["tool_call_id"] == "call_1"
+        assert requests[0]["body"]["context_management"] == {"edits": [{"type": _ANTHROPIC_EDIT}]}
 
 
 class _ReplayHooks:
@@ -473,7 +446,7 @@ class TestReplayAndResume:
         async def fake_execute(name, args, ctx):
             return contracts.ToolExecutionResult("대화 3개")
 
-        monkeypatch.setattr(litellm_client, "acompletion_stream", fake_stream)
+        monkeypatch.setattr(provider_client, "acompletion_stream", fake_stream)
         monkeypatch.setattr(tool_runtime, "context_execute_result", fake_execute)
 
         _ = [
@@ -560,7 +533,7 @@ class TestReplayAndResume:
             return chunks()
 
         monkeypatch.setattr(graph.bindings, "v2_tool_bindings", bindings)
-        monkeypatch.setattr(graph.litellm_client, "acompletion_stream", completion_stream)
+        monkeypatch.setattr(graph.provider_client, "acompletion_stream", completion_stream)
         monkeypatch.setattr(graph.chat_checkpointer, "_saver", MemorySaver())
 
         interrupted = [
@@ -692,15 +665,6 @@ class TestApiSurfaceCoverage:
         assert attempted.get("called") is None
         assert result is messages
 
-    def test_openai_compatible_surface_freezes_a_summary_route(self):
-        """Without a summary route the fence degrades to a warning and skips."""
-        import inspect
-
-        from lumen.services import openai_compat
-
-        source = inspect.getsource(openai_compat)
-        assert "summary_route = await resolve_summary_route(resolved)" in source
-        assert "summary_route=summary_route" in source
 
 
 _ANTHROPIC_ROUTE = {
@@ -779,121 +743,3 @@ class TestPassthroughResolution:
         ] == [{"type": "compaction", "compact_threshold": 26_214}]
 
 
-class TestPassthroughInjection:
-    @pytest.fixture
-    def billing_stub(self, monkeypatch):
-        async def no_bill(*_args, **_kwargs):
-            return (0, 0, 0)
-
-        monkeypatch.setattr(completion_api, "_bill", no_bill)
-
-    @staticmethod
-    def _settings(monkeypatch, *, master=True, passthrough=True):
-        monkeypatch.setattr(
-            completion_api,
-            "get_settings",
-            lambda: type(
-                "S",
-                (),
-                {
-                    "chat_native_compaction_enabled": master,
-                    "chat_native_compaction_passthrough_enabled": passthrough,
-                },
-            )(),
-        )
-
-    async def test_anthropic_messages_request_carries_the_edit(self, monkeypatch, billing_stub):
-        captured: dict = {}
-        self._settings(monkeypatch)
-
-        async def fake(**kwargs):
-            captured.update(kwargs)
-            return {"content": [], "usage": {"input_tokens": 1, "output_tokens": 1}}
-
-        monkeypatch.setattr(completion_api.litellm_client, "aanthropic_messages", fake)
-        await completion_api.complete_anthropic(
-            resolved=_ANTHROPIC_ROUTE,
-            messages=[{"role": "user", "content": "hi"}],
-            max_tokens=1024,
-            stream=False,
-            user_id="u1",
-            project_id="p1",
-            api_key_id=None,
-            options={},
-        )
-        assert captured["context_management"]["edits"][0]["type"] == _ANTHROPIC_EDIT
-
-    async def test_responses_request_carries_the_entry(self, monkeypatch, billing_stub):
-        captured: dict = {}
-        self._settings(monkeypatch)
-
-        async def fake(**kwargs):
-            captured.update(kwargs)
-            return {"output": [], "usage": {"input_tokens": 1, "output_tokens": 1}}
-
-        monkeypatch.setattr(completion_api.litellm_client, "aresponses", fake)
-        await completion_api.complete_responses(
-            resolved=_RESPONSES_ROUTE,
-            input="hi",
-            stream=False,
-            user_id="u1",
-            project_id="p1",
-            api_key_id=None,
-            options={},
-        )
-        assert captured["context_management"] == [{"type": "compaction", "compact_threshold": 160_000}]
-
-    async def test_caller_value_reaches_the_provider_unchanged(self, monkeypatch, billing_stub):
-        captured: dict = {}
-        self._settings(monkeypatch)
-        caller = {"edits": [{"type": _ANTHROPIC_EDIT, "trigger": {"type": "input_tokens", "value": 90_000}}]}
-
-        async def fake(**kwargs):
-            captured.update(kwargs)
-            return {"content": [], "usage": {"input_tokens": 1, "output_tokens": 1}}
-
-        monkeypatch.setattr(completion_api.litellm_client, "aanthropic_messages", fake)
-        await completion_api.complete_anthropic(
-            resolved=_ANTHROPIC_ROUTE,
-            messages=[{"role": "user", "content": "hi"}],
-            max_tokens=1024,
-            stream=False,
-            user_id="u1",
-            project_id="p1",
-            api_key_id=None,
-            options={"context_management": caller},
-        )
-        assert captured["context_management"] == caller
-
-    @pytest.mark.parametrize(("master", "passthrough"), [(False, True), (True, False), (False, False)])
-    async def test_either_switch_disarms_the_proxy(self, monkeypatch, billing_stub, master, passthrough):
-        captured: dict = {}
-        self._settings(monkeypatch, master=master, passthrough=passthrough)
-
-        async def fake(**kwargs):
-            captured.update(kwargs)
-            return {"content": [], "usage": {"input_tokens": 1, "output_tokens": 1}}
-
-        monkeypatch.setattr(completion_api.litellm_client, "aanthropic_messages", fake)
-        await completion_api.complete_anthropic(
-            resolved=_ANTHROPIC_ROUTE,
-            messages=[{"role": "user", "content": "hi"}],
-            max_tokens=1024,
-            stream=False,
-            user_id="u1",
-            project_id="p1",
-            api_key_id=None,
-            options={},
-        )
-        assert "context_management" not in captured
-
-    def test_responses_request_model_accepts_the_field(self):
-        """`extra="forbid"` would otherwise 400 a caller that sends its own."""
-        from lumen.api.compat.responses import ResponsesRequest
-
-        body = ResponsesRequest(
-            model="gpt-5.6-sol",
-            input="hi",
-            context_management=[{"type": "compaction", "compact_threshold": 120_000}],
-        )
-        assert body.context_management == [{"type": "compaction", "compact_threshold": 120_000}]

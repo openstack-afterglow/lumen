@@ -1,22 +1,35 @@
 """Durable run admission and atomic persistence."""
 
+import functools
 import json
 import uuid
+from copy import deepcopy
 from datetime import timedelta
 from decimal import Decimal
 from typing import Any, Literal
 
-from sqlalchemy import select
+from sqlalchemy import select, text
+from sqlalchemy.exc import IntegrityError
 
 from lumen.crypto import encrypt_chat_content
+from lumen.models.billing import Payer
 from lumen.models.chat_assets import ChatAsset, ChatMessageAsset, ChatRunAsset
 from lumen.models.chat_contracts import ChatRunDescriptor, validate_user_input_parts
 from lumen.models.chat_db import ChatConversation, ChatMessage
 from lumen.models.chat_runs import ChatRun, ChatRunProvider, ChatTempThread
-from lumen.services.message_graph import append_active_message, reachable_message_clause, register_message
+from lumen.services import worker_routing
+from lumen.services.domain_scope import scope_clause
+from lumen.services.inference_authority import native_run_scopes
+from lumen.services.message_graph import (
+    append_active_message,
+    reachable_message_clause,
+    register_message,
+    replace_active_path,
+)
 from lumen.services.message_parts import serialize_parts
 from lumen.services.message_timestamps import message_timestamps
 from lumen.services.providers import routing as ps
+from lumen.services.providers.credentials import execution_identity
 from lumen.services.run_store import NONTERMINAL, append_event
 
 from .common import (
@@ -24,7 +37,7 @@ from .common import (
     _event,
     _factory,
     _fingerprint,
-    _freeze_v2_lumen_snapshot,
+    _freeze_lumen_snapshot,
     _freeze_v2_tool_call_limit,
     _now,
     _require_supported_execution_protocol_version,
@@ -32,6 +45,26 @@ from .common import (
     wake_run,
 )
 from .errors import DurableRunConflict, DurableRunError, DurableRunInputError, DurableRunNotFound
+
+
+def _validate_sandbox_snapshot(
+    request_payload: dict[str, Any], capability_snapshot: dict[str, Any], protocol: int,
+    *, execution_mode: str = "chat",
+) -> None:
+    from lumen.models.chat_contracts import ToolPolicy
+    from lumen.services.sandbox_selection import SandboxSelectionError, validate_selection
+
+    try:
+        policy = ToolPolicy.model_validate((request_payload.get("features") or {}).get("tool_policy") or {})
+        if execution_mode == "code" and policy.enabled_sandbox_tools:
+            raise SandboxSelectionError("sandbox_code_combination_unsupported")
+        selected = validate_selection(capability_snapshot.get("sandbox_tools", []))
+        if policy.enabled_sandbox_tools != [item["name"] for item in selected]:
+            raise SandboxSelectionError("sandbox_selection_invalid")
+        if selected and protocol != 2:
+            raise SandboxSelectionError("sandbox_tool_unavailable")
+    except (SandboxSelectionError, ValueError) as exc:
+        raise DurableRunInputError(str(exc)) from exc
 
 
 async def _apply_root_budget(
@@ -43,53 +76,79 @@ async def _apply_root_budget(
     quota,
     order,
 ) -> bool:
-    """Freeze explicit root ceilings; a ``code`` root also takes its sandbox intent now.
-
-    Returns True when the run must start in ``waiting_resource`` instead of ``queued``.
-    Ceilings are never inferred from NULL, and the sandbox slot/seconds are reserved
-    against the project caps before the run becomes runnable.
-    """
+    """Freeze root ceilings and reserve selected tools before any worker can claim."""
     from lumen.config import get_settings
     from lumen.services.infrastructure import store as infra_store
+    from lumen.services.sandbox_selection import SandboxSelectionError, selected_pool
 
     from . import budgets
 
+    if execution_mode == "code" and (run.capability_snapshot or {}).get("sandbox_tools"):
+        raise DurableRunInputError("sandbox_code_combination_unsupported")
+    try:
+        pool_name = selected_pool((run.capability_snapshot or {}).get("sandbox_tools", []))
+    except SandboxSelectionError as exc:
+        raise DurableRunInputError(exc.code) from exc
     if agent_budget is None:
         if execution_mode != "chat":
             raise DurableRunInputError("agent_budget is required for plan and code execution modes")
-        return False
-    credit = Decimal(str(agent_budget["credit_ceiling"]))
-    sandbox_seconds = int(agent_budget["sandbox_seconds_ceiling"])
-    wall_time = int(agent_budget["wall_time_seconds"])
-    if credit <= 0 or sandbox_seconds <= 0 or wall_time <= 0:
-        raise DurableRunInputError("agent_budget values must be positive")
-    run.credit_ceiling = credit
-    # Existing descendant ceiling stays a separate, never-wider cap.
-    run.descendant_credit_ceiling = credit if run.descendant_credit_ceiling is None else min(
-        Decimal(str(run.descendant_credit_ceiling)), credit
-    )
-    run.sandbox_seconds_ceiling = sandbox_seconds
-    run.wall_time_seconds = wall_time
-    run.deadline_at = _now() + timedelta(seconds=wall_time)
-    if execution_mode != "code":
-        return False
+        if pool_name is None:
+            return False
+    else:
+        credit = Decimal(str(agent_budget["credit_ceiling"]))
+        sandbox_seconds = int(agent_budget["sandbox_seconds_ceiling"])
+        wall_time = int(agent_budget["wall_time_seconds"])
+        if credit <= 0 or sandbox_seconds <= 0 or wall_time <= 0:
+            raise DurableRunInputError("agent_budget values must be positive")
+        run.credit_ceiling = credit
+        run.descendant_credit_ceiling = credit if run.descendant_credit_ceiling is None else min(
+            Decimal(str(run.descendant_credit_ceiling)), credit
+        )
+        run.sandbox_seconds_ceiling = sandbox_seconds
+        run.wall_time_seconds = wall_time
+        run.deadline_at = _now() + timedelta(seconds=wall_time)
+        if execution_mode != "code" and pool_name is None:
+            return False
+    config = get_settings().runtime_config
+    seconds = run.sandbox_seconds_ceiling
+    if pool_name is not None:
+        pool_limit = config.pool(pool_name).max_lifetime_seconds
+        if agent_budget is None:
+            seconds = min(1800, pool_limit)
+        else:
+            # The ceiling covers the entire lineage, not just the root Pod.
+            # Reserve at most half (capped at five minutes) for root tools.
+            seconds = min(300, max(1, int(seconds) // 2), pool_limit, run.wall_time_seconds)
+    deadline = _now() + timedelta(seconds=seconds)
+    if run.deadline_at is not None:
+        deadline = min(deadline, run.deadline_at)
     try:
         await budgets.reserve(session, quota=quota, root=run, run_id=run.id, kind="sandbox_slot", amount=1, order=order)
         await budgets.reserve(
-            session, quota=quota, root=run, run_id=run.id, kind="sandbox_seconds", amount=sandbox_seconds, order=order
+            session, quota=quota, root=run, run_id=run.id, kind="sandbox_seconds", amount=seconds,
+            order=order, allow_unbudgeted_chat=agent_budget is None,
         )
-        await infra_store.assign_sandbox(
-            session,
-            run=run,
-            config=get_settings().runtime_config,
-            deadline_at=_now() + timedelta(seconds=min(sandbox_seconds, wall_time)),
-            order=order,
+        resource = await infra_store.assign_sandbox(
+            session, run=run, config=config, deadline_at=deadline, order=order, pool_name=pool_name,
         )
+        if pool_name is not None:
+            pool = config.pool(pool_name)
+            if resource.image_ref != pool.image or resource.policy_digest != pool.digest():
+                raise DurableRunInputError("sandbox_configuration_changed")
     except budgets.BudgetExceeded as exc:
-        raise DurableRunInputError(str(exc)) from exc
+        raise DurableRunInputError(exc.code) from exc
     except infra_store.ResourceUnavailable as exc:
-        raise DurableRunInputError(f"sandbox is unavailable ({exc.code})") from exc
+        raise DurableRunInputError(exc.code) from exc
     return True
+
+
+def _intent_with_credential_authority(
+    intent: dict[str, Any], credential_authority: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Bind trusted non-secret attenuation to UUID reuse, preserving legacy intents."""
+    if credential_authority is None:
+        return intent
+    return {**intent, "_credential_authority": deepcopy(credential_authority)}
 
 
 async def existing_run_for_intent(
@@ -134,6 +193,8 @@ def _add_run_providers(session, run: ChatRun, capability_snapshot: dict[str, Any
             provider_label=capability_snapshot["provider_name"],
             model_label=capability_snapshot["model_name"],
             config_version_hash=capability_snapshot["config_version_hash"],
+            **{key: value for key, value in execution_identity(capability_snapshot).items()
+               if key not in {"provider_auth", "provider_quota_group"}},
         )
     )
     summary = capability_snapshot.get("summary_route")
@@ -147,8 +208,20 @@ def _add_run_providers(session, run: ChatRun, capability_snapshot: dict[str, Any
                 provider_label=summary["provider_name"],
                 model_label=summary["model_name"],
                 config_version_hash=summary["config_version_hash"],
+                **{key: value for key, value in execution_identity(summary).items()
+                   if key not in {"provider_auth", "provider_quota_group"}},
             )
         )
+    for purpose, route in (capability_snapshot.get("feature_routes") or {}).items():
+        if purpose not in {"search", "advisor"} or not isinstance(route, dict):
+            continue
+        session.add(ChatRunProvider(
+            run_id=run.id, purpose=purpose, provider_id=route["provider_id"], model_id=route.get("model_id"),
+            provider_label=route["provider_name"], model_label=route.get("model_name") or purpose,
+            config_version_hash=route["config_version_hash"],
+            **{key: value for key, value in execution_identity(route).items()
+               if key not in {"provider_auth", "provider_quota_group"}},
+        ))
 
 
 async def _lock_run_configurations(
@@ -165,6 +238,7 @@ async def _lock_run_configurations(
     search = routes.get("search")
     advisor = routes.get("advisor")
     summary = capability_snapshot.get("summary_route")
+    svg_author = capability_snapshot.get("svg_author_route")
     try:
         await ps.lock_execution_routes(
             session,
@@ -172,6 +246,7 @@ async def _lock_run_configurations(
             search=search if isinstance(search, dict) else None,
             advisor=advisor if isinstance(advisor, dict) else None,
             summary=summary if isinstance(summary, dict) else None,
+            **({"svg_author": svg_author} if isinstance(svg_author, dict) else {}),
         )
     except ps.ProviderConfigurationChangedError as exc:
         raise DurableRunConflict("provider_configuration_changed") from exc
@@ -271,6 +346,8 @@ async def _bind_user_assets(
 ) -> list[dict[str, Any]]:
     """Bind owned input assets and return the canonical parts persisted for the message."""
     canonical = await _canonical_user_parts(session, parts=parts, user_id=user_id, project_id=project_id)
+    if any(part["type"] != "text" for part in canonical):
+        await session.flush()  # The run must exist before its asset FK rows are inserted.
     for index, part in enumerate(canonical):
         if part["type"] == "text":
             continue
@@ -280,6 +357,42 @@ async def _bind_user_assets(
     return canonical
 
 
+async def _read_committed(session) -> None:
+    """First statement of an admission transaction.
+
+    The idempotency ``SELECT ... FOR UPDATE`` of a new key takes a gap lock under REPEATABLE READ. Concurrent
+    admissions by one user then deadlock with each other's run INSERT and the provider-row locks (MariaDB 1213,
+    surfaced as HTTP 500). The unique ``uq_chat_runs_idempotency`` index (migration 030) decides same-key races
+    instead, and ``_replay_idempotency_race`` returns the winner's run.
+    """
+    await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
+
+
+def _replay_idempotency_race(function):
+    """A racing same-key admission fails its INSERT on the unique index; return the committed winner instead."""
+
+    @functools.wraps(function)
+    async def wrapper(**kwargs):
+        try:
+            return await function(**kwargs)
+        except IntegrityError:
+            previous = await existing_run_for_intent(
+                project_id=kwargs["project_id"],
+                user_id=kwargs["user_id"],
+                client_request_id=kwargs["client_request_id"],
+                intent=_intent_with_credential_authority(
+                    kwargs["intent"], kwargs["capability_snapshot"].get("credential_authority")
+                ),
+                conversation_id=kwargs.get("conversation_id"),
+            )
+            if previous is None:
+                raise
+            return previous
+
+    return wrapper
+
+
+@_replay_idempotency_race
 async def create_persistent_run(
     *,
     project_id: str,
@@ -299,9 +412,11 @@ async def create_persistent_run(
     run_kind: Literal["completion", "compaction"] = "completion",
     source: str = "web",
     api_key_id: int | None = None,
+    payer: Payer | None = None,
     expected_parent_id: int | None = None,
     agent_budget: dict[str, Any] | None = None,
     execution_mode: str = "chat",
+    domain_id: str | None = None,
 ) -> ChatRunDescriptor:
     """Atomically create the user turn, run, and first journal event.
 
@@ -313,26 +428,34 @@ async def create_persistent_run(
     except ValueError as exc:
         raise DurableRunInputError("Idempotency-Key must be a UUID") from exc
     _require_supported_execution_protocol_version(execution_protocol_version)
+    _validate_sandbox_snapshot(
+        request_payload, capability_snapshot, execution_protocol_version, execution_mode=execution_mode,
+    )
     request_payload = {
         **request_payload,
         "client_timezone": client_timezone,
         "execution_protocol_version": execution_protocol_version,
     }
+    request_payload["required_scopes"] = list(native_run_scopes({
+        **request_payload, "execution_mode": execution_mode,
+        "required_scopes": capability_snapshot.get("required_scopes", ()),
+    }, agent_id=agent_id))
     request_payload = _freeze_v2_tool_call_limit(request_payload, execution_protocol_version)
-    request_payload = await _freeze_v2_lumen_snapshot(
+    request_payload = await _freeze_lumen_snapshot(
         request_payload,
         user_id=user_id,
         project_id=project_id,
-        execution_protocol_version=execution_protocol_version,
     )
+    intent = _intent_with_credential_authority(intent, capability_snapshot.get("credential_authority"))
     fingerprint = _fingerprint(intent)
     factory = _factory()
     async with factory() as session, session.begin():
+        await _read_committed(session)
         from . import budgets
 
         order = budgets.LockOrder()
         quota = None
-        if agent_budget is not None or execution_mode != "chat":
+        if agent_budget is not None or execution_mode != "chat" or capability_snapshot.get("sandbox_tools"):
             quota = await budgets.lock_project_quota(session, project_id, order=order)
         order.take("conversation")
         conversation = (
@@ -340,7 +463,9 @@ async def create_persistent_run(
                 select(ChatConversation)
                 .where(
                     ChatConversation.id == conversation_id,
-                    ChatConversation.project_id == project_id,
+                    scope_clause(
+                        ChatConversation.domain_id, ChatConversation.project_id, domain_id=domain_id, project_id=project_id,
+                    ),
                     ChatConversation.user_id == user_id,
                 )
                 .with_for_update()
@@ -413,12 +538,7 @@ async def create_persistent_run(
         user_message.parts = serialize_parts(canonical_parts)
         user_message.parts_version = 1
         run_id = str(uuid.uuid4())
-        for index, part in enumerate(canonical_parts):
-            if part["type"] == "text":
-                continue
-            session.add(ChatRunAsset(run_id=run_id, asset_id=part["asset_id"], purpose="input"))
-            session.add(ChatMessageAsset(message_id=user_message.id, asset_id=part["asset_id"], part_index=index))
-
+        route = await worker_routing.resolve_worker_route(session, run_kind=run_kind)
         run = ChatRun(
             id=run_id,
             run_scope="persistent",
@@ -429,6 +549,7 @@ async def create_persistent_run(
             model_name=model_name,
             source=source,
             api_key_id=api_key_id,
+            payer_domain_id=payer.domain_id if payer is not None else None,
             agent_id=agent_id,
             execution_protocol_version=execution_protocol_version,
             capability_snapshot=capability_snapshot,
@@ -442,6 +563,8 @@ async def create_persistent_run(
             fingerprint_version=1,
             last_seq=0,
             run_kind=run_kind,
+            workload_class=route.workload_class,
+            worker_pool_id=route.worker_pool_id,
             current_ordinal=0,
             status="queued",
             execution_mode=execution_mode,
@@ -449,6 +572,12 @@ async def create_persistent_run(
         _add_run_providers(session, run, capability_snapshot)
         session.add(run)
         await session.flush()
+        for index, part in enumerate(canonical_parts):
+            if part["type"] == "text":
+                continue
+            session.add(ChatRunAsset(run_id=run_id, asset_id=part["asset_id"], purpose="input"))
+            session.add(ChatMessageAsset(message_id=user_message.id, asset_id=part["asset_id"], part_index=index))
+
         order.take("root")
         waiting_resource = await _apply_root_budget(
             session, run, agent_budget=agent_budget, execution_mode=execution_mode, quota=quota, order=order
@@ -477,6 +606,7 @@ async def create_persistent_run(
     return created
 
 
+@_replay_idempotency_race
 async def create_run(
     *,
     project_id: str,
@@ -495,9 +625,11 @@ async def create_run(
     run_kind: Literal["completion", "compaction"] = "completion",
     source: str = "web",
     api_key_id: int | None = None,
+    payer: Payer | None = None,
     expected_parent_id: int | None = None,
     agent_budget: dict[str, Any] | None = None,
     execution_mode: str = "chat",
+    domain_id: str | None = None,
 ) -> ChatRunDescriptor:
     """Create/reuse one owner-scoped run and its first durable event."""
     try:
@@ -505,22 +637,30 @@ async def create_run(
     except ValueError as exc:
         raise DurableRunInputError("Idempotency-Key must be a UUID") from exc
     _require_supported_execution_protocol_version(execution_protocol_version)
+    _validate_sandbox_snapshot(
+        request_payload, capability_snapshot, execution_protocol_version, execution_mode=execution_mode,
+    )
     request_payload = {**request_payload, "execution_protocol_version": execution_protocol_version}
+    request_payload["required_scopes"] = list(native_run_scopes({
+        **request_payload, "execution_mode": execution_mode,
+        "required_scopes": capability_snapshot.get("required_scopes", ()),
+    }, agent_id=agent_id))
     request_payload = _freeze_v2_tool_call_limit(request_payload, execution_protocol_version)
-    request_payload = await _freeze_v2_lumen_snapshot(
+    request_payload = await _freeze_lumen_snapshot(
         request_payload,
         user_id=user_id,
         project_id=project_id,
-        execution_protocol_version=execution_protocol_version,
     )
+    intent = _intent_with_credential_authority(intent, capability_snapshot.get("credential_authority"))
     fingerprint = _fingerprint(intent)
     factory = _factory()
     async with factory() as session, session.begin():
+        await _read_committed(session)
         from . import budgets
 
         order = budgets.LockOrder()
         quota = None
-        if agent_budget is not None or execution_mode != "chat":
+        if agent_budget is not None or execution_mode != "chat" or capability_snapshot.get("sandbox_tools"):
             quota = await budgets.lock_project_quota(session, project_id, order=order)
         order.take("conversation")
         conv = None
@@ -531,7 +671,10 @@ async def create_run(
                     select(ChatConversation)
                     .where(
                         ChatConversation.id == conversation_id,
-                        ChatConversation.project_id == project_id,
+                        scope_clause(
+                            ChatConversation.domain_id, ChatConversation.project_id,
+                            domain_id=domain_id, project_id=project_id,
+                        ),
                         ChatConversation.user_id == user_id,
                     )
                     .with_for_update()
@@ -606,6 +749,13 @@ async def create_run(
                 raise DurableRunConflict("conversation_run_active")
 
         await _lock_run_configurations(session, capability_snapshot, model_name=model_name)
+        route = await worker_routing.resolve_worker_route(session, run_kind=run_kind)
+        if conv is not None and user_message_id is not None and conv.active_leaf_id != user_message_id:
+            # Retry/regeneration selects the saved user turn only after fencing
+            # the observed branch. Completion appends below this same parent.
+            await replace_active_path(session, conversation_id=conversation_id, leaf_id=user_message_id)
+            conv.active_leaf_id = user_message_id
+            conv.history_revision = int(conv.history_revision or 0) + 1
         run = ChatRun(
             id=str(uuid.uuid4()),
             run_scope="persistent" if conversation_id else "temp",
@@ -618,6 +768,7 @@ async def create_run(
             agent_id=agent_id,
             source=source,
             api_key_id=api_key_id,
+            payer_domain_id=payer.domain_id if payer is not None else None,
             execution_protocol_version=execution_protocol_version,
             capability_snapshot=capability_snapshot,
             required_plugin_digest=capability_snapshot.get("required_plugin_digest"),
@@ -631,11 +782,21 @@ async def create_run(
             last_seq=0,
             current_ordinal=0,
             run_kind=run_kind,
+            workload_class=route.workload_class,
+            worker_pool_id=route.worker_pool_id,
             status="queued",
             execution_mode=execution_mode,
         )
         session.add(run)
         _add_run_providers(session, run, capability_snapshot)
+        input_parts = request_payload.get("input_parts")
+        if conv is not None and input_parts is not None:
+            # Replay may read a shared message, but it must bind only assets
+            # owned by the selected project. Do not modify that shared message.
+            await _bind_user_assets(
+                session, parts=input_parts, message_id=None, run_id=run.id,
+                user_id=user_id, project_id=project_id,
+            )
         await session.flush()
         order.take("root")
         if await _apply_root_budget(
@@ -666,6 +827,7 @@ async def create_run(
     return created
 
 
+@_replay_idempotency_race
 async def create_temp_run(
     *,
     project_id: str,
@@ -681,6 +843,7 @@ async def create_temp_run(
     run_kind: Literal["completion", "compaction"] = "completion",
     source: str = "web",
     api_key_id: int | None = None,
+    payer: Payer | None = None,
 ) -> ChatRunDescriptor:
     """Atomically create/reuse a temporary thread and its first durable run."""
     try:
@@ -688,17 +851,29 @@ async def create_temp_run(
     except ValueError as exc:
         raise DurableRunInputError("Idempotency-Key must be a UUID") from exc
     _require_supported_execution_protocol_version(execution_protocol_version)
+    _validate_sandbox_snapshot(request_payload, capability_snapshot, execution_protocol_version)
     request_payload = {**request_payload, "execution_protocol_version": execution_protocol_version}
+    request_payload["required_scopes"] = list(native_run_scopes({
+        **request_payload, "required_scopes": capability_snapshot.get("required_scopes", ()),
+    }))
     request_payload = _freeze_v2_tool_call_limit(request_payload, execution_protocol_version)
-    request_payload = await _freeze_v2_lumen_snapshot(
+    request_payload = await _freeze_lumen_snapshot(
         request_payload,
         user_id=user_id,
         project_id=project_id,
-        execution_protocol_version=execution_protocol_version,
     )
+    intent = _intent_with_credential_authority(intent, capability_snapshot.get("credential_authority"))
     fingerprint = _fingerprint(intent)
     factory = _factory()
     async with factory() as session, session.begin():
+        await _read_committed(session)
+        from . import budgets
+
+        order = budgets.LockOrder()
+        quota = None
+        if capability_snapshot.get("sandbox_tools"):
+            quota = await budgets.lock_project_quota(session, project_id, order=order)
+        order.take("conversation")
         existing = (
             await session.execute(
                 select(ChatRun)
@@ -749,6 +924,7 @@ async def create_temp_run(
         ).scalar_one_or_none()
         if active is not None:
             raise DurableRunConflict("conversation_run_active")
+        route = await worker_routing.resolve_worker_route(session, run_kind=run_kind)
         run = ChatRun(
             id=str(uuid.uuid4()),
             run_scope="temp",
@@ -758,6 +934,7 @@ async def create_temp_run(
             model_name=model_name,
             source=source,
             api_key_id=api_key_id,
+            payer_domain_id=payer.domain_id if payer is not None else None,
             execution_protocol_version=execution_protocol_version,
             capability_snapshot=capability_snapshot,
             required_plugin_digest=capability_snapshot.get("required_plugin_digest"),
@@ -771,6 +948,8 @@ async def create_temp_run(
             last_seq=0,
             current_ordinal=0,
             run_kind=run_kind,
+            workload_class=route.workload_class,
+            worker_pool_id=route.worker_pool_id,
             status="queued",
         )
         session.add(run)
@@ -786,6 +965,12 @@ async def create_temp_run(
             project_id=project_id,
         )
         thread.active_run_id = run.id
+        await session.flush()
+        order.take("root")
+        if await _apply_root_budget(
+            session, run, agent_budget=None, execution_mode="chat", quota=quota, order=order,
+        ):
+            run.status = "waiting_resource"
         _add_run_providers(session, run, capability_snapshot)
         await append_event(
             session,
@@ -802,9 +987,10 @@ async def create_temp_run(
                 },
             ),
         )
-        await append_event(session, run, _event(run, "run.stage.changed", {"stage": "queued"}))
+        await append_event(session, run, _event(run, "run.stage.changed", {"stage": run.status}))
         created = descriptor(run)
-    await wake_run(created.run_id)
+    if created.status == "queued":
+        await wake_run(created.run_id)
     return created
 
 
@@ -823,6 +1009,7 @@ async def create_temp_thread(*, project_id: str, user_id: str) -> ChatTempThread
         return row
 
 
+@_replay_idempotency_race
 async def create_compaction_run(
     *,
     project_id: str,
@@ -839,6 +1026,8 @@ async def create_compaction_run(
     execution_protocol_version: int = 1,
     source: str = "web",
     api_key_id: int | None = None,
+    payer: Payer | None = None,
+    domain_id: str | None = None,
 ) -> ChatRunDescriptor:
     """Admit a manual compaction run with strict parent->run->checkpoint locking and revision fence."""
     try:
@@ -852,9 +1041,13 @@ async def create_compaction_run(
 
     _require_supported_execution_protocol_version(execution_protocol_version)
     request_payload = {**request_payload, "execution_protocol_version": execution_protocol_version}
+    request_payload["required_scopes"] = ["native:runs:write",
+        "native:conversations:read" if conversation_id is not None else "native:runs:read"]
+    intent = _intent_with_credential_authority(intent, capability_snapshot.get("credential_authority"))
     fingerprint = _fingerprint(intent)
     factory = _factory()
     async with factory() as session, session.begin():
+        await _read_committed(session)
         conv = None
         thread = None
         if conversation_id is not None:
@@ -863,7 +1056,10 @@ async def create_compaction_run(
                     select(ChatConversation)
                     .where(
                         ChatConversation.id == conversation_id,
-                        ChatConversation.project_id == project_id,
+                        scope_clause(
+                            ChatConversation.domain_id, ChatConversation.project_id,
+                            domain_id=domain_id, project_id=project_id,
+                        ),
                         ChatConversation.user_id == user_id,
                     )
                     .with_for_update()
@@ -930,6 +1126,7 @@ async def create_compaction_run(
             temp_thread_id=temp_thread_id,
             user_id=user_id,
             project_id=project_id,
+            domain_id=domain_id,
             session=session,
         )
         if current_source.get("revision") != expected_context_revision:
@@ -937,6 +1134,7 @@ async def create_compaction_run(
 
         await _lock_run_configurations(session, capability_snapshot, model_name=model_name)
 
+        route = await worker_routing.resolve_worker_route(session, run_kind="compaction")
         run = ChatRun(
             id=str(uuid.uuid4()),
             run_scope="persistent" if conversation_id else "temp",
@@ -949,6 +1147,7 @@ async def create_compaction_run(
             model_name=model_name,
             source=source,
             api_key_id=api_key_id,
+            payer_domain_id=payer.domain_id if payer is not None else None,
             execution_protocol_version=execution_protocol_version,
             capability_snapshot=capability_snapshot,
             required_plugin_digest=capability_snapshot.get("required_plugin_digest"),
@@ -962,6 +1161,8 @@ async def create_compaction_run(
             last_seq=0,
             current_ordinal=0,
             run_kind="compaction",
+            workload_class=route.workload_class,
+            worker_pool_id=route.worker_pool_id,
             status="queued",
         )
         session.add(run)

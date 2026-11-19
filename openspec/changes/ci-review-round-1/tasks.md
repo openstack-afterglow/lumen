@@ -9,7 +9,7 @@
 - [x] Build lumen-api, lumen-worker and lumen-test locally and check ownership and imports
 - [x] Run the non-docker checks, stamp the architecture guard and pass the staged check
 - [x] Owner, on a docker host before pushing to dev: `uv run lumen-test system` and `uv run lumen-test integration` (integrated-source gates: system 9 passed, integration 40 passed on 2026-09-25)
-- [ ] After the first dev push: confirm every `test / *` job executed and `build-and-push` published, then measure `dedup` queue+run time on the first non-duplicate PRs
+- [x] After the first dev push: confirm every `test / *` job executed and `build-and-push` published, then measure `dedup` queue+run time on the first non-duplicate PRs (GitHub receipts reviewed 2026-10-07 below).
 
 ## Verification record (2026-09-24)
 
@@ -40,8 +40,15 @@ Not verified here:
 - Isolated MariaDB/Redis integration: 40 passed. Docker process-stack system: 9 passed. Local Afterglow Compose migrations exited 0; current API/worker images were deployed and authenticated BFF reads passed.
 - Native arm64 sandbox isolation: 21 passed. Native amd64 isolation, live provider inference and cloud sandbox lifecycle remain unverified; package/binary smoke is not that proof.
 
-- GitHub workflow publication and dedup timing remain the open post-push item above.
+- 당시 미확인 GitHub workflow publication과 dedup timing은 아래 2026-10-07 receipts로 검증했다.
 
-## 0.3.0 release boundary
+## 0.3.0 release boundary (historical)
 
-The workflow and packaging changes are in the root 0.3.0 release candidate; tag publication has not been verified. The unchecked first-`dev`-push job/publication check and PR dedup timing remain open; local multi-platform builds do not establish that the `v0.3.0` tag workflows or GHCR image publication have succeeded. See `CHANGELOG.md` for release notes.
+The workflow and packaging changes entered the root 0.3.0 candidate. At preparation time, first-dev-push/publication and PR dedup timing were unverified; the later GitHub receipts below close that task. Local multi-platform builds alone still do not establish any tag workflow or GHCR publication success. See `CHANGELOG.md` for version-specific release notes.
+
+## GitHub execution and timing receipts — 2026-10-07
+
+- First post-cutover `dev` push [35990866877](https://github.com/openstack-afterglow/lumen/actions/runs/35990866877), SHA `6c3315a57c11e747d797b4c7db3f256fb0b6cfac`: every then-defined `test / *` job succeeded (service, datastore, SDK, Kolla, process-system); PR-only dedup skipped; both then-defined API/worker image jobs and their GHCR login/build-and-push steps succeeded. Later [37315953627](https://github.com/openstack-afterglow/lumen/actions/runs/37315953627), SHA `0e034c91c41c95205cfdd1cd1fd2a63fab244294`, ran all eleven expanded test jobs and all four API/worker/controller/sandbox publishing jobs successfully. These are observed workflow publication receipts, not production deployment or 0.6.3 publication.
+- The first three sampled non-duplicate PRs after cutover have measured dedup queue/run seconds: [36645179290](https://github.com/openstack-afterglow/lumen/actions/runs/36645179290) `2/3`, [36646336520](https://github.com/openstack-afterglow/lumen/actions/runs/36646336520) `2/2`, [36649188977](https://github.com/openstack-afterglow/lumen/actions/runs/36649188977) `3/3`. Each ran eleven tests; same-tree dev PRs instead skipped tests as intended. Measurements use run creation→dedup start and job start→completion, not projected savings.
+- Re-measured twenty most recent successful non-deduplicated `docker-build.yml` test runs, 2026-09-29–2026-10-05: created→last successful `test / *` completion median **130.5s**, nearest-rank p90 **154s**. Every sample ran eleven test jobs; system remains the longest job (median **125.5s**), service **50s**, datastore **68.5s**. This is a pre-0.6.3 baseline; the expanded pending test volume must be re-measured after publication rather than attributed these older timings.
+- Sample run IDs, newest first: `37329683293`, `37317145958`, `37315953627`, `37212521188`, `37190133167`, `37136255535`, `37131889751`, `37047027777`, `37047028114`, `37046029099`, `37044952089`, `37044082785`, `36864815886`, `36864418902`, `36861508761`, `36861454259`, `36860528668`, `36650204858`, `36650113439`, `36649188977`. Source: `gh run list --workflow docker-build.yml --status success --limit 60 --json databaseId,event,headBranch,headSha,createdAt,updatedAt,url`, and each `gh api repos/openstack-afterglow/lumen/actions/runs/<id>/jobs?per_page=100`.

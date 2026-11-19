@@ -1,4 +1,8 @@
 ---
+- name: Pull | Build pinned source images when requested
+  ansible.builtin.include_tasks: source_build.yml
+  when: lumen_source_mode | default(false) | bool
+
 - name: Pull | Pull Lumen images
   become: true
   community.docker.docker_image:
@@ -11,3 +15,12 @@
     - inventory_hostname in groups['lumen']
     - item.value.enabled | bool
     - not (lumen_source_mode | default(false) | bool)
+
+- name: Pull | Pull pinned managed ClamAV image
+  become: true
+  community.docker.docker_image:
+    name: "{{ lumen_clamav_service.image }}"
+    source: pull
+  when:
+    - inventory_hostname in groups['lumen']
+    - enable_lumen_clamav | bool

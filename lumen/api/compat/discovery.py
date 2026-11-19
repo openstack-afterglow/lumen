@@ -6,10 +6,13 @@
 
 from __future__ import annotations
 
+from typing import get_args
+
 from fastapi import APIRouter, Request
 from pydantic import BaseModel, Field
 
 from lumen.config import get_settings
+from lumen.models.batch_contracts import BATCH_ENDPOINTS, BatchOperation, batch_item_scopes
 
 router = APIRouter()
 
@@ -88,10 +91,57 @@ class CompatDiscoveryHostGate(BaseModel):
             "/v1/responses",
             "/v1/messages",
             "/v1/models",
+            "/v1/cli/models",
+            "/v1/files",
+            "/v1/batches",
             "/v1/claude-gateway/*",
         ]
     )
     behavior: str = "chat_api_hosts 설정을 통해 허용된 Host 헤더 요청만 통과하며 미허용 시 404로 응답합니다."
+
+
+class CompatDiscoveryOpenAIBatch(BaseModel):
+    files: str
+    batches: str
+    supported_endpoints: list[str]
+    completion_window: str = "24h"
+    file_purposes: list[str] = Field(default_factory=lambda: ["batch"])
+    max_rows: int
+    max_file_bytes: int
+    max_line_bytes: int
+    upload_slots: int
+    input_ttl_days: int
+    default_output_ttl_days: int
+    output_expires_after_seconds: list[int] = Field(default_factory=lambda: [3600, 30 * 86400])
+    required_scopes: dict[str, list[str]]
+    endpoint_scopes: dict[str, list[str]]
+
+
+class CompatDiscoveryNativeBatch(BaseModel):
+    batches: str
+    operations: list[str]
+    completion_window: str = "24h"
+    max_items: int
+    max_body_bytes: int
+    idempotency_key: str = "Idempotency-Key header required: 1-128 printable ASCII characters"
+    required_scopes: dict[str, list[str]]
+    operation_scopes: dict[str, list[str]]
+
+
+class CompatDiscoveryBatches(BaseModel):
+    enabled: bool
+    openai: CompatDiscoveryOpenAIBatch
+    native: CompatDiscoveryNativeBatch
+    execution: str = (
+        "Lumen batch workers execute items at frozen Lumen prices; no upstream provider Batch API, discount or quota applies."
+    )
+    unsupported: list[str] = Field(default_factory=lambda: [
+        "stream=true", "model=lumen virtual conversations", "realtime", "server-side or built-in provider tools",
+        "compaction/context_management", "stateful Responses (store, previous_response_id, background)",
+        "request headers, credentials or base URL overrides",
+    ])
+    result_order: str = "Results are not ordered; correlate rows by custom_id."
+
 
 
 class CompatDiscoveryResponse(BaseModel):
@@ -114,6 +164,7 @@ class CompatDiscoveryResponse(BaseModel):
     idempotency: CompatDiscoveryIdempotency
     sse: CompatDiscoverySSE
     host_gate: CompatDiscoveryHostGate
+    batches: CompatDiscoveryBatches
 
 
 @router.get("/compat", response_model=CompatDiscoveryResponse)
@@ -204,6 +255,8 @@ async def discovery(request: Request) -> CompatDiscoveryResponse:
                 "responses": f"{origin}/v1/responses",
                 "speech": f"{origin}/v1/audio/speech",
                 "transcriptions": f"{origin}/v1/audio/transcriptions",
+                "files": f"{origin}/v1/files",
+                "batches": f"{origin}/v1/batches",
             },
             anthropic={
                 "messages": f"{origin}/v1/messages",
@@ -216,6 +269,7 @@ async def discovery(request: Request) -> CompatDiscoveryResponse:
                 "runs": f"{origin}/v1/runs",
                 "audio_speech": f"{origin}/v1/chat/audio/speech",
                 "audio_transcriptions": f"{origin}/v1/chat/audio/transcriptions",
+                "batches": f"{origin}/v1/chat/batches",
                 "sdk_base_url": origin,
             },
             gateway={
@@ -232,7 +286,7 @@ async def discovery(request: Request) -> CompatDiscoveryResponse:
         models_endpoint=f"{origin}/v1/models",
         features=[
             "model='lumen': text-only durable worker streaming (caller tools/memory 비활성화)",
-            "provider model ID: tools(function calling) pass-through 및 vision 지원",
+            "Model API keys support model inference and vision, but not server tools, Batch, Files, or run history.",
             "Finite audio: configured product USD/second rate times scanned media duration; provider invoice units may differ.",
             "Audio speech streams owned scanned MP3/WAV; transcription accepts project-owned scanned audio, returns real text.",
             "Idempotency-Key UUID 지원 (네이티브 202 멱등 재시도 및 쿼터 재검사 예외)",
@@ -254,7 +308,7 @@ async def discovery(request: Request) -> CompatDiscoveryResponse:
         },
         notes=[
             "OpenAI 호환 route에서 model='lumen'은 durable worker 실행으로 처리되며, provider model ID는 stateless 중계로 동작합니다.",
-            "사용량은 발급 사용자의 지갑·월 쿼터에서 차감됩니다.",
+            "Personal keys pay from the user wallet. Service keys pay from the owning domain's credit pool.",
             "사용량은 웹과 분리된 API 통계(키별)로 집계됩니다.",
             "Configured gateway metadata describes the legacy Lumen custom device protocol, not current Claude Apps Gateway login.",
             "OpenAI 호환 오류는 최상위 {error: {message, type, code}} 구조를 사용합니다.",
@@ -262,4 +316,39 @@ async def discovery(request: Request) -> CompatDiscoveryResponse:
         idempotency=CompatDiscoveryIdempotency(),
         sse=CompatDiscoverySSE(),
         host_gate=CompatDiscoveryHostGate(),
+        batches=CompatDiscoveryBatches(
+            enabled=settings.batch_enabled,
+            openai=CompatDiscoveryOpenAIBatch(
+                files=f"{origin}/v1/files",
+                batches=f"{origin}/v1/batches",
+                supported_endpoints=list(BATCH_ENDPOINTS),
+                max_rows=settings.batch_jsonl_max_rows,
+                max_file_bytes=settings.batch_jsonl_max_bytes,
+                max_line_bytes=settings.batch_jsonl_max_line_bytes,
+                upload_slots=settings.batch_upload_slots,
+                input_ttl_days=settings.batch_input_ttl_days,
+                default_output_ttl_days=settings.batch_result_ttl_days,
+                required_scopes={
+                    "files_read": ["compat:files:read"],
+                    "files_write": ["compat:files:write"],
+                    "batches_read": ["compat:batches:read"],
+                    "batches_write": ["compat:batches:write"],
+                },
+                endpoint_scopes={
+                    endpoint: list(batch_item_scopes(operation, contract="openai"))
+                    for endpoint, operation in BATCH_ENDPOINTS.items()
+                },
+            ),
+            native=CompatDiscoveryNativeBatch(
+                batches=f"{origin}/v1/chat/batches",
+                operations=list(get_args(BatchOperation)),
+                max_items=settings.batch_native_max_items,
+                max_body_bytes=settings.batch_native_max_bytes,
+                required_scopes={"read": ["native:batches:read"], "write": ["native:batches:write"]},
+                operation_scopes={
+                    operation: list(batch_item_scopes(operation, contract="native"))
+                    for operation in get_args(BatchOperation)
+                },
+            ),
+        ),
     )

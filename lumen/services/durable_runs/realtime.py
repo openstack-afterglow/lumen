@@ -12,6 +12,7 @@ import hashlib
 import json
 import secrets
 import uuid
+from copy import deepcopy
 from decimal import Decimal
 
 from sqlalchemy import select, text
@@ -20,16 +21,21 @@ from sqlalchemy.exc import IntegrityError
 from lumen.cache import _get_redis
 from lumen.config import get_settings
 from lumen.crypto import encrypt_chat_content
+from lumen.models.billing import Payer
 from lumen.models.chat_runs import ChatModelCallReservation, ChatRun, ChatRunProvider, ChatRunSegment
 from lumen.services import credit
-from lumen.services.litellm_client import UsageCost
+from lumen.services.api_key_store import ApiKeyAuthorityUnavailable, ApiKeyForbidden, authorize_api_key_in_transaction
+from lumen.services.inference_authority import check_dispatch, preflight_dispatch, read_dispatch_candidate
+from lumen.services.provider_metadata import UsageCost
 from lumen.services.providers import pricing as provider_pricing
 from lumen.services.providers import realtime_transport, routing
+from lumen.services.providers.credentials import execution_identity
 from lumen.services.providers.errors import AmbiguousModelRouteError, ProviderValidationError
+from lumen.services.providers.relay_history import receipt_owner
 from lumen.services.run_store import (
     append_event,
     begin_segment_io,
-    claim_queued_run,
+    claim_realtime_run,
     complete_segment_io,
     load_segment_payload,
     prepare_segment,
@@ -45,6 +51,7 @@ from .errors import (
     DurableRunInputError,
     DurableRunNotFound,
     DurableRunProviderResultUnknown,
+    RealtimeKindMismatch,
 )
 from .lifecycle import _renew_lease
 
@@ -119,41 +126,69 @@ def _checkpoint(meter, basis: str) -> dict:
     if basis == "session":
         seconds = meter.connected_seconds
         usage["connected_seconds"] = format(seconds, "f") if isinstance(seconds, Decimal) else None
+        state = meter.provider_seconds_state
+        if state != "unmetered":
+            # GPT-Live's own final voice seconds; Lumen's connected time stays evidence only.
+            usage["provider_seconds_state"] = state
+            usage["provider_seconds"] = (format(meter.provider_seconds, "f")
+                                         if isinstance(meter.provider_seconds, Decimal) else None)
     if basis == "tokens":
         usage["usage_state"] = meter.usage_state
         usage["usage"] = meter.usage.as_usage_dict() if meter.usage is not None else None
+        usage["image_sent"] = meter.image_sent
     return usage
 
 
+# Duration family -> (ledger component kind, summary key, checkpoint byte and sample-rate keys).
+_DURATION_COMPONENTS = {
+    "realtime_input": ("audio_input_seconds", "input_audio_seconds", "input_bytes", "input_sample_rate_hz"),
+    "realtime_output": ("audio_output_seconds", "output_audio_seconds", "output_bytes", "output_sample_rate_hz"),
+}
+
+
 def _duration_bill(run: ChatRun, snapshot: dict, usage: dict):
+    """Price each frozen duration family; input-only plans (transcription, translation) bill input PCM only."""
     duration = snapshot["max_duration_seconds"]
+    frozen_rates = snapshot.get("duration_rates")
+    if (not isinstance(frozen_rates, dict) or "realtime_input" not in frozen_rates
+            or set(frozen_rates) - set(_DURATION_COMPONENTS)):
+        raise DurableRunProviderResultUnknown("frozen realtime duration price is unavailable")
     components = []
-    costs = []
+    costs: dict[str, Decimal] = {}
     summary = {}
-    for family, kind, summary_key, size, rate in (
-        ("realtime_input", "audio_input_seconds", "input_audio_seconds",
-         usage.get("input_bytes"), usage.get("input_sample_rate_hz")),
-        ("realtime_output", "audio_output_seconds", "output_audio_seconds",
-         usage.get("output_bytes"), usage.get("output_sample_rate_hz")),
-    ):
+    for family, (kind, summary_key, size_key, rate_key) in _DURATION_COMPONENTS.items():
+        if family not in frozen_rates:
+            continue
+        size, rate = usage.get(size_key), usage.get(rate_key)
         if type(size) is not int or type(rate) is not int or rate not in {16000, 24000} or size < 0 or size > 2 * rate * duration:
             raise DurableRunProviderResultUnknown("realtime duration exceeds frozen reservation")
         seconds = Decimal(size) / Decimal(2 * rate)
         cost = _duration_seconds_cost(snapshot, family, seconds)
-        frozen = snapshot["duration_rates"][family]
-        costs.append(cost)
+        frozen = frozen_rates[family]
+        costs[family] = cost
         summary[summary_key] = format(seconds, "f")
         components.append({"segment_id": _SEGMENT, "kind": kind, "quantity": format(seconds, "f"), "unit": "second",
             "unit_price_usd": format(Decimal(frozen["rate"]) / frozen["unit_seconds"], "f"),
             "cost_usd": format(cost, "f"), "source": "media", "model_name": run.model_name,
             "metadata": {"billing_basis": "duration", "rate_unit_seconds": frozen["unit_seconds"]}})
-    usage_cost = UsageCost(raw_cost=costs[0] + costs[1], input_cost=costs[0], output_cost=costs[1],
+    input_cost, output_cost = costs["realtime_input"], costs.get("realtime_output")
+    usage_cost = UsageCost(raw_cost=input_cost if output_cost is None else input_cost + output_cost,
+                           input_cost=input_cost, output_cost=Decimal(0) if output_cost is None else output_cost,
                            pricing_status="priced", pricing_snapshot=snapshot)
     return usage_cost, components, None, summary
 
 
 def _session_bill(run: ChatRun, snapshot: dict, usage: dict):
-    raw = usage.get("connected_seconds")
+    """Bill session seconds: GPT-Live's provider-reported final value, else Lumen-connected time.
+
+    GPT-Live publishes authoritative usage in ``session.closed``, so its absence, invalidity or
+    a value above the held bound leaves the hold unknown; local elapsed time never stands in.
+    Conversation models priced per session (no provider seconds published) bill connected time.
+    """
+    live = snapshot.get("realtime_kind") == "live"
+    if live and usage.get("provider_seconds_state") != "complete":
+        raise DurableRunProviderResultUnknown("realtime provider session usage is unavailable")
+    raw = usage.get("provider_seconds" if live else "connected_seconds")
     try:
         seconds = Decimal(raw) if isinstance(raw, str) else None
     except ArithmeticError:
@@ -166,7 +201,8 @@ def _session_bill(run: ChatRun, snapshot: dict, usage: dict):
     components = [{"segment_id": _SEGMENT, "kind": _SESSION_KIND, "quantity": format(seconds, "f"), "unit": "second",
         "unit_price_usd": format(Decimal(frozen["rate"]) / frozen["unit_seconds"], "f"),
         "cost_usd": format(cost, "f"), "source": "media", "model_name": run.model_name,
-        "metadata": {"billing_basis": "session", "rate_unit_seconds": frozen["unit_seconds"]}}]
+        "metadata": {"billing_basis": "session", "rate_unit_seconds": frozen["unit_seconds"],
+                     "usage_source": "provider" if live else "lumen_connected"}}]
     usage_cost = UsageCost(raw_cost=cost, input_cost=cost, output_cost=Decimal(0),
                            pricing_status="priced", pricing_snapshot=snapshot)
     return usage_cost, components, None, {"session_seconds": format(seconds, "f")}
@@ -180,7 +216,7 @@ def _token_bill(run: ChatRun, snapshot: dict, usage: dict):
     required: tuple[str, ...] = ()
     if observed is None:
         # A truly idle session can be free; sent input without completion usage is uncertain.
-        if usage.get("input_bytes") != 0 or usage.get("output_bytes") != 0:
+        if usage.get("input_bytes") != 0 or usage.get("output_bytes") != 0 or usage.get("image_sent"):
             raise DurableRunProviderResultUnknown("realtime provider token usage is missing")
         breakdown = UsageBreakdown.from_totals(0, 0)
     else:
@@ -188,9 +224,8 @@ def _token_bill(run: ChatRun, snapshot: dict, usage: dict):
             breakdown = UsageBreakdown.from_canonical(observed)
         except ValueError as exc:
             raise DurableRunProviderResultUnknown("realtime provider token usage is invalid") from exc
-        # Observed PCM in a direction demands the provider's audio share for it.
-        required = tuple(name for name, size in (("audio_input", usage.get("input_bytes")),
-                                                 ("audio_output", usage.get("output_bytes"))) if size)
+        required = tuple(name for name, observed_input in (("audio_input", usage.get("input_bytes")),
+            ("audio_output", usage.get("output_bytes")), ("image_input", usage.get("image_sent"))) if observed_input)
     try:
         usage_cost = credit.usage_cost_from_pricing_snapshot(snapshot["token_pricing"],
             prompt_tokens=breakdown.input_tokens, completion_tokens=breakdown.output_tokens,
@@ -208,10 +243,38 @@ def _token_bill(run: ChatRun, snapshot: dict, usage: dict):
 _BILLS = {"duration": _duration_bill, "session": _session_bill, "tokens": _token_bill}
 
 
-def _intent(request: dict) -> dict:
-    return {"model_id": request.get("model_id"), "provider_id": request.get("provider_id"),
-            "voice": request.get("voice"), "instructions": request.get("instructions"),
-            "max_duration_seconds": request.get("max_duration_seconds", 300)}
+def _token_hold(pricing: dict):
+    """In-session guard for OpenAI token plans: frozen price, reserved USD, per-response bound."""
+    if pricing.get("billing_basis") != "tokens" or "response_bound_usd" not in pricing:
+        return None
+    snapshot = pricing["token_pricing"]
+
+    def price(usage: UsageBreakdown) -> Decimal:
+        return credit.usage_cost_from_pricing_snapshot(snapshot, prompt_tokens=usage.input_tokens,
+            completion_tokens=usage.output_tokens, breakdown=usage, required_modalities=()).raw_cost
+
+    return price, Decimal(pricing["reservation_usd"]), Decimal(pricing["response_bound_usd"])
+
+
+def _intent(request: dict, kind: str = "conversation") -> dict:
+    intent = {"model_id": request.get("model_id"), "provider_id": request.get("provider_id"),
+              "voice": request.get("voice"), "instructions": request.get("instructions"),
+              "max_duration_seconds": request.get("max_duration_seconds", 300)}
+    # Conversation intents keep their historical fingerprint; other kinds add only what they carry.
+    if request.get("model_row_id") is not None:
+        intent["model_row_id"] = request["model_row_id"]
+    if kind != "conversation":
+        intent["realtime_kind"] = kind
+    if request.get("transcription") is not None:
+        intent["transcription"] = request["transcription"]
+    if request.get("output_language") is not None:
+        intent["output_language"] = request["output_language"]
+    if request.get("reasoning_effort") is not None:
+        intent["reasoning_effort"] = request["reasoning_effort"]
+    for key in ("tools", "tool_choice"):
+        if request.get(key) is not None:
+            intent[key] = request[key]
+    return intent
 
 
 def _ticket_key(run_id: str) -> str:
@@ -253,11 +316,19 @@ async def consume_ticket(run_id: str, token: str) -> tuple[str, str]:
 async def admit_realtime_session(
     request: dict, *, project_id: str, user_id: str, client_request_id: str,
     source: str = "web", api_key_id: int | None = None, provider_type: str | None = None,
+    payer: Payer | None = None,
+    credential_authority: dict | None = None, kind: str = "conversation", wire: str = "native",
 ) -> dict:
-    """``provider_type`` is the transport a vendor wire fixes, never the editable public selector."""
-    from .admission import _lock_run_configurations, existing_run_for_intent
+    """``provider_type`` is the transport a vendor wire fixes, never the editable public selector.
 
-    intent = _intent(request)
+    ``kind`` is the realtime kind the calling endpoint speaks. Native sessions support every
+    kind; translation and live also keep their compatible endpoints.
+    """
+    from .admission import _intent_with_credential_authority, _lock_run_configurations, existing_run_for_intent
+
+    if kind not in realtime_transport.REALTIME_KINDS:
+        raise DurableRunInputError("unsupported realtime session kind")
+    intent = _intent_with_credential_authority(_intent(request, kind), credential_authority)
     previous = await existing_run_for_intent(project_id=project_id, user_id=user_id,
         client_request_id=client_request_id, intent=intent, conversation_id=None)
     if previous is not None:
@@ -266,27 +337,48 @@ async def admit_realtime_session(
         async with _factory()() as session:
             row = (await session.execute(select(ChatRun).where(ChatRun.id == previous.run_id))).scalar_one()
             return await _response(row, user_id=user_id, project_id=project_id)
-    model_id, provider_id = intent["model_id"], intent["provider_id"]
-    if not isinstance(model_id, str) or not model_id or (provider_id is not None and not isinstance(provider_id, (str, int))):
+    model_id, model_row_id, provider_id = intent["model_id"], intent.get("model_row_id"), intent["provider_id"]
+    if ((model_id is not None and not isinstance(model_id, str)) or (not model_id and model_row_id is None)
+            or (provider_id is not None and not isinstance(provider_id, (str, int)))):
         raise DurableRunInputError("realtime model is required")
-    provider_number = int(provider_id) if provider_id is not None and str(provider_id).isdecimal() else None
-    api_provider = str(provider_id) if provider_id is not None and provider_number is None else None
     try:
-        route = (await routing.resolve_model_by_id(int(model_id), model_kind="realtime") if model_id.isdecimal()
-                 else await routing.resolve_api_model(model_id, provider=api_provider, provider_id=provider_number,
-                                                       provider_type=provider_type, model_kind="realtime"))
+        route = await routing.resolve_media_model(model_id, model_row_id=model_row_id, provider_id=provider_id,
+                                                  provider_type=provider_type, model_kind="realtime")
     except AmbiguousModelRouteError as exc:
         raise DurableRunInputError("realtime provider selection is ambiguous") from exc
-    if route is None or (provider_number is not None and route["provider_id"] != provider_number) or (
-        api_provider is not None and route["api_provider"] != api_provider
-    ) or (provider_type is not None and route["provider_type"] != provider_type):
+    if route is None:
         raise DurableRunInputError("realtime provider or model is unavailable")
+    route_kind = realtime_transport.realtime_kind(route)
+    if route_kind != kind:
+        raise RealtimeKindMismatch(f"realtime {route_kind} models are not available on this endpoint")
+    if "transcription" in intent:
+        from lumen.services.providers.realtime_protocol import transcription_session, transcription_update
+
+        options = intent["transcription"]
+        try:
+            if kind != "transcription" or not isinstance(options, dict) or transcription_session(
+                    transcription_update(route["api_model_name"], options)["session"])[1] != options:
+                raise DurableRunInputError("realtime transcription options are invalid")
+        except realtime_transport.RealtimeTransportError as exc:
+            raise DurableRunInputError("realtime transcription options are invalid") from exc
+    if "output_language" in intent:
+        from lumen.services.providers.realtime_protocol import translation_language
+
+        try:
+            if kind != "translation" or translation_language(intent["output_language"]) != intent["output_language"]:
+                raise DurableRunInputError("realtime translation language is invalid")
+        except realtime_transport.RealtimeTransportError as exc:
+            raise DurableRunInputError("realtime translation language is invalid") from exc
     voices = realtime_transport.available_realtime_options(route)
     voice = intent["voice"] or voices["default_voice"]
     plan = realtime_transport.validate_realtime_request(route, voice=voice,
-        instructions=intent["instructions"], max_duration_seconds=intent["max_duration_seconds"])
-    payload = {**intent, "voice": voice}
-    await credit.precheck(user_id, project_id, api_key_id)
+        instructions=intent["instructions"], max_duration_seconds=intent["max_duration_seconds"],
+        reasoning_effort=intent.get("reasoning_effort"), tools=intent.get("tools"),
+        tool_choice=intent.get("tool_choice"))
+    required_scopes = ("compat:realtime:write",) if source == "api" else ("native:realtime:write",)
+    # The admitting wire is frozen: translation and live sessions run only on it.
+    payload = {**intent, "voice": voice, "required_scopes": list(required_scopes), "wire": wire}
+    await credit.precheck(user_id, project_id, api_key_id, payer=payer)
     per_usd = Decimal(str(get_settings().chat_credit_per_usd))
     margin = Decimal(str(route["margin_multiplier"]))
     envelope = _envelope_usd(plan, intent["max_duration_seconds"])
@@ -294,12 +386,22 @@ async def admit_realtime_session(
     if bound <= 0 or bound >= Decimal("10000000000"):
         raise DurableRunInputError("realtime credit reservation is invalid")
     capability = {key: route[key] for key in ("provider_id", "model_id", "provider_name", "provider_type", "model_name", "model_kind", "config_version_hash")}
+    capability.update(execution_identity(route))
     capability["effective_features"] = {}
+    if credential_authority is not None:
+        capability["credential_authority"] = deepcopy(credential_authority)
+    image_input = (plan["billing_basis"] == "tokens"
+                   and realtime_transport.conversation_features(route)["image_input"])
     pricing = {**plan, "max_duration_seconds": intent["max_duration_seconds"],
                "reservation_usd": format(envelope, "f"), "bound_credits": format(bound, "f"),
-               "margin_multiplier": format(margin, "f"), "credit_per_usd": format(per_usd, "f")}
+               "margin_multiplier": format(margin, "f"), "credit_per_usd": format(per_usd, "f"),
+               # Frozen so the BFF can size its relay from Lumen, never from the browser.
+               "realtime_image_input": image_input}
     try:
         async with _factory()() as session, session.begin():
+            # No gap locks: the unique idempotency index (migration 030) decides same-key races, and the
+            # IntegrityError replay below returns the winner. Gap locks deadlocked concurrent admissions.
+            await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
             existing = (await session.execute(select(ChatRun).where(ChatRun.project_id == project_id,
                 ChatRun.user_id == user_id, ChatRun.client_request_id == client_request_id).with_for_update())).scalar_one_or_none()
             if existing is not None:
@@ -310,16 +412,27 @@ async def admit_realtime_session(
                 run = existing
             else:
                 await _lock_run_configurations(session, capability, model_name=route["model_name"])
-                run = ChatRun(id=str(uuid.uuid4()), run_scope="realtime", run_kind="realtime",
+                try:
+                    await authorize_api_key_in_transaction(session, user_id=user_id, project_id=project_id,
+                        api_key_id=api_key_id, required_scopes=required_scopes,
+                        credential_authority=capability.get("credential_authority"))
+                except ApiKeyForbidden as exc:
+                    raise DurableRunInputError("inference_authority_revoked") from exc
+                except ApiKeyAuthorityUnavailable as exc:
+                    raise DurableRunError("inference_authority_unavailable") from exc
+                run = ChatRun(id=str(uuid.uuid4()), run_scope="realtime", run_kind="realtime", workload_class="realtime",
                     project_id=project_id, user_id=user_id, model_name=route["model_name"], source=source,
                     api_key_id=api_key_id, client_request_id=client_request_id, request_fingerprint=_fingerprint(intent),
+                    payer_domain_id=payer.domain_id if payer is not None else None,
                     fingerprint_version=1, execution_protocol_version=1, capability_snapshot=capability,
                     pricing_snapshot=pricing, request_payload=encrypt_chat_content(json.dumps(payload)),
-                    status="queued", last_seq=0, current_ordinal=0, reserved_credits=bound)
+                    status="queued", last_seq=0, current_ordinal=0)
                 session.add(run)
                 session.add(ChatRunProvider(run_id=run.id, purpose="executor", provider_id=route["provider_id"],
                     model_id=route["model_id"], provider_label=route["provider_name"],
-                    model_label=route["model_name"], config_version_hash=route["config_version_hash"]))
+                    model_label=route["model_name"], config_version_hash=route["config_version_hash"],
+                    **{key: value for key, value in execution_identity(route).items()
+                       if key not in {"provider_auth", "provider_quota_group"}}))
                 await append_event(session, run, _event(run, "run.started", {"conversation_id": None,
                     "temp_thread_id": None, "model_name": run.model_name, "effective_features": {}, "run_kind": "realtime"}))
                 await append_event(session, run, _event(run, "run.stage.changed", {"stage": "queued"}))
@@ -335,17 +448,35 @@ async def admit_realtime_session(
 
 
 async def _response(run: ChatRun, *, user_id: str, project_id: str) -> dict:
+    from lumen.services.providers.realtime_protocol import client_frame_limit
+
     token = await _issue_ticket(run.id, user_id=user_id, project_id=project_id)
+    image_input = (run.pricing_snapshot or {}).get("realtime_image_input") is True
     return {"session_id": run.id, "status": "ready", "model_name": run.model_name,
             "provider_type": run.capability_snapshot["provider_type"], "expires_in_seconds": _TICKET_TTL,
-            "connect_token": token}
+            "connect_token": token, "realtime_image_input": image_input,
+            "max_client_frame_bytes": client_frame_limit(image_input)}
 
 
 async def _start(run_id: str, *, owner: str, user_id: str, project_id: str) -> tuple[dict, dict, dict, str]:
+    async with _factory()() as session:
+        candidate = await read_dispatch_candidate(session, run_id, _SEGMENT)
+        if candidate is None or candidate.user_id != user_id or candidate.project_id != project_id:
+            raise DurableRunNotFound("realtime session is unavailable")
+        scopes = _payload(candidate).get("required_scopes") or [
+            "compat:realtime:write" if candidate.source == "api" else "native:realtime:write"]
+        try:
+            approval = await preflight_dispatch(session, candidate, tuple(scopes))
+        except ApiKeyForbidden as exc:
+            raise DurableRunInputError("inference_authority_revoked") from exc
+        except ApiKeyAuthorityUnavailable as exc:
+            raise DurableRunError("inference_authority_unavailable") from exc
+
     async def transaction():
         async with _factory()() as session, session.begin():
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
-            run = await claim_queued_run(session, run_id, owner=owner, lease_seconds=45)
+            await credit.lock_run_payer(session, run_id)
+            run = await claim_realtime_run(session, run_id, owner=owner, lease_seconds=45)
             if run is None or run.user_id != user_id or run.project_id != project_id:
                 raise DurableRunNotFound("realtime session is unavailable")
             owner_fenced = run.lease_owner
@@ -353,11 +484,22 @@ async def _start(run_id: str, *, owner: str, user_id: str, project_id: str) -> t
             await session.flush()
             if segment.status != "prepared":
                 raise DurableRunProviderResultUnknown("realtime session cannot be resumed")
-            await credit.reserve_media_credit_in_transaction(session, user_id=run.user_id,
-                project_id=run.project_id, api_key_id=run.api_key_id,
+            try:
+                verified = await check_dispatch(session, run, approval)
+            except ApiKeyForbidden as exc:
+                raise DurableRunInputError("inference_authority_revoked") from exc
+            payer = credit.run_payer(run)
+            await credit.reserve_call_credit_in_transaction(session, user_id=run.user_id,
+                project_id=run.project_id, api_key_id=run.api_key_id, payer=payer,
                 bound=Decimal(run.pricing_snapshot["bound_credits"]))
             session.add(ChatModelCallReservation(run_id=run.id, segment_id=_SEGMENT,
-                bound_credits=Decimal(run.pricing_snapshot["bound_credits"]), status="reserved"))
+                bound_credits=Decimal(run.pricing_snapshot["bound_credits"]), status="reserved", **payer.columns()))
+            await credit.refresh_domain_reserved(session, payer)
+            run.reserved_credits = Decimal(run.pricing_snapshot["bound_credits"])
+            try:
+                verified.require_fresh()
+            except ApiKeyForbidden as exc:
+                raise DurableRunInputError("inference_authority_revoked") from exc
             begin_segment_io(segment)
             run.provider_started_at = _now()
             await append_event(session, run, _event(run, "run.stage.changed", {"stage": "model_request"}))
@@ -403,6 +545,8 @@ async def _settle(run_id: str, *, owner: str, meter) -> dict[str, str]:
 
     async def transaction():
         async with _factory()() as session, session.begin():
+            await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
+            await credit.lock_run_payer(session, run_id)
             run, segment, reservation = await _lock_settlement_rows(session, run_id, owner)
             if reservation.status == "settled":
                 return {}
@@ -417,10 +561,13 @@ async def _settle(run_id: str, *, owner: str, meter) -> dict[str, str]:
             complete_segment_io(segment, result_payload={"closed": True}, usage_payload=usage)
             prompt_tokens = breakdown.input_tokens if breakdown is not None else 0
             completion_tokens = breakdown.output_tokens if breakdown is not None else 0
+            payer = credit.run_payer(run)
             credited = await credit.apply_usage_in_transaction(session, event_id=f"run:{run.id}",
                 user_id=run.user_id, project_id=run.project_id, model_name=run.model_name,
+                payer=payer,
                 provider=run.capability_snapshot["provider_name"], prompt_tokens=prompt_tokens,
                 completion_tokens=completion_tokens, usage_cost=usage_cost,
+                execution_route=run.capability_snapshot,
                 margin_multiplier=Decimal(snapshot["margin_multiplier"]),
                 credit_per_usd=Decimal(snapshot["credit_per_usd"]), source=run.source,
                 api_key_id=run.api_key_id, run_id=run.id, usage_components=components, breakdown=breakdown)
@@ -430,6 +577,7 @@ async def _settle(run_id: str, *, owner: str, meter) -> dict[str, str]:
             reservation.actual_credits = credited
             reservation.status = "settled"
             reservation.settled_at = _now()
+            await credit.refresh_domain_reserved(session, payer)
             run.usage_reconciled_at = _now()
             await append_event(session, run, _event(run, "usage.updated", {"components": components,
                 "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
@@ -438,6 +586,7 @@ async def _settle(run_id: str, *, owner: str, meter) -> dict[str, str]:
     return await budgets.retry_deadlocks(transaction)
 
 
+@receipt_owner
 async def run_realtime_session(websocket, *, run_id: str, token: str, wire: str = "native") -> None:
     """Consume ticket, own the fenced run, relay, settle, and terminalize on disconnect."""
     from lumen.services.providers.realtime_protocol import relay_audio
@@ -454,13 +603,22 @@ async def run_realtime_session(websocket, *, run_id: str, token: str, wire: str 
         raise DurableRunProviderResultUnknown("realtime provider changed before connection")
     try:
         current_plan = realtime_transport.validate_realtime_request(route, voice=payload["voice"],
-            instructions=payload["instructions"], max_duration_seconds=pricing["max_duration_seconds"])
+            instructions=payload["instructions"], max_duration_seconds=pricing["max_duration_seconds"],
+            reasoning_effort=payload.get("reasoning_effort"), tools=payload.get("tools"),
+            tool_choice=payload.get("tool_choice"))
     except ProviderValidationError:
         current_plan = None
     if not _plan_matches(pricing, current_plan):
         await _finish(run_id, status="failed", message_id=None, owner=owner,
                       error_code="provider_result_unknown", safe_message="realtime price changed before connection")
         raise DurableRunProviderResultUnknown("realtime price changed before connection")
+    kind = pricing.get("realtime_kind", "conversation")
+    if kind in {"translation", "live"} and payload.get("wire") != wire or (
+            wire == "native" and kind == "translation" and payload.get("output_language") is None):
+        # Translation and live run only on the wire that admitted them, with its frozen setup.
+        await _finish(run_id, status="failed", message_id=None, owner=owner,
+                      error_code="provider_result_unknown", safe_message="realtime model requires its compatible wire")
+        raise DurableRunInputError("realtime model requires its compatible wire")
     stop = asyncio.Event()
 
     async def heartbeat():
@@ -484,7 +642,11 @@ async def run_realtime_session(websocket, *, run_id: str, token: str, wire: str 
         meter = await relay_audio(websocket, route, session_id=run_id, voice=payload["voice"],
             instructions=payload["instructions"], max_duration_seconds=pricing["max_duration_seconds"],
             wire=wire, is_canceled=is_canceled, token_usage=pricing.get("billing_basis", "duration") == "tokens",
-            session_time=pricing.get("billing_basis", "duration") == "session")
+            session_time=pricing.get("billing_basis", "duration") == "session",
+            transcription=payload.get("transcription"), output_language=payload.get("output_language"),
+            reasoning_effort=payload.get("reasoning_effort"), tools=payload.get("tools"),
+            tool_choice=payload.get("tool_choice"),
+            token_hold=_token_hold(pricing))
         summary = await _settle(run_id, owner=owner, meter=meter)
         await _finish(run_id, status="canceled" if await is_canceled() else "completed", message_id=None, owner=owner)
         if wire == "native":

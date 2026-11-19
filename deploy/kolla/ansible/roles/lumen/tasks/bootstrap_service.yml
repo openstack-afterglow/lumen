@@ -1,19 +1,10 @@
 ---
-- name: Bootstrap | Pull Lumen API image for migration
-  become: true
-  community.docker.docker_image:
-    name: "{{ lumen_api_image_ref }}"
-    source: pull
-    force_source: "{{ lumen_image_tag == 'latest' }}"
-  run_once: true
-  delegate_to: "{{ groups['lumen'] | first }}"
-  when: not (lumen_source_mode | default(false) | bool)
-
 - name: Bootstrap | Apply Lumen database migrations
   become: true
   community.docker.docker_container:
     name: lumen_bootstrap
     image: "{{ lumen_api_image_ref }}"
+    pull: never
     command: ["python", "-m", "lumen.scripts.migrate", "--apply"]
     state: started
     detach: false
@@ -21,10 +12,15 @@
     network_mode: host
     volumes:
       - "{{ lumen_config_dir }}/lumen.conf:/etc/lumen/lumen.conf:ro"
+      - "{{ lumen_policy_directory }}:/etc/lumen/policy.d:ro"
     env: &lumen_migration_env
       LUMEN_CONFIG_FILE: "/etc/lumen/lumen.conf"
       DATABASE_URL: "{{ lumen_database_url }}"
       REDIS_URL: "{{ lumen_redis_url }}"
+      REDIS_SENTINEL_ADDRESSES: "{{ lumen_redis_sentinel_addresses | to_json }}"
+      REDIS_SENTINEL_MASTER: "{{ lumen_redis_sentinel_master }}"
+      REDIS_SENTINEL_USERNAME: "{{ lumen_redis_sentinel_username }}"
+      REDIS_SENTINEL_PASSWORD: "{{ lumen_redis_sentinel_password }}"
       KEYSTONE_AUTH_URL: "{{ lumen_keystone_auth_url }}"
       KEYSTONE_ADMIN_USERNAME: "{{ lumen_keystone_user }}"
       KEYSTONE_ADMIN_PASSWORD: "{{ lumen_keystone_password }}"
@@ -47,6 +43,7 @@
   community.docker.docker_container:
     name: lumen_provider_bootstrap
     image: "{{ lumen_api_image_ref }}"
+    pull: never
     command: ["python", "-m", "lumen.scripts.seed_providers"]
     state: started
     detach: false
@@ -54,6 +51,7 @@
     network_mode: host
     volumes:
       - "{{ lumen_config_dir }}/lumen.conf:/etc/lumen/lumen.conf:ro"
+      - "{{ lumen_policy_directory }}:/etc/lumen/policy.d:ro"
     env:
       <<: *lumen_migration_env
       OPENAI_API_KEY: "{{ lumen_openai_api_key }}"

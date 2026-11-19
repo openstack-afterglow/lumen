@@ -156,3 +156,51 @@ def test_claude_gateway_migration_reuses_expiring_api_keys():
     assert "client_id_hash CHAR(64) NOT NULL" in statements[1]
     assert "refresh_token" not in statements[1]
     assert "raw" not in statements[1]
+
+
+def test_domain_mcp_migration_is_registered_and_preserves_existing_scope_defaults():
+    migration = next(item for item in load_manifest() if item.logical_id == "033-mcp-domain-connections")
+    statements = _statements(MIGRATIONS / migration.relative_path)
+    assert "ADD COLUMN owner_domain_id VARCHAR(64) NULL" in statements[0]
+    assert "ADD COLUMN implicit_selection BOOLEAN NOT NULL DEFAULT TRUE" in statements[0]
+    assert "WHERE scope = 'user'" in statements[1]
+    assert "uq_chat_mcp_scoped_template_label (connection_scope_key, template_key, connection_label)" in statements[2]
+    assert "ADD INDEX idx_chat_mcp_domain (owner_domain_id, scope)" in statements[2]
+
+
+def test_stateless_hold_migration_is_additive_content_free_and_registered():
+    migration = next(item for item in load_manifest() if item.logical_id == "034-stateless-call-reservations")
+    statements = _statements(MIGRATIONS / migration.relative_path)
+    assert len(statements) == 1
+    ddl = statements[0]
+    assert ddl.startswith("CREATE TABLE chat_stateless_call_reservations")
+    assert "expires_at" not in ddl
+    assert "idx_stateless_hold_owner (user_id, status)" in ddl
+    assert "idx_stateless_hold_key (api_key_id, status)" in ddl
+    assert all(word not in ddl.lower() for word in ("prompt", "content", "answer", "alter table", "drop table"))
+
+
+def test_domain_mcp_owner_check_matches_orm_and_is_registered():
+    from sqlalchemy import CheckConstraint
+
+    from lumen.models.chat_db import ChatMcpServer
+
+    migration = next(item for item in load_manifest() if item.logical_id == "035-mcp-domain-owner-check")
+    expression = "scope <> 'domain' OR owner_domain_id IS NOT NULL"
+    name = "ck_chat_mcp_servers_domain_owner"
+    assert _statements(MIGRATIONS / migration.relative_path) == [
+        f"ALTER TABLE chat_mcp_servers\n    ADD CONSTRAINT {name}\n    CHECK ({expression})"
+    ]
+    checks = [item for item in ChatMcpServer.__table__.constraints if isinstance(item, CheckConstraint)]
+    assert any(item.name == name and str(item.sqltext) == expression for item in checks)
+
+
+def test_agent_model_identity_migration_only_adds_nullable_row_id():
+    from lumen.models.chat_db import ChatAgent
+
+    migration = next(item for item in load_manifest() if item.logical_id == "039-agent-model-identity")
+    assert _statements(MIGRATIONS / migration.relative_path) == [
+        "ALTER TABLE chat_agents\n    ADD COLUMN IF NOT EXISTS model_row_id BIGINT NULL"
+    ]
+    selection = ChatAgent.__table__.c.model_row_id
+    assert selection.nullable and not selection.foreign_keys

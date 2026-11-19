@@ -4,9 +4,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import hmac
 import logging
+import os
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, get_args
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exception_handlers import request_validation_exception_handler
@@ -23,7 +26,12 @@ from lumen.logging_config import configure_logging
 from lumen.plugins.host import build_host
 from lumen.plugins.registry import get_registry
 from lumen.request_logging import RequestLoggingMiddleware
-from lumen.services.infrastructure.api_load import ApiLoadMeter, ApiLoadMiddleware
+from lumen.services.infrastructure.api_load import (
+    ApiAdmissionMiddleware,
+    ApiLoadMeter,
+    ApiLoadMiddleware,
+    api_admission,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,8 +63,25 @@ class HealthResponse(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    from lumen.services.bifrost_runtime import close_bifrost_runtime
+
+    try:
+        async with _service_lifespan(app):
+            yield
+    finally:
+        # Uvicorn has drained HTTP/SSE before lifespan exit; service cleanup
+        # below completes before the private provider child receives SIGTERM.
+        await close_bifrost_runtime()
+
+
+@asynccontextmanager
+async def _service_lifespan(app: FastAPI):
     configure_logging("api")
     settings = get_settings()
+    from lumen.services.afterglow_ingress import ingress_key
+
+    if ingress_key() is None:
+        logger.warning("Agent Vault disabled: LUMEN_AFTERGLOW_INGRESS_SECRET must contain at least 32 bytes")
     registry = get_registry()
     # Approved distributions/versions are checked before any entry point is imported;
     # an incompatible or missing required plugin stops the process instead of falling back.
@@ -71,6 +96,9 @@ async def lifespan(app: FastAPI):
             unhealthy_seconds=settings.database_unhealthy_seconds,
         )
     await registry.start(build_host())
+    from lumen.services.bifrost_runtime import start_bifrost_runtime
+
+    await start_bifrost_runtime()
 
     if settings.chat_checkpointer_postgres_url:
         from lumen.services.checkpointer import chat_checkpointer
@@ -84,6 +112,12 @@ async def lifespan(app: FastAPI):
 
         await setup_semantic_memory()
 
+    scope_backfill = None
+    if settings.database_url:
+        from lumen.services.domain_scope_backfill import startup_domain_scope_backfill
+
+        scope_backfill = asyncio.create_task(startup_domain_scope_backfill(), name="domain-scope-backfill")
+
     logger.info("api ready")
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(
@@ -92,7 +126,12 @@ async def lifespan(app: FastAPI):
             settings.chat_semantic_memory_enabled,
         )
 
-    yield
+    try:
+        yield
+    finally:
+        if scope_backfill is not None:
+            scope_backfill.cancel()
+            await asyncio.gather(scope_backfill, return_exceptions=True)
 
     try:
         from lumen.services.checkpointer import chat_checkpointer
@@ -109,14 +148,37 @@ async def lifespan(app: FastAPI):
     logger.info("api stopped")
 
 
+def _initialize_guest_drain_state(state: Any) -> None:
+    """Close admission before serving when the supervisor restores a drain fence."""
+    token = os.environ.get("LUMEN_INTERNAL_DRAIN_TOKEN", "")
+    raw_fence = os.environ.get("LUMEN_INTERNAL_DRAIN_FENCE")
+    fence = None
+    if raw_fence is not None:
+        if not token or not raw_fence.isascii() or not raw_fence.isdecimal():
+            raise RuntimeError("invalid guest boot drain advisory")
+        fence = int(raw_fence)  # ASCII decimal digits only: no sign, whitespace or Unicode digits.
+    # The secret is fixed for this child boot, not reloaded on later requests.
+    state.internal_drain_token = token
+    state.draining = fence is not None
+    state.drain_fence = fence
+
+
 app = FastAPI(
     title="Lumen",
     description="Lumen durable agent, LLM, and chat service API",
     version="1.0.0",
     lifespan=lifespan,
 )
+# Restore persisted supervisor intent before constructing any admission middleware.
+_initialize_guest_drain_state(app.state)
 api_load_meter = ApiLoadMeter()
 app.add_middleware(ApiLoadMiddleware, meter=api_load_meter)
+
+
+# Reservations share the guest drain flag. Keep admission outside measured load
+# so rejected HTTP requests cannot be mistaken for serving capacity.
+api_admission.state = app.state
+app.state.api_admission = api_admission
 
 settings = get_settings()
 origins = settings.cors_origin_list
@@ -129,15 +191,47 @@ if origins:
         allow_headers=["*"],
     )
 app.add_middleware(RequestLoggingMiddleware)
+app.add_middleware(ApiAdmissionMiddleware, admission=api_admission)
+
+
+# Anthropic Messages clients act only on Anthropic-shaped request errors. Claude Code auto mode
+# adds a top-level `safeguards` field whose server-side review the LiteLLM transport cannot carry;
+# a 400 naming the field makes the client retry without it and classify locally. FastAPI's 422
+# envelope is not recognized and would echo the rejected input (local paths, permission rules).
+_ANTHROPIC_MESSAGE_PATHS = frozenset(
+    {
+        "/v1/messages",
+        "/v1/messages/count_tokens",
+        "/v1/claude-gateway/v1/messages",
+        "/v1/claude-gateway/v1/messages/count_tokens",
+    }
+)
 
 
 @app.exception_handler(RequestValidationError)
-async def provider_request_validation_handler(request: Request, exc: RequestValidationError):
+async def request_validation_handler(request: Request, exc: RequestValidationError):
     if request.url.path == "/v1/admin/providers" or request.url.path.startswith("/v1/admin/providers/"):
+        if any(error.get("type") == "unsupported_provider_type" for error in exc.errors()):
+            return JSONResponse(
+                status_code=422,
+                content={"detail": {
+                    "code": "unsupported_provider_type",
+                    "message": (
+                        "Supported inference provider_type values are openai, anthropic, gemini, perplexity "
+                        "and existing chatgpt device authentication. Managed search provider types remain supported. "
+                        "Register third-party inference APIs as openai or anthropic with a custom api_base."
+                    ),
+                }},
+                headers={"Cache-Control": "no-store"},
+            )
         return JSONResponse(
             status_code=422,
             content={"detail": "프로바이더 요청 형식이 올바르지 않습니다"},
             headers={"Cache-Control": "no-store"},
+        )
+    if request.url.path in _ANTHROPIC_MESSAGE_PATHS:
+        return compat_anthropic.anthropic_error_response(
+            400, compat_anthropic.anthropic_validation_message(exc.errors())
         )
     return await request_validation_exception_handler(request, exc)
 
@@ -190,6 +284,31 @@ class ReadyResponse(BaseModel):
     checkpointer: bool | None = None
 
 
+@app.post("/v1/internal/drain", include_in_schema=False)
+async def internal_drain(request: Request):
+    """Apply the supervisor's persisted fence to this boot's in-memory gate."""
+    if request.client is None or request.client.host not in {"127.0.0.1", "::1"}:
+        raise HTTPException(status_code=403, detail="local drain only")
+    token = request.headers.get("X-Lumen-Drain-Token", "")
+    expected = request.app.state.internal_drain_token
+    if not expected or not token or not hmac.compare_digest(token.encode(), expected.encode()):
+        raise HTTPException(status_code=403, detail="invalid drain token")
+    try:
+        body = await request.json()
+    except ValueError:
+        raise HTTPException(status_code=422, detail="nonnegative integer fence required") from None
+    fence = body.get("fence") if isinstance(body, dict) else None
+    if type(fence) is not int or fence < 0:
+        raise HTTPException(status_code=422, detail="nonnegative integer fence required")
+    state = request.app.state
+    if state.drain_fence is not None and fence < state.drain_fence:
+        raise HTTPException(status_code=409, detail="stale drain fence")
+    # No await between fence comparison and admission closure.
+    state.drain_fence = fence
+    state.draining = True
+    return {"draining": True, "drain_fence": fence, "drain_acknowledged": True}
+
+
 @app.get("/v1/ready", tags=["Health"], response_model=ReadyResponse)
 async def ready(request: Request, include_load: bool = False):
     """Dependency readiness; guest-only load details require a loopback connection."""
@@ -198,18 +317,35 @@ async def ready(request: Request, include_load: bool = False):
     from lumen.db import check_db
     from lumen.services.checkpointer import chat_checkpointer
 
-    database = await check_db()
+    if include_load:
+        # The supervisor gives the child 3 s; a stalled dependency must not hide live counters.
+        try:
+            database = await asyncio.wait_for(check_db(), timeout=1)
+        except TimeoutError:
+            database = False
+    else:
+        database = await check_db()
+    draining = request.app.state.draining
     plugins = get_registry().ready
     checkpointer = chat_checkpointer.available if get_settings().chat_checkpointer_postgres_url else None
-    ok = database and plugins and checkpointer is not False
+    ok = database and plugins and checkpointer is not False and not draining
     body = ReadyResponse(status="ok" if ok else "unavailable", database=database, plugins=plugins, checkpointer=checkpointer)
     content = body.model_dump(mode="json")
     if include_load:
         content.update(api_load_meter.snapshot())
-    return JSONResponse(status_code=200 if ok else 503, content=content)
+        content.update(api_admission.snapshot())
+        content.update(
+            ready=ok,
+            draining=draining,
+            drain_fence=request.app.state.drain_fence,
+            drain_acknowledged=draining,
+        )
+    # Local supervision needs fresh counters even when dependency readiness fails.
+    return JSONResponse(status_code=200 if include_load or ok else 503, content=content)
 
 
 from lumen.api import agent_runtime as agent_runtime_routes
+from lumen.api import batches as batch_routes
 from lumen.api import (
     chat_admin_router,
     chat_agents_router,
@@ -219,6 +355,8 @@ from lumen.api import (
     chat_code_workspaces_router,
     chat_completions_router,
     chat_conversations_router,
+    chat_decisions_router,
+    chat_embeddings_router,
     chat_extensions_admin_router,
     chat_extensions_user_router,
     chat_images_router,
@@ -231,10 +369,20 @@ from lumen.api import (
     chat_workspaces_router,
     claude_gateway,
 )
+from lumen.api import domain_pools as domain_pool_routes
+from lumen.api import extension_archives as extension_archive_routes
 from lumen.api import plugins as plugin_routes
+from lumen.api import policy as policy_routes
+from lumen.api import vault as vault_routes
 from lumen.api.compat import anthropic as compat_anthropic
 from lumen.api.compat import audio as compat_audio
+from lumen.api.compat import batches as compat_batches
+from lumen.api.compat import cli as compat_cli
+from lumen.api.compat import decisions as compat_decisions
 from lumen.api.compat import discovery as compat_discovery
+from lumen.api.compat import embeddings as compat_embeddings
+from lumen.api.compat import files as compat_files
+from lumen.api.compat import gemini as compat_gemini
 from lumen.api.compat import images as compat_images
 from lumen.api.compat import openai as compat_openai
 from lumen.api.compat import realtime as compat_realtime
@@ -243,8 +391,10 @@ from lumen.auth import require_chat_api_host
 
 # Chat routers already declare their complete route paths. Mount once at `/v1`
 # so the SDK and Afterglow BFF preserve the public contract exactly.
+app.include_router(policy_routes.router, prefix="/v1", tags=["Policy"])
 app.include_router(plugin_routes.admin_router, prefix="/v1", tags=["Plugin Administration"])
 app.include_router(plugin_routes.router, prefix="/v1", tags=["Plugin Catalogue"])
+app.include_router(vault_routes.router, prefix="/v1", tags=["Agent Vault"])
 app.include_router(agent_runtime_routes.admin_router, prefix="/v1", tags=["Agent Runtime Administration"])
 app.include_router(agent_runtime_routes.router, prefix="/v1", tags=["Agent Runtime"])
 for router, tag in (
@@ -257,12 +407,17 @@ for router, tag in (
     (chat_assets_router, "Chat Assets"),
     (chat_images_router, "Images"),
     (chat_audio_router, "Audio"),
+    (chat_embeddings_router, "Embeddings"),
+    (chat_decisions_router, "Decisions"),
     (chat_realtime_router, "Realtime Voice"),
+    (batch_routes.router, "Batches"),
     (chat_api_keys_router, "Chat API Keys"),
     (chat_mcp_oauth_router, "Chat MCP OAuth"),
     (chat_extensions_admin_router, "Chat Extensions Admin"),
     (chat_extensions_user_router, "Chat Extensions"),
+    (extension_archive_routes.router, "Chat Extension Archives"),
     (chat_usage_router, "Chat Usage"),
+    (domain_pool_routes.router, "Domain Credits"),
     (chat_stats_router, "Chat Stats"),
     (chat_quotas_router, "Chat Quotas"),
     (chat_admin_router, "Chat Administration"),
@@ -275,12 +430,23 @@ for router, tag in (
     (compat_discovery.router, "AI Compat Discovery"),
     (compat_images.router, "OpenAI Images Compat"),
     (compat_audio.router, "OpenAI Audio Compat"),
+    (compat_embeddings.router, "OpenAI and Gemini Embeddings Compat"),
+    (compat_decisions.router, "OpenAI Decisions Compat"),
     (compat_openai.router, "OpenAI Compat"),
+    (compat_cli.router, "Coding CLI Model Catalog"),
     (compat_anthropic.router, "Anthropic Compat"),
     (compat_responses.router, "OpenAI Responses Compat"),
+    (compat_files.router, "OpenAI Files Compat"),
+    (compat_batches.router, "OpenAI Batch Compat"),
 ):
     app.include_router(router, prefix="/v1", tags=[tag], dependencies=[Depends(require_chat_api_host)])
 app.include_router(compat_realtime.router, tags=["Realtime Voice Compat"])
+compat_embeddings.google_router.include_router(compat_decisions.google_router, tags=["Gemini Decisions Compat"])
+compat_embeddings.google_router.include_router(compat_gemini.router)
+app.include_router(
+    compat_embeddings.google_router, tags=["Gemini Compat"],
+    dependencies=[Depends(require_chat_api_host)],
+)
 
 # Claude Code's public machine protocol is host-gated with the other direct
 # compatibility APIs. The Keystone-only browser authorization handoff is
@@ -302,7 +468,17 @@ def custom_openapi() -> dict:
     """Document API-key compatibility schemes without changing native route semantics."""
     if app.openapi_schema:
         return app.openapi_schema
+    from lumen.models.batch_contracts import (
+        BATCH_ENDPOINTS,
+        BatchOperation,
+        NativeBatchCreateRequest,
+        OpenAIBatchCreateRequest,
+        batch_item_scopes,
+    )
     from lumen.models.chat_contracts import _CHAT_RUN_EVENT
+    from lumen.models.decision_contracts import NativeDecisionRequest
+    from lumen.models.gemini_decision_contracts import GeminiDecisionRequest
+    from lumen.service_authority import MODEL_API_KEY_ROUTE_SCOPES
 
     schema = get_openapi(title=app.title, version=app.version, description=app.description, routes=app.routes)
     schema["x-contract-version"] = "1.0.0"
@@ -310,12 +486,19 @@ def custom_openapi() -> dict:
         "openai_lumen": "OpenAI-compatible Lumen durable completion (/v1/chat/completions, model='lumen')",
         "openai_stateless": "OpenAI-compatible stateless provider completion (/v1/chat/completions, provider model IDs)",
         "openai_responses": "OpenAI Responses-compatible stateless completion (/v1/responses)",
+        "openai_embeddings": "OpenAI-compatible stateless text embeddings (/v1/embeddings)",
+        "openai_decisions": "OpenAI-compatible stateless typed decisions (/v1/decisions)",
+        "gemini_embeddings": "Google Gemini-compatible text embeddings (/v1beta/models/{model}:embedContent, :batchEmbedContents)",
+        "gemini_models": "Google Gemini API v1beta models list/get, generateContent and streamGenerateContent (?alt=sse)",
+        "gemini_decisions": "Google Gemini-compatible stateless typed decisions (/v1beta/decisions)",
         "anthropic_stateless": "Anthropic-compatible stateless completion (/v1/messages)",
         "openai_images": "OpenAI-compatible durable image generation and edits (/v1/images/generations, /v1/images/edits)",
-        "openai_realtime": "OpenAI-compatible durable realtime WebSocket (/v1/realtime)",
+        "openai_realtime": "OpenAI-compatible durable realtime WebSockets (/v1/realtime, /v1/realtime?intent=transcription, /v1/realtime/translations, /v1/live/sessions)",
         "gemini_live": "Google Gemini Live-compatible WebSocket (/v1beta/realtime)",
         "lumen_native": "Lumen native durable runs (/v1/conversations/{conversation_id}/completions, /v1/temp-completions, /v1/runs/...)",
         "claude_gateway": "Claude Code device-authenticated Anthropic gateway (/v1/claude-gateway)",
+        "openai_batch": "OpenAI-compatible Files/Batch (/v1/files, /v1/batches) executed by Lumen batch workers",
+        "lumen_batch": "Lumen native mixed multimodal batches (/v1/chat/batches)",
     }
 
     security_schemes = schema.setdefault("components", {}).setdefault("securitySchemes", {})
@@ -336,6 +519,12 @@ def custom_openapi() -> dict:
         "name": "x-api-key",
         "description": "API key header (x-api-key: <key>)",
     }
+    security_schemes["GoogleApiKey"] = {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-goog-api-key",
+        "description": "Gemini SDK API key header (x-goog-api-key: <key>)",
+    }
     api_key_security = [{"APIKeyBearer": []}, {"XApiKey": []}]
     for path, method in (
         ("/v1/chat/completions", "post"),
@@ -343,33 +532,46 @@ def custom_openapi() -> dict:
         ("/v1/images/edits", "post"),
         ("/v1/audio/speech", "post"),
         ("/v1/audio/transcriptions", "post"),
+        ("/v1/embeddings", "post"),
+        ("/v1/decisions", "post"),
+        ("/v1beta/models/{model}:embedContent", "post"),
+        ("/v1beta/models/{model}:batchEmbedContents", "post"),
         ("/v1/responses", "post"),
         ("/v1/messages", "post"),
         ("/v1/messages/count_tokens", "post"),
         ("/v1/models", "get"),
+        ("/v1/cli/models", "get"),
         ("/v1/claude-gateway/v1/messages", "post"),
         ("/v1/claude-gateway/v1/messages/count_tokens", "post"),
         ("/v1/claude-gateway/v1/models", "get"),
         ("/v1/claude-gateway/v1/managed-settings", "get"),
+        ("/v1/files", "post"),
+        ("/v1/files", "get"),
+        ("/v1/files/{file_id}", "get"),
+        ("/v1/files/{file_id}", "delete"),
+        ("/v1/files/{file_id}/content", "get"),
+        ("/v1/batches", "post"),
+        ("/v1/batches", "get"),
+        ("/v1/batches/{batch_id}", "get"),
+        ("/v1/batches/{batch_id}/cancel", "post"),
     ):
         if path in schema.get("paths", {}) and method in schema["paths"][path]:
             schema["paths"][path][method]["security"] = api_key_security
+    gemini_paths = (
+        ("/v1beta/decisions", "post"), ("/v1beta/models/{model}:embedContent", "post"),
+        ("/v1beta/models/{model}:batchEmbedContents", "post"), ("/v1beta/models", "get"),
+        ("/v1beta/models/{model}", "get"), ("/v1beta/models/{model}:generateContent", "post"),
+        ("/v1beta/models/{model}:streamGenerateContent", "post"), ("/v1beta/models/{model}:countTokens", "post"),
+    )
+    for path, method in gemini_paths:
+        if path in schema.get("paths", {}) and method in schema["paths"][path]:
+            schema["paths"][path][method]["security"] = [*api_key_security, {"GoogleApiKey": []}]
 
     route_scopes: dict[tuple[str, str], list[str]] = {
-        ("/v1/images/generations", "post"): ["compat:images:write"],
-        ("/v1/images/edits", "post"): ["compat:images:write", "native:assets:write"],
-        ("/v1/audio/speech", "post"): ["compat:audio:write"],
-        ("/v1/audio/transcriptions", "post"): ["compat:audio:write", "native:assets:write"],
-        ("/v1/chat/completions", "post"): ["compat:completions:write"],
-        ("/v1/responses", "post"): ["compat:completions:write"],
-        ("/v1/messages", "post"): ["compat:completions:write"],
-        ("/v1/messages/count_tokens", "post"): ["compat:completions:write"],
         ("/v1/claude-gateway/v1/messages", "post"): ["compat:completions:write"],
         ("/v1/claude-gateway/v1/messages/count_tokens", "post"): ["compat:completions:write"],
         ("/v1/claude-gateway/v1/models", "get"): ["models:read"],
         ("/v1/claude-gateway/v1/managed-settings", "get"): ["models:read"],
-        ("/v1/models", "get"): ["models:read"],
-        ("/v1/chat/models", "get"): ["models:read"],
         ("/v1/capabilities", "get"): ["models:read"],
         ("/v1/conversations", "post"): ["native:conversations:write"],
         ("/v1/conversations", "get"): ["native:conversations:read"],
@@ -387,7 +589,6 @@ def custom_openapi() -> dict:
         ("/v1/temp-completions", "post"): ["native:runs:write"],
         ("/v1/chat/images/generations", "post"): ["native:images:write"],
         ("/v1/chat/images/edits", "post"): ["native:images:write", "native:assets:read"],
-        ("/v1/chat/audio/speech", "post"): ["native:audio:write"],
         ("/v1/chat/audio/transcriptions", "post"): ["native:audio:write", "native:assets:read"],
         ("/v1/chat/realtime/sessions", "post"): ["native:realtime:write"],
         ("/v1/conversations/{conversation_id}/messages/{message_id}/regenerate", "post"): [
@@ -414,7 +615,28 @@ def custom_openapi() -> dict:
         ("/v1/usage/timeseries", "get"): ["usage:read"],
         ("/v1/usage/keys", "get"): ["usage:read"],
         ("/v1/usage/records", "get"): ["usage:read"],
+        ("/v1/chat/batches", "post"): ["native:batches:write"],
+        ("/v1/chat/batches", "get"): ["native:batches:read"],
+        ("/v1/chat/batches/{batch_id}", "get"): ["native:batches:read"],
+        ("/v1/chat/batches/{batch_id}/items", "get"): ["native:batches:read"],
+        ("/v1/chat/batches/{batch_id}/cancel", "post"): ["native:batches:write"],
+        ("/v1/files", "post"): ["compat:files:write"],
+        ("/v1/files", "get"): ["compat:files:read"],
+        ("/v1/files/{file_id}", "get"): ["compat:files:read"],
+        ("/v1/files/{file_id}", "delete"): ["compat:files:write"],
+        ("/v1/files/{file_id}/content", "get"): ["compat:files:read"],
+        ("/v1/batches", "post"): ["compat:batches:write"],
+        ("/v1/batches", "get"): ["compat:batches:read"],
+        ("/v1/batches/{batch_id}", "get"): ["compat:batches:read"],
+        ("/v1/batches/{batch_id}/cancel", "post"): ["compat:batches:write"],
     }
+    model_key_scopes = {
+        # Route templates may use converters (``{model:path}``); OpenAPI paths do not.
+        (path.replace("{model:path}", "{model}"), method.lower()): [scope]
+        for (method, path), scope in MODEL_API_KEY_ROUTE_SCOPES.items()
+        if method != "WEBSOCKET"
+    }
+    route_scopes.update(model_key_scopes)
     admission_posts = {
         ("/v1/conversations/{conversation_id}/completions", "post"),
         ("/v1/conversations/{conversation_id}/messages/{message_id}/regenerate", "post"),
@@ -432,8 +654,22 @@ def custom_openapi() -> dict:
         if path in schema.get("paths", {}) and method in schema["paths"][path]:
             op = schema["paths"][path][method]
             op["x-required-api-key-scopes"] = scopes
+            op["x-model-api-key-allowed"] = (path, method) in model_key_scopes
             if (path, method) in admission_posts:
                 op["x-conditional-api-key-scopes"] = conditional_scopes
+    batch_conditional_scopes = {
+        ("/v1/chat/batches", "post"): {
+            f"operation {operation}": list(batch_item_scopes(operation, contract="native"))
+            for operation in get_args(BatchOperation)
+        },
+        ("/v1/batches", "post"): {
+            f"endpoint {endpoint}": list(batch_item_scopes(operation, contract="openai"))
+            for endpoint, operation in BATCH_ENDPOINTS.items()
+        },
+    }
+    for (path, method), scopes in batch_conditional_scopes.items():
+        if path in schema.get("paths", {}) and method in schema["paths"][path]:
+            schema["paths"][path][method]["x-conditional-api-key-scopes"] = scopes
     sse_routes = [
         ("/v1/chat/completions", "post", "OpenAI SSE stream (data: JSON \\n\\n data: [DONE])"),
         ("/v1/responses", "post", "OpenAI Responses semantic SSE events"),
@@ -467,6 +703,25 @@ def custom_openapi() -> dict:
     for def_name, def_schema in defs.items():
         components_schemas[def_name] = def_schema
     components_schemas["ChatRunEvent"] = event_schema
+    # Batch create routes bound and parse their bodies before validation, so the
+    # request schemas are published explicitly instead of through a body parameter.
+    for model in (NativeBatchCreateRequest, OpenAIBatchCreateRequest):
+        model_schema = model.model_json_schema(ref_template="#/components/schemas/{model}")
+        for def_name, def_schema in model_schema.pop("$defs", {}).items():
+            components_schemas.setdefault(def_name, def_schema)
+        components_schemas[model.__name__] = model_schema
+    # The Gemini route decodes its bounded body only after auth. Give nested
+    # schemas distinct names from similarly named OpenAI Decisions types.
+    gemini_schema = GeminiDecisionRequest.model_json_schema(ref_template="#/components/schemas/GeminiDecision_{model}")
+    for def_name, def_schema in gemini_schema.pop("$defs", {}).items():
+        components_schemas[f"GeminiDecision_{def_name}"] = def_schema
+    components_schemas["GeminiDecisionRequest"] = gemini_schema
+    decision_schema = NativeDecisionRequest.model_json_schema(
+        ref_template="#/components/schemas/NativeDecision_{model}",
+    )
+    for def_name, def_schema in decision_schema.pop("$defs", {}).items():
+        components_schemas[f"NativeDecision_{def_name}"] = def_schema
+    components_schemas["NativeDecisionRequest"] = decision_schema
 
     def _fix_refs(obj: Any) -> None:
         if isinstance(obj, dict):

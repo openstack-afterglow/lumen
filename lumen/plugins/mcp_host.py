@@ -43,19 +43,26 @@ class McpExtensions:
     async def list(self, kind: str, namespace: Namespace) -> list[dict[str, Any]]:
         if kind != "mcp" or not namespace.project_id:
             raise PermissionError("MCP namespace is invalid")
-        return await extensions_store.list_for_user("mcp", user_id=namespace.user_id, project_id=namespace.project_id, active_only=True, reveal_secrets=True)
+        return await extensions_store.list_for_user(
+            "mcp", user_id=namespace.user_id, project_id=namespace.project_id, active_only=True,
+            reveal_secrets=True, include_domain=False, runtime=True,
+        )
 
     async def resolve(self, kind: str, identifier: int | str, namespace: Namespace) -> dict[str, Any]:
-        if kind != "mcp" or type(identifier) is not int:
+        if kind != "mcp" or type(identifier) is not int or not namespace.project_id:
             raise PermissionError("MCP server identifier is invalid")
-        row = next((row for row in await self.list(kind, namespace) if row["id"] == identifier), None)
+        rows = await extensions_store.list_for_user(
+            "mcp", user_id=namespace.user_id, project_id=namespace.project_id, active_only=True,
+            reveal_secrets=True, include_domain=(identifier,), selected_ids=(identifier,), runtime=True,
+        )
+        row = next((row for row in rows if row["id"] == identifier), None)
         if row is None:
             raise PermissionError("MCP server is unavailable")
         return row
 
     async def revalidate(self, kind: str, identifier: int | str, fingerprint: str, namespace: Namespace) -> dict[str, Any]:
         row = await self.resolve(kind, identifier, namespace)
-        if row.get("config_fingerprint") != fingerprint:
+        if extensions_store.selection_fingerprint(row) != fingerprint:
             raise PermissionError("MCP configuration changed")
         return row
 

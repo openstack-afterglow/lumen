@@ -6,3 +6,13 @@
     state: absent
   loop: "{{ lumen_services | dict2items }}"
   when: inventory_hostname in groups['lumen']
+
+- name: Destroy | Remove managed ClamAV container but retain signatures
+  become: true
+  community.docker.docker_container:
+    name: "{{ lumen_clamav_service.container_name }}"
+    state: absent
+    keep_volumes: true
+  when:
+    - inventory_hostname in groups['lumen']
+    - enable_lumen_clamav | bool

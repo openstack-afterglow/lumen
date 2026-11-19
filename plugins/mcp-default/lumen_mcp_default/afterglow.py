@@ -89,7 +89,7 @@ def _parse_registry(raw: object) -> tuple[dict[str, Any] | None, tuple[ToolDefin
 class AfterglowMcp:
     """Delegated Afterglow MCP authority: describe/bind/revalidate over ``McpAuthorityAccess``."""
 
-    manifest = PluginManifest(id="afterglow-mcp", kind="mcp", version="0.1.0", required_capabilities=("mcp_authority",))
+    manifest = PluginManifest(id="afterglow-mcp", kind="mcp", version="0.1.1", required_capabilities=("mcp_authority",))
 
     def __init__(self) -> None:
         self._authority = None

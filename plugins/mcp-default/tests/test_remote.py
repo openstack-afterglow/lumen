@@ -110,6 +110,7 @@ async def test_remote_describe_bind_and_authority_changes():
     assert snapshot.credential_epoch == 2
     assert snapshot.tools[0].name == "mcp_23_search"
     assert snapshot.tools[0].input_schema["additionalProperties"] is False
+    assert snapshot.tools[0].effect == "external_mutation"
     context = ExecutionContext(user_id="alice", project_id="team", run_id="run", call_id="call")
     binding = (await plugin.bind(snapshot, context))[0]
     assert (await binding.execute({"query": "find this"}, context)).model_content == "find this"
@@ -180,8 +181,9 @@ async def test_remote_punctuated_names_are_provider_safe_and_dispatch_original_m
 
     called = []
 
-    async def call_tool(_server, method, arguments):
+    async def call_tool(_server, method, arguments, *, context, expected_credential_epoch):
         called.append((method, arguments))
+        assert expected_credential_epoch == 2
         return McpToolOutput(text=method, files=())
 
     monkeypatch.setattr(plugin, "list_tools", list_tools)
@@ -202,3 +204,128 @@ async def test_remote_punctuated_names_are_provider_safe_and_dispatch_original_m
     changed = restored.model_copy(update={"remote_tool_names": {names[0]: "other-name"}})
     with pytest.raises(PluginError, match="snapshot tool names changed"):
         await plugin.bind(changed, context)
+
+
+async def test_binding_cannot_be_reused_by_another_owner_run_or_revoked_owner(monkeypatch):
+    plugin, extensions, _connections = await ready()
+    snapshot = (await plugin.describe(McpSelection(authority="remote", namespace=USER, server_ids=(23,))))[0]
+    context = ExecutionContext(user_id="alice", project_id="team", run_id="run")
+    binding = (await plugin.bind(snapshot, context))[0]
+    calls = []
+
+    async def call_tool(*args, **kwargs):
+        calls.append((args, kwargs))
+        return McpToolOutput(text="unexpected", files=())
+
+    monkeypatch.setattr(plugin.transport, "call_tool", call_tool)
+    for other in (
+        ExecutionContext(user_id="bob", project_id="team", run_id="run"),
+        ExecutionContext(user_id="alice", project_id="other", run_id="run"),
+        ExecutionContext(user_id="alice", project_id="team", run_id="other-run"),
+    ):
+        with pytest.raises(PluginError) as failure:
+            await binding.execute({"query": "no dispatch"}, other)
+        assert failure.value.code == "plugin_authority_revoked"
+    extensions.server["is_active"] = False
+    with pytest.raises(PluginError) as failure:
+        await binding.execute({"query": "revoked"}, context)
+    assert failure.value.code == "plugin_authority_revoked"
+    assert calls == []
+
+
+async def test_direct_remote_dispatch_revalidates_current_owner_configuration(monkeypatch):
+    plugin, extensions, _connections = await ready()
+    server, _epoch = await plugin._server(23, USER)
+    calls = []
+
+    async def call_tool(*args, **kwargs):
+        calls.append((args, kwargs))
+        return McpToolOutput(text="unexpected", files=())
+
+    monkeypatch.setattr(plugin.transport, "call_tool", call_tool)
+    extensions.server["effect_overrides"] = {"search": "external_mutation"}
+    with pytest.raises(PluginError) as failure:
+        await plugin.call_tool(server, "search", {}, context=ExecutionContext(user_id="alice", project_id="team", run_id="run"), expected_credential_epoch=2)
+    assert failure.value.code == "plugin_configuration_changed"
+    assert calls == []
+
+
+@pytest.mark.parametrize("expected", [None, 0, True, 2])
+async def test_dispatch_rejects_rotated_epoch_at_the_resolution_used_for_headers(monkeypatch, expected):
+    plugin, _extensions, connections = await ready()
+    server, _epoch = await plugin._server(23, USER)
+    connections.row = connections.row.model_copy(update={"credential_epoch": 3, "token": {"access_token": "rotated"}})
+    calls = []
+
+    async def dispatch(*args, **kwargs):
+        calls.append((args, kwargs))
+        return McpToolOutput(text="unexpected", files=())
+
+    monkeypatch.setattr(plugin.transport, "call_tool", dispatch)
+    with pytest.raises(PluginError) as failure:
+        await plugin.call_tool(server, "search", {}, context=ExecutionContext(user_id="alice", project_id="team", run_id="run"), expected_credential_epoch=expected)
+    assert failure.value.code == "plugin_authority_revoked"
+    assert calls == []
+
+
+async def test_snapshot_dispatch_compares_epoch_of_its_actual_single_resolution(monkeypatch):
+    plugin, _extensions, connections = await ready()
+    snapshot = (await plugin.describe(McpSelection(authority="remote", namespace=USER, server_ids=(23,))))[0]
+    context = ExecutionContext(user_id="alice", project_id="team", run_id="run")
+    binding = (await plugin.bind(snapshot, context))[0]
+    original = plugin._server
+    resolutions = []
+    calls = []
+
+    async def rotate(server_id, namespace):
+        resolutions.append((server_id, namespace))
+        connections.row = connections.row.model_copy(update={"credential_epoch": 3, "token": {"access_token": "rotated"}})
+        return await original(server_id, namespace)
+
+    async def dispatch(*args, **kwargs):
+        calls.append((args, kwargs))
+        return McpToolOutput(text="unexpected", files=())
+
+    monkeypatch.setattr(plugin, "_server", rotate)
+    monkeypatch.setattr(plugin.transport, "call_tool", dispatch)
+    with pytest.raises(PluginError) as failure:
+        await binding.execute({"query": "no dispatch"}, context)
+    assert failure.value.code == "plugin_authority_revoked"
+    assert resolutions == [(23, USER)]
+    assert calls == []
+
+
+async def test_refresh_at_same_epoch_dispatches_only_the_fresh_resolved_headers(monkeypatch):
+    plugin, _extensions, connections = await ready()
+    server, epoch = await plugin._server(23, USER)
+    connections.row = connections.row.model_copy(update={"token": {"access_token": "refreshed"}})
+    calls = []
+
+    async def dispatch(current, name, arguments, *, context):
+        calls.append((current["headers"], name, arguments, context))
+        return McpToolOutput(text="completed", files=())
+
+    monkeypatch.setattr(plugin.transport, "call_tool", dispatch)
+    context = ExecutionContext(user_id="alice", project_id="team", run_id="run")
+    assert (await plugin.call_tool(server, "search", {}, context=context, expected_credential_epoch=epoch)).text == "completed"
+    assert calls == [({"Authorization": "Bearer refreshed"}, "search", {}, context)]
+
+
+async def test_snapshot_binding_cannot_follow_mutated_nested_configuration(monkeypatch):
+    plugin, extensions, _connections = await ready()
+    extensions.server["effect_overrides"] = {"search": "external_mutation"}
+    snapshot = (await plugin.describe(McpSelection(authority="remote", namespace=USER, server_ids=(23,))))[0]
+    context = ExecutionContext(user_id="alice", project_id="team", run_id="run")
+    binding = (await plugin.bind(snapshot, context))[0]
+    calls = []
+
+    async def dispatch(*args, **kwargs):
+        calls.append((args, kwargs))
+        return McpToolOutput(text="unexpected", files=())
+
+    monkeypatch.setattr(plugin.transport, "call_tool", dispatch)
+    extensions.server["effect_overrides"]["search"] = "read"
+    with pytest.raises(PluginError) as failure:
+        await binding.execute({"query": "no dispatch"}, context)
+    assert failure.value.code == "plugin_configuration_changed"
+    assert calls == []

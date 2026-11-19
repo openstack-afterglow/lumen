@@ -3,9 +3,11 @@
 import hashlib
 import hmac
 import json
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from cryptography.exceptions import InvalidTag
 from sqlalchemy import select
 
 from lumen.config import get_settings
@@ -27,6 +29,8 @@ from .errors import (
     DurableRunProtocolMismatch,
 )
 from .lifecycle import _require_owned_running_lease
+
+logger = logging.getLogger(__name__)
 
 
 def _normalize_interaction_response(response_schema: object, response: object) -> dict[str, Any]:
@@ -172,7 +176,7 @@ def _validated_approval_dispatch_hmac(*, run: ChatRun, approval: ChatToolApprova
         raise DurableRunError("v2 approval dispatch identity is invalid")
     try:
         arguments = json.loads(decrypt_chat_content(approval.arguments_ciphertext))
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+    except (TypeError, ValueError, json.JSONDecodeError, InvalidTag) as exc:
         raise DurableRunError("v2 approval arguments are unreadable") from exc
     if not isinstance(arguments, dict):
         raise DurableRunError("v2 approval dispatch identity is invalid")
@@ -237,7 +241,10 @@ def _normalize_approval_destination(value: object) -> str | None:
     return normalized
 
 
-async def _persist_v2_approval_interrupt(*, run_id: str, owner: str, calls: object) -> None:
+async def _reconcile_v2_approval_interrupt(
+    *, run_id: str, owner: str, calls: object, resume: bool
+) -> list[dict[str, str]] | None:
+    """Journal the checkpoint's exact calls before considering any current-round decisions."""
     if not isinstance(calls, list) or not calls:
         raise DurableRunError("v2 approval interrupt is invalid")
     factory = _factory()
@@ -247,6 +254,7 @@ async def _persist_v2_approval_interrupt(*, run_id: str, owner: str, calls: obje
         if run.execution_protocol_version != 2:
             raise DurableRunProtocolMismatch("v1 run emitted a v2 approval interrupt")
         seen_call_ids: set[str] = set()
+        approvals: list[ChatToolApproval] = []
         for raw_call in calls:
             if not isinstance(raw_call, dict):
                 raise DurableRunError("v2 approval interrupt call is invalid")
@@ -327,8 +335,15 @@ async def _persist_v2_approval_interrupt(*, run_id: str, owner: str, calls: obje
                 expires_at=expires_at,
             )
             if approval is not None:
-                if not approval.dispatch_hmac or not hmac.compare_digest(approval.dispatch_hmac, expected_hmac):
+                _validated_approval_dispatch_hmac(run=run, approval=approval)
+                if (
+                    not approval.dispatch_hmac
+                    or not hmac.compare_digest(approval.dispatch_hmac, expected_hmac)
+                    or approval.expected_state_revision != expected_state_revision
+                    or approval.writer_fence != writer_fence
+                ):
                     raise DurableRunError("v2 approval interrupt identity changed")
+                approvals.append(approval)
                 continue
             approval = ChatToolApproval(
                 run_id=run.id,
@@ -351,6 +366,7 @@ async def _persist_v2_approval_interrupt(*, run_id: str, owner: str, calls: obje
                 expires_at=expires_at,
             )
             session.add(approval)
+            approvals.append(approval)
             await append_event(
                 session,
                 run,
@@ -371,6 +387,20 @@ async def _persist_v2_approval_interrupt(*, run_id: str, owner: str, calls: obje
                     },
                 ),
             )
+        decisions: list[dict[str, str]] = []
+        for approval in approvals:
+            if approval.status == "pending":
+                continue
+            if approval.status not in {"approved", "denied"}:
+                raise DurableRunError("v2 approval cannot resume")
+            dispatch_hmac = _validated_approval_dispatch_hmac(run=run, approval=approval)
+            decision = "approve" if approval.status == "approved" else "deny"
+            _validated_approval_decision_hmac(
+                run=run, approval=approval, decision=decision, dispatch_hmac=dispatch_hmac
+            )
+            decisions.append({"call_id": approval.call_id, "decision": decision})
+        if resume and len(decisions) == len(approvals):
+            return decisions
         if not transition_allowed(run.status, "awaiting_input"):
             raise DurableRunConflict("approval interrupt cannot pause this run")
         run.status = "awaiting_input"
@@ -379,43 +409,12 @@ async def _persist_v2_approval_interrupt(*, run_id: str, owner: str, calls: obje
         await append_event(session, run, _event(run, "run.stage.changed", {"stage": "awaiting_input"}))
 
 
-async def _v2_approval_resume(*, run_id: str, owner: str) -> list[dict[str, str]] | None:
-    factory = _factory()
-    async with factory() as session:
-        run = (await session.execute(select(ChatRun).where(ChatRun.id == run_id).with_for_update())).scalar_one()
-        _require_owned_running_lease(run, owner)
-        if run.execution_protocol_version != 2:
-            return None
-        approvals = list(
-            (
-                await session.execute(
-                    select(ChatToolApproval)
-                    .where(ChatToolApproval.run_id == run.id)
-                    .order_by(ChatToolApproval.call_id)
-                    .with_for_update()
-                )
-            ).scalars()
-        )
-        if not approvals:
-            return None
-        if any(approval.status == "pending" for approval in approvals):
-            raise DurableRunError("queued v2 run has unresolved approvals")
-        decisions: list[dict[str, str]] = []
-        for approval in approvals:
-            if approval.status not in {"approved", "denied"}:
-                raise DurableRunError("v2 approval cannot resume")
-            dispatch_hmac = _validated_approval_dispatch_hmac(run=run, approval=approval)
-            decision = "approve" if approval.status == "approved" else "deny"
-            _validated_approval_decision_hmac(
-                run=run,
-                approval=approval,
-                decision=decision,
-                dispatch_hmac=dispatch_hmac,
-            )
-            decisions.append(
-                {"call_id": approval.call_id, "decision": "approve" if approval.status == "approved" else "deny"}
-            )
-        return decisions
+async def _persist_v2_approval_interrupt(*, run_id: str, owner: str, calls: object) -> None:
+    await _reconcile_v2_approval_interrupt(run_id=run_id, owner=owner, calls=calls, resume=False)
+
+
+async def _v2_approval_resume(*, run_id: str, owner: str, calls: object) -> list[dict[str, str]] | None:
+    return await _reconcile_v2_approval_interrupt(run_id=run_id, owner=owner, calls=calls, resume=True)
 
 
 async def resolve_tool_approval(
@@ -700,78 +699,98 @@ async def expire_pending_inputs(*, limit: int = 100) -> list[str]:
             )
         ).scalars()
         candidate_run_ids = sorted(set(approval_run_ids).union(interaction_run_ids))[:limit]
-        for run_id in candidate_run_ids:
-            run = (
-                await session.execute(
-                    select(ChatRun)
-                    .where(
-                        ChatRun.id == run_id,
-                        ChatRun.execution_protocol_version == 2,
-                        ChatRun.status == "awaiting_input",
-                    )
-                    .with_for_update(skip_locked=True)
-                )
-            ).scalar_one_or_none()
-            if run is None:
-                continue
-            approvals = list(
-                (
+
+    for run_id in candidate_run_ids:
+        should_wake = False
+        try:
+            # A corrupt input must roll back only its own run, including journal writes.
+            async with factory() as session, session.begin():
+                run = (
                     await session.execute(
-                        select(ChatToolApproval)
-                        .where(ChatToolApproval.run_id == run.id)
-                        .order_by(ChatToolApproval.call_id)
-                        .with_for_update()
+                        select(ChatRun)
+                        .where(
+                            ChatRun.id == run_id,
+                            ChatRun.execution_protocol_version == 2,
+                            ChatRun.status == "awaiting_input",
+                        )
+                        .with_for_update(skip_locked=True)
                     )
-                ).scalars()
-            )
-            interactions = list(
-                (
-                    await session.execute(
-                        select(ChatRunInteraction)
-                        .where(ChatRunInteraction.run_id == run.id)
-                        .order_by(ChatRunInteraction.id)
-                        .with_for_update()
-                    )
-                ).scalars()
-            )
-            for approval in approvals:
-                if approval.status != "pending" or not _is_due(approval.expires_at, now):
+                ).scalar_one_or_none()
+                if run is None:
                     continue
-                approval.status = "denied"
-                approval.decided_at = now
-                approval.decided_by_user_id = None
-                await append_event(
-                    session,
-                    run,
-                    _event(run, "tool.approval_resolved", _approval_resolved_payload(approval, "deny")),
+                approvals = list(
+                    (
+                        await session.execute(
+                            select(ChatToolApproval)
+                            .where(ChatToolApproval.run_id == run.id)
+                            .order_by(ChatToolApproval.call_id)
+                            .with_for_update()
+                        )
+                    ).scalars()
                 )
-            for interaction in interactions:
-                if interaction.status != "pending" or not _is_due(interaction.expires_at, now):
-                    continue
-                interaction.status = "timeout"
-                interaction.response_ciphertext = None
-                interaction.decided_at = now
-                interaction.decided_by_user_id = None
-                await append_event(
-                    session,
-                    run,
-                    _event(
+                interactions = list(
+                    (
+                        await session.execute(
+                            select(ChatRunInteraction)
+                            .where(ChatRunInteraction.run_id == run.id)
+                            .order_by(ChatRunInteraction.id)
+                            .with_for_update()
+                        )
+                    ).scalars()
+                )
+                for approval in approvals:
+                    if approval.status != "pending" or not _is_due(approval.expires_at, now):
+                        continue
+                    dispatch_hmac = _validated_approval_dispatch_hmac(run=run, approval=approval)
+                    approval.status = "denied"
+                    approval.decided_at = now
+                    approval.decided_by_user_id = None
+                    approval.decision_hmac = _approval_decision_hmac(
+                        dispatch_hmac=dispatch_hmac,
+                        owner_user_id=run.user_id,
+                        project_id=run.project_id,
+                        call_id=approval.call_id,
+                        decision="deny",
+                        decided_by_user_id=approval.decided_by_user_id,
+                        decided_at=approval.decided_at,
+                    )
+                    await append_event(
+                        session,
                         run,
-                        "interaction.resolved",
-                        {"interaction_id": interaction.id, "status": "timeout", "response": None},
-                    ),
-                )
-            if any(item.status == "pending" for item in approvals) or any(
-                item.status == "pending" for item in interactions
-            ):
-                continue
-            if not transition_allowed(run.status, "queued"):
-                raise DurableRunConflict("expired input batch cannot resume this run")
-            run.status = "queued"
-            run.lease_owner = None
-            run.lease_expires_at = None
-            await append_event(session, run, _event(run, "run.stage.changed", {"stage": "queued"}))
-            resumed_run_ids.append(run.id)
-    for run_id in resumed_run_ids:
-        await wake_run(run_id)
+                        _event(run, "tool.approval_resolved", _approval_resolved_payload(approval, "deny")),
+                    )
+                for interaction in interactions:
+                    if interaction.status != "pending" or not _is_due(interaction.expires_at, now):
+                        continue
+                    interaction.status = "timeout"
+                    interaction.response_ciphertext = None
+                    interaction.decided_at = now
+                    interaction.decided_by_user_id = None
+                    await append_event(
+                        session,
+                        run,
+                        _event(
+                            run,
+                            "interaction.resolved",
+                            {"interaction_id": interaction.id, "status": "timeout", "response": None},
+                        ),
+                    )
+                if any(item.status == "pending" for item in approvals) or any(
+                    item.status == "pending" for item in interactions
+                ):
+                    continue
+                if not transition_allowed(run.status, "queued"):
+                    raise DurableRunConflict("expired input batch cannot resume this run")
+                run.status = "queued"
+                run.lease_owner = None
+                run.lease_expires_at = None
+                await append_event(session, run, _event(run, "run.stage.changed", {"stage": "queued"}))
+                should_wake = True
+        except DurableRunError:
+            # Domain validation failures stay fail-closed; database failures still propagate.
+            logger.warning("durable input expiry rejected invalid run run_id=%s", run_id)
+            continue
+        if should_wake:
+            resumed_run_ids.append(run_id)
+            await wake_run(run_id)
     return resumed_run_ids

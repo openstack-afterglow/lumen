@@ -1,9 +1,10 @@
 """Bounded, secret-safe provider model discovery for the admin review flow.
 
 Live API lists are authoritative for API-key providers. A failed or incomplete live
-fetch never becomes a usable static list. Subscription and unsupported providers
-receive a clearly marked LiteLLM reference catalog instead. Administrator-owned
-custom bases are trusted (including local endpoints), but redirects and environment
+fetch never becomes a usable catalog list. Native subscription modes use the tracked
+native catalog. Compatible endpoints supply live IDs and display names only, with
+administrator-owned prices.
+Custom bases are trusted (including local endpoints), but redirects and environment
 proxies are disabled so credentials cannot be forwarded to another origin.
 """
 
@@ -17,6 +18,8 @@ from datetime import UTC, datetime
 from typing import Any, Literal
 from urllib.parse import urlencode
 
+from lumen.services.native_catalog import ModelKind, native_catalog
+from lumen.services.provider_metadata import NATIVE_PROVIDER_TYPES, native_catalog_entry, provider_family
 from lumen.services.providers import errors
 from lumen.services.providers import routing as provider_store
 from lumen.services.providers.credentials import (
@@ -42,27 +45,12 @@ _GEMINI_DEFAULT_BASE = "https://generativelanguage.googleapis.com/v1beta"
 _GEMINI_PAGE_SIZE = 200
 _GEMINI_CHAT_METHODS = frozenset({"generateContent", "streamGenerateContent", "bidiGenerateContent", "generateMessage"})
 
-# provider_type → OpenAI 호환 /models 기본 base (api_base 미지정 시 사용)
-_DEFAULT_BASES: dict[str, str] = {
+# Only supported native adapters expose this OpenAI-style listing protocol.
+_DEFAULT_BASES = {
     "openai": "https://api.openai.com/v1",
-    "groq": "https://api.groq.com/openai/v1",
-    "deepseek": "https://api.deepseek.com/v1",
-    "mistral": "https://api.mistral.ai/v1",
-    "together_ai": "https://api.together.xyz/v1",
-    "openrouter": "https://openrouter.ai/api/v1",
-    "xai": "https://api.x.ai/v1",
     "perplexity": "https://api.perplexity.ai/v1",
-    "ollama": "http://localhost:11434/v1",
 }
-# OpenAI 호환 /models 엔드포인트를 노출하는 provider_type.
-# azure 는 제외: 동일 이름이라도 실제 deployment discovery 는 api-version query 와 별도 경로가
-# 필요해 일반 OpenAI 호환 /models 계약으로 라이브 조회를 대표할 수 없다(정적 참고 목록만 제공).
-_OPENAI_COMPATIBLE = set(_DEFAULT_BASES)
-_MODEL_MODES: dict[str, Literal["text", "image", "tts", "stt", "realtime"]] = {
-    "chat": "text", "completion": "text", "responses": "text",
-    "image_generation": "image", "audio_speech": "tts",
-    "audio_transcription": "stt", "realtime": "realtime",
-}
+_OPENAI_COMPATIBLE = frozenset(_DEFAULT_BASES)
 
 
 def _models_url(provider_type: str, api_base: str | None) -> str | None:
@@ -90,7 +78,7 @@ class DiscoveredCandidate:
     generation_methods: tuple[str, ...] = ()
     input_token_limit: int | None = None
     output_token_limit: int | None = None
-    model_kind: Literal["text", "image", "tts", "stt", "realtime"] | None = None
+    model_kind: ModelKind | None = None
 
 
 @dataclass(frozen=True)
@@ -125,15 +113,41 @@ def _error_outcome(code: str, message: str, retryable: bool) -> _FetchOutcome:
     return _FetchOutcome("error", (), code, message, retryable)
 
 
-def _serialize_candidate(candidate: DiscoveredCandidate) -> dict[str, Any]:
+def _serialize_candidate(
+    candidate: DiscoveredCandidate, provider_type: str, api_base: str | None,
+    family: str, catalog_version: str | None,
+) -> dict[str, Any]:
+    compatible = family == "compatible"
+    entry = {} if compatible else native_catalog_entry(candidate.id, provider_type, api_base)
+    if compatible:
+        kind = None
+    elif candidate.model_kind == "decision":
+        kind = "decision"
+        if entry.get("kind") != kind:
+            entry = {}
+    else:
+        kind = entry.get("kind") or candidate.model_kind
+    purpose = "unknown" if compatible else (
+        "chat" if kind == "text" else "non_chat" if kind else candidate.purpose
+    )
     return {
         "id": candidate.id,
-        "display_name": candidate.display_name,
-        "purpose": candidate.purpose,
-        "generation_methods": list(candidate.generation_methods),
-        "input_token_limit": candidate.input_token_limit,
-        "output_token_limit": candidate.output_token_limit,
-        "model_kind": candidate.model_kind,
+        "display_name": candidate.display_name or entry.get("display_name"),
+        "purpose": purpose,
+        "generation_methods": [] if compatible else list(candidate.generation_methods),
+        "input_token_limit": None if compatible else candidate.input_token_limit or entry.get("context_window"),
+        "output_token_limit": None if compatible else candidate.output_token_limit or entry.get("max_output_tokens"),
+        "model_kind": kind,
+        "provider_family": family,
+        "requires_manual_pricing": compatible,
+        "status": entry.get("status"),
+        "token_pricing": entry.get("token_pricing"),
+        "media_pricing": entry.get("media_pricing"),
+        "capabilities": entry.get("capabilities"),
+        "source_urls": entry.get("source_urls", []),
+        "verified_at": entry.get("verified_at"),
+        "catalog_version": catalog_version if entry else None,
+        "catalog_entry": entry or None,
     }
 
 
@@ -345,22 +359,6 @@ def _gemini_parse_page(payload: Any) -> _PageResult:
 
 
 
-def _catalog_kind(provider_type: str, model_id: str) -> Literal["text", "image", "tts", "stt", "realtime"] | None:
-    """Exact catalog operation hint, never an execution or price guarantee."""
-    import litellm
-
-    for key in (f"{provider_type}/{model_id}", model_id):
-        entry = litellm.model_cost.get(key)
-        if isinstance(entry, dict) and entry.get("litellm_provider") == provider_type:
-            return _MODEL_MODES.get(entry.get("mode"))
-    return None
-
-
-def _catalog_candidate(provider_type: str, model_id: str) -> DiscoveredCandidate:
-    kind = _catalog_kind(provider_type, model_id)
-    purpose = "chat" if kind == "text" else "non_chat" if kind else "unknown"
-    return DiscoveredCandidate(id=model_id, purpose=purpose, model_kind=kind)
-
 def _gemini_candidate(item: dict) -> DiscoveredCandidate | None:
     name = item.get("name")
     if not isinstance(name, str) or not name or name != name.strip():
@@ -382,7 +380,11 @@ def _gemini_candidate(item: dict) -> DiscoveredCandidate | None:
     output_limit = item.get("outputTokenLimit")
     input_limit = input_limit if type(input_limit) is int and input_limit > 0 else None
     output_limit = output_limit if type(output_limit) is int and output_limit > 0 else None
-    kind = "realtime" if "bidiGenerateContent" in methods else _catalog_kind("gemini", model_id)
+    kind: ModelKind | None = None
+    if "createDecision" in methods:
+        kind = "decision"
+    elif "bidiGenerateContent" in methods:
+        kind = "realtime"
     return DiscoveredCandidate(
         id=model_id,
         display_name=display_name,
@@ -445,7 +447,7 @@ async def _fetch_openai_compatible_models(
                     raise _DiscoveryFailure(
                         "discovery_malformed_response", "프로바이더 모델 항목 형식이 올바르지 않습니다"
                     )
-                if raw_id.startswith("preset/"):
+                if provider_type == "perplexity" and raw_id.startswith("preset/"):
                     continue
                 projected = api_model_name(raw_id, "perplexity") if provider_type == "perplexity" else raw_id
                 if len(projected) > _MAX_MODEL_ID_LEN:
@@ -455,7 +457,9 @@ async def _fetch_openai_compatible_models(
                 if len(candidates) >= _MAX_MODELS:
                     raise _DiscoveryFailure("discovery_model_limit", "모델 목록 조회 한도를 초과했습니다")
                 seen.add(projected)
-                candidates.append(_catalog_candidate(provider_type, projected))
+                display_name = item.get("display_name") if isinstance(item, dict) else None
+                display_name = display_name.strip() if isinstance(display_name, str) and display_name.strip() else None
+                candidates.append(DiscoveredCandidate(id=projected, display_name=display_name))
             return _FetchOutcome("success" if candidates else "empty", tuple(candidates))
     except TimeoutError:
         return _error_outcome("discovery_timeout", "모델 목록 조회 시간이 초과되었습니다", True)
@@ -467,31 +471,10 @@ async def _fetch_openai_compatible_models(
         return _error_outcome(exc.code, exc.message, exc.retryable)
 
 
-# ---------------------------------------------------------------------------
-# 정적(litellm) 참고 목록 — 목록 API가 미지원인 경우에만 사용
-# ---------------------------------------------------------------------------
-def _litellm_static(provider_type: str) -> list[str]:
-    try:
-        import litellm
-
-        mbp = getattr(litellm, "models_by_provider", None) or {}
-        return sorted({str(m) for m in mbp.get(provider_type, [])})
-    except Exception:
-        logger.warning("litellm 정적 모델 목록 실패 ptype=%s", provider_type, exc_info=True)
-        return []
-
-
-def _static_candidates(provider_type: str) -> tuple[DiscoveredCandidate, ...]:
-    static = _litellm_static(provider_type)
-    if provider_type == "perplexity":
-        static = [api_model_name(model, "perplexity") for model in static if not model.startswith("preset/")]
-    ids = sorted({m for m in static if m and len(m) <= _MAX_MODEL_ID_LEN})
-    return tuple(_catalog_candidate(provider_type, i) for i in ids)
-
-
-def _wrap_ids(ids: list[str]) -> tuple[DiscoveredCandidate, ...]:
-    unique = sorted({i for i in ids if i and len(i) <= _MAX_MODEL_ID_LEN})
-    return tuple(DiscoveredCandidate(id=i) for i in unique)
+# Subscription discovery reads the tracked native catalog, never an upstream list.
+def _catalog_static(provider_type: str) -> list[str]:
+    models = native_catalog()["providers"].get(provider_type, {}).get("models", [])
+    return [entry["id"] for entry in models]
 
 
 # ---------------------------------------------------------------------------
@@ -500,13 +483,21 @@ def _wrap_ids(ids: list[str]) -> tuple[DiscoveredCandidate, ...]:
 def _response(
     provider_id: int,
     fetched_at: str,
-    source: Literal["api", "litellm", "none"],
+    source: Literal["api", "catalog", "none"],
     live_status: Literal["success", "empty", "unsupported", "error"],
     complete: bool,
     error: dict[str, Any] | None,
     candidates: tuple[DiscoveredCandidate, ...],
+    *,
+    provider_type: str,
+    api_base: str | None = None,
+    family: str = "native",
 ) -> dict[str, Any]:
+    version = native_catalog()["catalog_version"] if family == "native" else None
     return {
+        "provider_family": family,
+        "requires_manual_pricing": family == "compatible",
+        "catalog_version": version,
         "provider_id": provider_id,
         "fetched_at": fetched_at,
         "source": source,
@@ -514,38 +505,46 @@ def _response(
         "complete": complete,
         "error": error,
         "models": [c.id for c in candidates],
-        "candidates": [_serialize_candidate(c) for c in candidates],
+        "candidates": [
+            _serialize_candidate(c, provider_type, api_base, family, version)
+            for c in candidates
+        ],
     }
 
 
 def _subscription_response(provider_id: int, fetched_at: str, auth_mode: str) -> dict[str, Any]:
-    catalog_provider = "chatgpt" if auth_mode == "chatgpt_device" else "anthropic"
+    catalog_provider = "openai" if auth_mode == "chatgpt_device" else "anthropic"
     canonical_models: list[str] = []
-    for candidate in _litellm_static(catalog_provider):
+    for candidate in _catalog_static(catalog_provider):
+        if native_catalog_entry(candidate, catalog_provider, None).get("kind") not in {None, "text"}:
+            continue
         try:
             canonical_models.append(canonical_subscription_model_name(candidate, auth_mode))
         except errors.ProviderValidationError:
             continue
-    candidates = _wrap_ids(canonical_models)
-    source: Literal["api", "litellm", "none"] = "litellm" if candidates else "none"
-    return _response(provider_id, fetched_at, source, "unsupported", False, None, candidates)
+    candidates = tuple(DiscoveredCandidate(id=model) for model in sorted(set(canonical_models)))
+    source: Literal["api", "catalog", "none"] = "catalog" if candidates else "none"
+    return _response(
+        provider_id, fetched_at, source, "unsupported", False, None, candidates,
+        provider_type=catalog_provider,
+    )
 
 
-def _unsupported_response(provider_id: int, fetched_at: str, provider_type: str) -> dict[str, Any]:
-    candidates = _static_candidates(provider_type)
-    source: Literal["api", "litellm", "none"] = "litellm" if candidates else "none"
-    return _response(provider_id, fetched_at, source, "unsupported", False, None, candidates)
-
-
-def _build_response(provider_id: int, fetched_at: str, outcome: _FetchOutcome) -> dict[str, Any]:
+def _build_response(
+    provider_id: int, fetched_at: str, outcome: _FetchOutcome,
+    provider_type: str, api_base: str | None, family: str,
+) -> dict[str, Any]:
+    error = None
     if outcome.status == "error":
         error = {"code": outcome.error_code, "message": outcome.error_message, "retryable": outcome.retryable}
-        return _response(provider_id, fetched_at, "none", "error", False, error, ())
-    return _response(provider_id, fetched_at, "api", outcome.status, True, None, outcome.candidates)
+    return _response(
+        provider_id, fetched_at, "none" if error else "api", outcome.status, not error, error,
+        outcome.candidates, provider_type=provider_type, api_base=api_base, family=family,
+    )
 
 
 async def discover_models(provider_id: int) -> dict[str, Any]:
-    """Fetch authoritative live candidates or explicitly unsupported static references."""
+    """Fetch authoritative live IDs, annotating only native routes with tracked facts."""
     prov = await provider_store.get_provider_for_discovery(provider_id)
     if prov is None:
         raise errors.ProviderNotFoundError(f"프로바이더 {provider_id} 를 찾을 수 없습니다")
@@ -553,12 +552,21 @@ async def discover_models(provider_id: int) -> dict[str, Any]:
     fetched_at = _now_iso()
     auth_mode = prov.get("auth_mode", "api_key")
     if auth_mode in {"chatgpt_device", "anthropic_subscription"}:
-        # 구독 토큰은 공식 API-key 목록 endpoint로 절대 보내지 않는다 — 정적 참고 목록만 제공.
+        # Subscription credentials never reach the official API-key listing endpoint.
         return _subscription_response(provider_id, fetched_at, auth_mode)
 
     provider_type = prov["provider_type"]
     api_base = prov["api_base"]
-    api_key = prov["api_key"]
+    if provider_type not in NATIVE_PROVIDER_TYPES:
+        outcome = _error_outcome("unsupported_provider_type", str(errors.UnsupportedProviderTypeError()), False)
+        return _build_response(provider_id, fetched_at, outcome, provider_type, api_base, "compatible")
+    family = provider_family(provider_type, api_base, auth_mode)
+    api_key = None
+    if provider_type in {"anthropic", "gemini", *_OPENAI_COMPATIBLE} and prov.get("provider_auth") is not None:
+        from lumen.services.providers.credentials import resolve_inference_credential
+
+        material = await resolve_inference_credential(prov["provider_auth"])
+        api_key = material.get("api_key")
 
     if provider_type == "anthropic":
         outcome = await _fetch_anthropic_models(api_base, api_key)
@@ -566,7 +574,4 @@ async def discover_models(provider_id: int) -> dict[str, Any]:
         outcome = await _fetch_gemini_models(api_base, api_key)
     elif provider_type in _OPENAI_COMPATIBLE:
         outcome = await _fetch_openai_compatible_models(provider_type, api_base, api_key)
-    else:
-        return _unsupported_response(provider_id, fetched_at, provider_type)
-
-    return _build_response(provider_id, fetched_at, outcome)
+    return _build_response(provider_id, fetched_at, outcome, provider_type, api_base, family)

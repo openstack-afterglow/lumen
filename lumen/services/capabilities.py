@@ -1,15 +1,20 @@
 """Canonical, fail-closed model capability detection.
 
-Provider-specific SDK probes are normalized here.  Callers must gate a requested
-feature on the returned availability rather than silently dropping parameters.
+Exact local metadata is normalized here. Callers gate a requested feature on
+availability; an absent observation is not a provider denial.
 """
 
 from typing import Any
 from urllib.parse import urlsplit
 
 from lumen.services.execution_protocol import v2_runtime_ready
-from lumen.services.litellm_client import chatgpt_model_metadata
-from lumen.services.providers.credentials import api_model_name, litellm_model_name
+from lumen.services.provider_metadata import (
+    catalog_model_metadata,
+    catalog_version,
+    direct_provider_route,
+    provider_output_budget_enforced,
+)
+from lumen.services.providers.credentials import transport_model_name
 
 _RUNTIME_TOOL_FEATURES = (
     "mcp",
@@ -161,135 +166,75 @@ def effective_runtime_capabilities(
     }
 
 
-def _probe(name: str, *, model_name: str, provider_type: str | None) -> bool:
-    try:
-        import litellm
-
-        probe = getattr(litellm, name)
-        try:
-            return bool(probe(model=model_name, custom_llm_provider=provider_type))
-        except TypeError:
-            try:
-                return bool(probe(model=model_name))
-            except TypeError:
-                return bool(probe(model_name))
-    except Exception:
-        return False
 
 
-def reasoning_explicitly_unsupported(model_name: str, source: str | None, overrides: dict | None) -> bool:
-    """Unknown LiteLLM probes are false too; only a known denial can discard input."""
-    if source == "override" and isinstance(overrides, dict) and overrides.get("reasoning") is False:
-        return True
-    try:
-        import litellm
-
-        catalog = litellm.model_cost
-        metadata = catalog.get(litellm_model_name(model_name)) if isinstance(catalog, dict) else None
-        return isinstance(metadata, dict) and not bool(metadata.get("supports_reasoning"))
-    except Exception:
-        return False
+def reasoning_explicitly_unsupported(
+    model_name: str, source: str | None, overrides: dict | None,
+    provider_type: str | None = None, api_base: str | None = None,
+) -> bool:
+    """Only an explicit administrator/catalog denial can discard caller input."""
+    if source == "override" and isinstance(overrides, dict) and type(overrides.get("reasoning")) is bool:
+        return not overrides["reasoning"]
+    return catalog_model_metadata(model_name, provider_type, api_base).get("supports_reasoning") is False
 
 
 _NATIVE_WEB_SEARCH_PROVIDERS = frozenset({"anthropic", "gemini", "openai", "perplexity"})
 
 
-def _is_perplexity_sonar(model_name: str, provider_type: str | None) -> bool:
-    return provider_type == "perplexity" and model_name.rsplit("/", 1)[-1].lower().startswith("sonar")
 
 
-def _native_web_search_available(model_name: str, provider_type: str | None) -> bool:
-    """Accept native search only when this transport can activate LiteLLM's exact capability."""
-    return provider_type in _NATIVE_WEB_SEARCH_PROVIDERS and _probe(
-        "supports_web_search", model_name=model_name, provider_type=provider_type
-    )
+def _is_perplexity_sonar(model_name: str, provider_type: str | None, api_base: str | None) -> bool:
+    """Exact built-in search products retain their independent authorization scope."""
+    if provider_type != "perplexity" or not direct_provider_route(provider_type, api_base):
+        return False
+    from lumen.services.providers.credentials import api_model_name
+
+    return api_model_name(model_name, "perplexity") in {
+        "perplexity/sonar", "perplexity/sonar-pro", "perplexity/sonar-reasoning",
+        "perplexity/sonar-reasoning-pro", "perplexity/sonar-deep-research",
+    }
 
 
-def _detected_native_web_search_available(detected: dict[str, Any]) -> bool:
-    """Return whether detected capabilities advertise this exact native transport."""
-    gate = (detected.get("feature_gates") or {}).get("web_search")
-    return (
-        bool(detected.get("web_search"))
-        and isinstance(gate, dict)
-        and gate.get("available") is True
-        and gate.get("mode") == "native"
-    )
+def _native_web_search_available(model_name: str, provider_type: str | None, api_base: str | None = None) -> bool:
+    """Exact catalog observation intersected with native transport support."""
+    return provider_type in _NATIVE_WEB_SEARCH_PROVIDERS and catalog_model_metadata(
+        model_name, provider_type, api_base,
+    ).get("supports_web_search") is True
 
 
-def _catalog_context_limit(model_name: str, provider_type: str | None) -> int | None:
-    """Read only an exact LiteLLM catalog input-window entry.
-
-    Stored Perplexity routes retain their transport prefix (for example,
-    ``perplexity/perplexity/sonar``), while LiteLLM's catalog is keyed by the
-    canonical Agent API identifier (``perplexity/sonar``).  Project that one
-    provider-specific alias, but never infer a limit from a model family or a
-    generic ``max_tokens`` field.
-    """
-    normalized = litellm_model_name(model_name)
-    candidates = [normalized]
-    if provider_type == "perplexity":
-        canonical = api_model_name(normalized, "perplexity")
-        if canonical and canonical not in candidates:
-            candidates.append(canonical)
-    try:
-        import litellm
-
-        catalog = getattr(litellm, "model_cost", {})
-        for candidate in candidates:
-            metadata = catalog.get(candidate) if isinstance(catalog, dict) else None
-            value = metadata.get("max_input_tokens") if isinstance(metadata, dict) else None
-            if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-                return value
-    except Exception:
-        pass
-    return None
 
 
-def litellm_capabilities(model_name: str, provider_type: str | None) -> dict[str, Any]:
-    """Return the legacy display fields plus canonical feature gates.
+def _unavailable_reason(metadata: dict, key: str, *, transport_unsupported: bool = False) -> str:
+    return "provider_unsupported" if transport_unsupported or metadata.get(key) is False else "metadata_unknown"
 
-    LiteLLM cannot infer managed routes or pricing, so those are deliberately
-    unavailable rather than guessed.
-    """
-    normalized_model = litellm_model_name(model_name)
+
+
+
+def provider_capabilities(model_name: str, provider_type: str | None, api_base: str | None = None) -> dict[str, Any]:
+    """Fail-closed availability, retaining observed/unknown metadata provenance."""
+    normalized_model = transport_model_name(model_name)
     is_chatgpt = provider_type == "chatgpt" or model_name.startswith("chatgpt/")
-    metadata = chatgpt_model_metadata(model_name) if is_chatgpt else {}
-    vision = (
-        bool(metadata.get("supports_vision"))
-        if is_chatgpt
-        else _probe("supports_vision", model_name=normalized_model, provider_type=provider_type)
-    )
-    pdf_input = (
-        bool(metadata.get("supports_pdf_input"))
-        if is_chatgpt
-        else _probe("supports_pdf_input", model_name=normalized_model, provider_type=provider_type)
-    )
-    reasoning = (
-        bool(metadata.get("supports_reasoning"))
-        if is_chatgpt
-        else _probe("supports_reasoning", model_name=normalized_model, provider_type=provider_type)
-    )
-    function_calling = (
-        bool(metadata.get("supports_function_calling"))
-        if is_chatgpt
-        else _probe("supports_function_calling", model_name=normalized_model, provider_type=provider_type)
-    )
-    structured_output = (
-        False
-        if is_chatgpt
-        else _probe("supports_response_schema", model_name=normalized_model, provider_type=provider_type)
-    )
+    metadata = catalog_model_metadata(normalized_model, "openai") if is_chatgpt else catalog_model_metadata(model_name, provider_type, api_base)
+    vision = metadata.get("supports_vision") is True
+    pdf_input = metadata.get("supports_pdf_input") is True
+    reasoning = metadata.get("supports_reasoning") is True
+    function_calling = metadata.get("supports_function_calling") is True
+    structured_output = not is_chatgpt and metadata.get("supports_response_schema") is True
+    decisions = provider_type == "openai" and metadata.get("supports_decisions") is True
+    prompt_caching = metadata.get("supports_prompt_caching") is True
     parallel_function_calling = bool(metadata.get("supports_parallel_function_calling")) if is_chatgpt else False
-    supports_web_search = _native_web_search_available(normalized_model, provider_type)
-    web_search_required = supports_web_search and _is_perplexity_sonar(normalized_model, provider_type)
-    configured_context_limit = metadata.get("max_input_tokens")
+    supports_web_search = _native_web_search_available(normalized_model, provider_type, api_base)
+    web_search_required = _is_perplexity_sonar(normalized_model, provider_type, api_base)
+    configured_context_limit = metadata.get("context_window", metadata.get("max_input_tokens"))
     context_limit = (
         configured_context_limit
         if isinstance(configured_context_limit, int)
         and not isinstance(configured_context_limit, bool)
         and configured_context_limit > 0
-        else _catalog_context_limit(normalized_model, provider_type)
+        else None
     )
+    max_input_tokens = metadata.get("max_input_tokens")
+    max_output_tokens = metadata.get("max_output_tokens")
     return {
         # Existing model-admin/UI fields retained until the capability API is cut over.
         "vision": vision,
@@ -297,17 +242,33 @@ def litellm_capabilities(model_name: str, provider_type: str | None) -> dict[str
         "tool_call": function_calling,
         "attachment": vision or pdf_input,
         "modalities": None,
-        "reasoning_options": [],
+        **({"max_output_tokens": max_output_tokens} if type(max_output_tokens) is int and max_output_tokens > 0 else {}),
+        "reasoning_options": metadata.get("reasoning_options") or [],
         "context_limit": context_limit,
+        **({"max_input_tokens": max_input_tokens} if type(max_input_tokens) is int
+           and context_limit is not None and 0 < max_input_tokens < context_limit else {}),
+        "metadata_source": "catalog" if metadata else None,
+        "metadata_status": "observed" if metadata else "missing",
+        "metadata_version": catalog_version() if metadata else None,
+        "capability_observations": {
+            key: metadata.get(key) if isinstance(metadata.get(key), bool) else None
+            for key in ("supports_vision", "supports_pdf_input", "supports_reasoning",
+                        "supports_function_calling", "supports_response_schema", "supports_web_search")
+        },
         # Canonical gate contract.
         "streaming": True,
+        "output_budget_enforced": provider_output_budget_enforced("chatgpt" if is_chatgpt else provider_type),
         "function_calling": function_calling,
         "parallel_function_calling": parallel_function_calling,
         "structured_output": structured_output,
         "web_search": supports_web_search,
+        "native_web_search_transport_supported": provider_type in _NATIVE_WEB_SEARCH_PROVIDERS,
         "web_search_required": web_search_required,
         "web_fetch": False,
         "advisor": False,
+        "decisions": decisions,
+        "decisions_transport_supported": provider_type == "openai" and not is_chatgpt,
+        "prompt_caching": prompt_caching,
         "responses_api": is_chatgpt,
         "mcp": False,
         "code_interpreter": False,
@@ -322,14 +283,22 @@ def litellm_capabilities(model_name: str, provider_type: str | None) -> dict[str
             "structured_output": {
                 "available": structured_output,
                 "mode": "native" if structured_output else "none",
-                "reason_code": None if structured_output else "provider_unsupported",
+                "reason_code": None if structured_output else _unavailable_reason(
+                    metadata, "supports_response_schema", transport_unsupported=is_chatgpt
+                ),
                 "pricing_available": structured_output,
             },
+            "decisions": {
+                "available": decisions,
+                "mode": "native" if decisions else "none",
+                "reason_code": None if decisions else _unavailable_reason(metadata, "supports_decisions"),
+                "pricing_available": decisions,
+            },
             "web_search": {
-                "available": supports_web_search,
-                "mode": "native" if supports_web_search else "none",
-                "reason_code": None if supports_web_search else "provider_unsupported",
-                "pricing_available": supports_web_search,
+                "available": False,
+                "mode": "none",
+                "reason_code": "pricing_unavailable" if supports_web_search else _unavailable_reason(metadata, "supports_web_search"),
+                "pricing_available": False,
             },
             "web_fetch": {
                 "available": False,
@@ -347,13 +316,13 @@ def litellm_capabilities(model_name: str, provider_type: str | None) -> dict[str
             "image_input": {
                 "available": vision,
                 "mode": "native" if vision else "none",
-                "reason_code": None if vision else "provider_unsupported",
+                "reason_code": None if vision else _unavailable_reason(metadata, "supports_vision"),
                 "pricing_available": vision,
             },
             "document_input": {
                 "available": pdf_input,
                 "mode": "native" if pdf_input else "none",
-                "reason_code": None if pdf_input else "provider_unsupported",
+                "reason_code": None if pdf_input else _unavailable_reason(metadata, "supports_pdf_input"),
                 "pricing_available": pdf_input,
             },
             "audio_input": {
@@ -417,6 +386,7 @@ def apply_subscription_capability_limits(capabilities: dict[str, Any], auth_mode
     normalized["web_search"] = False
     normalized["web_search_required"] = False
     gates = {name: dict(gate) for name, gate in (normalized.get("feature_gates") or {}).items()}
+    normalized["native_web_search_transport_supported"] = False
     gate = gates.get("web_search", {})
     gate.update(
         available=False,
@@ -425,7 +395,13 @@ def apply_subscription_capability_limits(capabilities: dict[str, Any], auth_mode
         pricing_available=False,
     )
     gates["web_search"] = gate
+    normalized["decisions"] = False
+    normalized["decisions_transport_supported"] = False
+    gates["decisions"] = {
+        "available": False, "mode": "none", "reason_code": "provider_unsupported", "pricing_available": False,
+    }
     if auth_mode == "chatgpt_device":
+        normalized["output_budget_enforced"] = False
         normalized["structured_output"] = False
         normalized["responses_api"] = True
         normalized["endpoints"] = ["responses"]
@@ -442,14 +418,11 @@ def apply_subscription_capability_limits(capabilities: dict[str, Any], auth_mode
 
 
 def reasoning_can_be_disabled(capabilities: dict[str, Any] | None, provider_type: str | None) -> bool:
-    """Whether an explicit ``reasoning_effort="none"`` is a valid request, not only a value LiteLLM forwards.
+    """Whether explicit reasoning_effort='none' is supported by stored metadata.
 
-    LiteLLM 1.93 passes ``none`` unchanged to OpenAI (gpt-5 and o3 reject it) and maps it to
-    ``thinkingBudget: 0`` for Gemini (below gemini-2.5-pro's minimum). Only models.dev metadata
-    that advertises disabling qualifies: an effort list with ``none``, a ``toggle``, or a
-    ``budget_tokens`` minimum of exactly 0. Anthropic thinking is opt-in and LiteLLM sends no
-    thinking block for ``none``, so its ``budget_tokens`` minimum is not a floor on disabling.
-    Chat admission and the user model catalog share this rule.
+    Only models.dev metadata advertising disabling qualifies: an effort list
+    with 'none', a toggle, or a budget_tokens minimum of exactly zero. Anthropic
+    thinking is opt-in, so its minimum is not a floor on disabling.
     """
     capabilities = capabilities or {}
     if not capabilities.get("reasoning"):
@@ -471,11 +444,26 @@ def reasoning_can_be_disabled(capabilities: dict[str, Any] | None, provider_type
 
 
 def normalize_capabilities(stored: dict[str, Any] | None, detected: dict[str, Any]) -> dict[str, Any]:
-    """Upgrade legacy models.dev/override shapes to canonical feature gates."""
+    """Normalize stored administrator overrides into canonical feature gates."""
     if not stored:
         return detected
     normalized = dict(detected)
     normalized.update({key: value for key, value in stored.items() if key != "feature_gates"})
+    if not stored.get("reasoning_options"):
+        normalized["reasoning_options"] = detected.get("reasoning_options") or []
+    # Executor parameter fidelity is not an administrator/model capability override.
+    normalized["output_budget_enforced"] = detected.get("output_budget_enforced")
+    normalized["native_web_search_transport_supported"] = detected.get("native_web_search_transport_supported") is True
+    normalized["decisions_transport_supported"] = detected.get("decisions_transport_supported") is True
+    if detected.get("max_input_tokens") is not None:
+        normalized["max_input_tokens"] = detected["max_input_tokens"]
+    output_limit = normalized.get("max_output_tokens")
+    if type(output_limit) is not int or output_limit <= 0:
+        detected_limit = detected.get("max_output_tokens")
+        if type(detected_limit) is int and detected_limit > 0:
+            normalized["max_output_tokens"] = detected_limit
+        else:
+            normalized.pop("max_output_tokens", None)
     # ``CapabilitiesInput`` always serializes context_limit, so a stored override that
     # only changed an unrelated flag carries context_limit=None. Never let that erase an
     # exact catalog window (for example the Perplexity Agent route perplexity/sonar);
@@ -499,7 +487,7 @@ def normalize_capabilities(stored: dict[str, Any] | None, detected: dict[str, An
         inputs = normalized.get("input_modalities") or []
     legacy_vision_specified = "vision" in stored or isinstance(legacy_modalities, dict)
     if legacy_vision_specified:
-        vision = bool(stored.get("vision", normalized.get("vision"))) or "image" in inputs
+        vision = bool(stored["vision"]) if "vision" in stored else "image" in inputs
         normalized["vision"] = vision
         gates["image_input"] = {
             **gates["image_input"],
@@ -508,6 +496,18 @@ def normalize_capabilities(stored: dict[str, Any] | None, detected: dict[str, An
             "reason_code": None if vision else "provider_unsupported",
         }
     legacy_pdf_specified = isinstance(legacy_modalities, dict)
+    for feature in ("decisions", "structured_output", "prompt_caching"):
+        if feature in stored:
+            available = stored[feature] is True
+            normalized[feature] = available
+            if feature != "prompt_caching":
+                gates[feature] = {
+                    **gates.get(feature, {}),
+                    "available": available,
+                    "mode": "native" if available else "none",
+                    "reason_code": None if available else "provider_unsupported",
+                    "pricing_available": available,
+                }
     if legacy_pdf_specified:
         pdf_input = "pdf" in inputs
         gates["document_input"] = {
@@ -546,7 +546,7 @@ def normalize_capabilities(stored: dict[str, Any] | None, detected: dict[str, An
         isinstance(stored_web_search_gate, dict) and stored_web_search_gate.get("mode") == "native"
     )
     if legacy_web_search_specified or stored_native_web_search_gate:
-        native_available = _detected_native_web_search_available(detected)
+        native_available = detected.get("native_web_search_transport_supported") is True
         admin_disabled = (legacy_web_search_specified and not bool(stored["web_search"])) or (
             stored_native_web_search_gate and stored_web_search_gate.get("available") is False
         )
@@ -554,21 +554,22 @@ def normalize_capabilities(stored: dict[str, Any] | None, detected: dict[str, An
         gate = gates["web_search"]
         gates["web_search"] = {
             **gate,
-            "available": available,
-            "mode": "native" if available else "none",
+            "available": False,
+            "mode": "none",
             "reason_code": (
-                None
-                if available
-                else (gate.get("reason_code") if admin_disabled and gate.get("reason_code") else "provider_unsupported")
+                "pricing_unavailable" if available
+                else gate.get("reason_code") if admin_disabled and gate.get("reason_code") else "provider_unsupported"
             ),
-            "pricing_available": bool(gate.get("pricing_available")) and available,
+            "pricing_available": False,
         }
         normalized["web_search"] = available
-    web_search_gate = gates["web_search"]
-    normalized["web_search_required"] = (
-        bool(detected.get("web_search_required"))
-        and web_search_gate.get("available") is True
-        and web_search_gate.get("mode") == "native"
-    )
+    # Built-in search is an authorization floor, independent of optional tool gates/pricing.
+    normalized["web_search_required"] = detected.get("web_search_required") is True
+    if not normalized["decisions_transport_supported"]:
+        normalized["decisions"] = False
+        if "decisions" in gates:
+            gates["decisions"] = {
+                "available": False, "mode": "none", "reason_code": "provider_unsupported", "pricing_available": False,
+            }
     normalized["feature_gates"] = gates
     return normalized

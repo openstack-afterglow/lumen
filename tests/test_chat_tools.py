@@ -6,6 +6,9 @@
 - 미등록 툴/핸들러 예외 → 항상 안전한 문자열(예외 미전파).
 """
 
+import pytest
+
+pytestmark = pytest.mark.usefixtures("synthetic_inference_store")
 from lumen.services import conversation_store as cs
 from lumen.services.tool_runtime import dispatch as tool_runtime
 from lumen.services.tool_runtime import selection

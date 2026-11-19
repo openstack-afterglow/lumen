@@ -1,6 +1,6 @@
 """Register Lumen as an OpenStack SDK service."""
 
-from lumen_sdk.client import Client
+from lumen_sdk.client import AsyncClient, Client
 from lumen_sdk.service import LumenService
 
 __version__ = "0.2.1"
@@ -21,4 +21,4 @@ def register(conn):
     return conn.lumen
 
 
-__all__ = ["Client", "LumenService", "register"]
+__all__ = ["AsyncClient", "Client", "LumenService", "register"]

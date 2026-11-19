@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import AsyncIterator
+from contextlib import aclosing
 from typing import Any, Literal
 from urllib.parse import parse_qs
 
@@ -20,9 +21,11 @@ from lumen.api.compat.anthropic import (
     anthropic_protocol_headers,
 )
 from lumen.api.compat.streaming import events_with_ping
-from lumen.auth import Principal, require_api_key_scopes, require_token
+from lumen.auth import Principal, ensure_scopes, require_api_key_scopes, require_token
 from lumen.services import claude_gateway as gateway
 from lumen.services import completion_api as core
+from lumen.services.inference_authority import HOSTED_TOOL_CODE, completion_scopes, hosted_tool_message, hosted_tools
+from lumen.services.infrastructure.api_load import admit_sse, register_sse_resource
 
 public_router = APIRouter()
 internal_router = APIRouter()
@@ -137,6 +140,9 @@ async def authorize_device(
     body: GatewayAuthorizeBody,
     token_info: dict = Depends(require_token),
 ):
+    if token_info.get("credential_restricted"):
+        raise HTTPException(status_code=403, detail="Device credential approval requires an unrestricted human session")
+    ensure_scopes(token_info, "native:keys:write", *(gateway.GATEWAY_SCOPES if body.action == "approve" else ()))
     try:
         await gateway.enforce_rate_limit(
             "device-approval", f"{token_info['project_id']}:{token_info['user_id']}", limit=10
@@ -205,14 +211,22 @@ async def hello():
 
 
 @public_router.post("/v1/messages")
+@admit_sse
 async def messages(
     body: AnthropicMessagesRequest,
     request: Request,
     token_info: Principal = Depends(require_gateway_write),
 ):
+    request_body = body.model_dump(exclude_none=True)
+    if hosted := hosted_tools(request_body):
+        return anthropic_error_response(403, f"{hosted_tool_message(hosted)} ({HOSTED_TOOL_CODE})")
+    ensure_scopes(token_info, *completion_scopes(request_body))
     try:
         _model, resolved = await _resolved_gateway_model()
-        await core.precheck(token_info["user_id"], token_info["project_id"], api_key_id=token_info.get("api_key_id"))
+        # The server-side principal payer selects the bounded wallet hold; without it the call
+        # would fall back to an advisory precheck that parallel requests can overrun.
+        await core.precheck(token_info["user_id"], token_info["project_id"], api_key_id=token_info.get("api_key_id"),
+                            payer=token_info.get("payer"))
         options = body.model_dump(
             exclude={"model", "provider", "messages", "max_tokens", "stream"},
             exclude_none=True,
@@ -224,6 +238,7 @@ async def messages(
             user_id=token_info["user_id"],
             project_id=token_info["project_id"],
             api_key_id=token_info.get("api_key_id"),
+            payer=token_info.get("payer"),
             resolved=resolved,
             messages=body.messages,
             max_tokens=body.max_tokens,
@@ -237,19 +252,22 @@ async def messages(
 
     if not body.stream:
         return JSONResponse(result)
+    # The provider stream is already open; the SSE owner closes it even if the body never starts.
+    register_sse_resource(request, result)
 
     async def stream() -> AsyncIterator[str]:
-        try:
-            async for item in events_with_ping(result, ping_seconds=15):
-                if item is None:
-                    yield 'event: ping\ndata: {"type":"ping"}\n\n'
-                else:
-                    event_type = item.get("type", "message")
-                    payload = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
-                    yield f"event: {event_type}\ndata: {payload}\n\n"
-        except Exception:
-            payload = json.dumps(anthropic_error(502, "upstream model error"), separators=(",", ":"))
-            yield f"event: error\ndata: {payload}\n\n"
+        async with aclosing(events_with_ping(result, ping_seconds=15)) as events:
+            try:
+                async for item in events:
+                    if item is None:
+                        yield 'event: ping\ndata: {"type":"ping"}\n\n'
+                    else:
+                        event_type = item.get("type", "message")
+                        payload = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+                        yield f"event: {event_type}\ndata: {payload}\n\n"
+            except Exception:
+                payload = json.dumps(anthropic_error(502, "upstream model error"), separators=(",", ":"))
+                yield f"event: error\ndata: {payload}\n\n"
 
     return StreamingResponse(
         stream(),

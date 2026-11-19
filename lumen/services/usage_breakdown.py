@@ -12,6 +12,8 @@ Invariants:
 - ``uncached_input_tokens`` is derived and never negative.
 - When cache creation is known but its TTL split is missing, all of it is
   attributed to the 5 minute bucket (Anthropic's default TTL).
+- The persisted short/long slots also carry OpenAI's 30m/12h writes.
+  OpenAI write totals must have a consistent TTL split; never guess a TTL.
 - ``modality_tokens`` carries provider-REPORTED image/audio shares of those
   aggregates. A direction that is ``None`` was not reported; ``0`` was. A
   modality's ``input_tokens`` includes its own cache read. Cache creation is
@@ -109,6 +111,60 @@ def _split_creation(total: int | None, reported_1h: int | None, reported_5m: int
         return (reported_5m or 0), (reported_1h or 0)
     one_hour = min(reported_1h, total) if reported_1h is not None else 0
     return total - one_hour, one_hour
+
+
+def _openai_cache_writes(details: Any) -> tuple[int, int] | None:
+    """Return OpenAI short/long writes; reject ambiguous or inconsistent evidence."""
+    total = _reported(details, "cache_write_tokens")
+    split = _field(details, "cache_write_tokens_details")
+    if total is None and split is None:
+        return 0, 0
+    if not isinstance(total, int):
+        return None
+    if split is None:
+        return (0, 0) if total == 0 else None
+    if not isinstance(split, Mapping):
+        return None
+    short = _reported(split, "ttl_30m_tokens")
+    long = _reported(split, "ttl_12h_tokens")
+    if _MALFORMED in (short, long):
+        return None
+    short, long = short or 0, long or 0
+    return (short, long) if short + long == total else None
+
+
+def _legacy_cache_split(details: Any, total: int | None) -> tuple[int, int, bool]:
+    split = _field(details, "cache_creation_token_details")
+    if split is None:
+        split = _field(details, "cached_write_token_details")
+        short_key, long_key = "cached_write_tokens_5m", "cached_write_tokens_1h"
+    else:
+        short_key, long_key = "ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"
+    short, long = _reported(split, short_key), _reported(split, long_key)
+    if _MALFORMED in (short, long) or split is not None and not isinstance(split, Mapping):
+        return 0, 0, True
+    known = (short or 0) + (long or 0)
+    invalid = total is not None and (
+        known > total or short is not None and long is not None and known != total
+    )
+    return (*_split_creation(total, long, short), invalid)
+
+
+def _cache_writes(details: Any, creation: int | None, *, official_openai: bool = False) -> tuple[int, int, bool]:
+    raw_split = _field(details, "cache_write_tokens_details")
+    if official_openai or raw_split is not None or (
+        isinstance(details, Mapping) and "cache_write_tokens_details" in details
+    ):
+        writes = _openai_cache_writes(details)
+        return (*(writes or (0, 0)), writes is None or creation is not None)
+    total = _reported(details, "cache_write_tokens")
+    if total is _MALFORMED:
+        return 0, 0, True
+    if total is None:
+        total = _reported(details, "cached_write_tokens")
+        if total is _MALFORMED:
+            return 0, 0, True
+    return _legacy_cache_split(details, creation if creation is not None else total)
 
 
 def _sum_optional(left: int | None, right: int | None) -> int | None:
@@ -446,24 +502,13 @@ class UsageBreakdown:
         creation = _count(_field(details, "cache_creation_tokens"))
         if creation is None:
             creation = _count(_field(usage, "cache_creation_input_tokens"))
-        if creation is None:
-            creation = _count(_field(details, "cache_write_tokens"))
-        split = _field(details, "cache_creation_token_details")
-        reported_1h = _count(_field(split, "ephemeral_1h_input_tokens"))
-        reported_5m = _count(_field(split, "ephemeral_5m_input_tokens"))
-        five_minute, one_hour = _split_creation(creation, reported_1h, reported_5m)
+        five_minute, one_hour, invalid_writes = _cache_writes(details, creation)
         counters = (
             _field(details, "cached_tokens"), _field(usage, "cache_read_input_tokens"),
             _field(details, "cache_creation_tokens"), _field(usage, "cache_creation_input_tokens"),
-            _field(details, "cache_write_tokens"),
-            _field(split, "ephemeral_1h_input_tokens"), _field(split, "ephemeral_5m_input_tokens"),
         )
-        invalid = invalid or any(value is not None and _count(value) is None for value in counters)
+        invalid = invalid or invalid_writes or any(value is not None and _count(value) is None for value in counters)
         invalid = invalid or (read or 0) + five_minute + one_hour > prompt_tokens
-        if creation is not None:
-            invalid = invalid or (reported_1h or 0) + (reported_5m or 0) > creation
-            if reported_1h is not None and reported_5m is not None:
-                invalid = invalid or reported_1h + reported_5m != creation
         base = cls.from_totals(
             prompt_tokens,
             completion_tokens,
@@ -517,7 +562,7 @@ class UsageBreakdown:
         )
 
     @classmethod
-    def from_responses(cls, usage: object) -> UsageBreakdown | None:
+    def from_responses(cls, usage: object, *, official_openai: bool = False) -> UsageBreakdown | None:
         """Read raw OpenAI Responses usage, where ``input_tokens`` INCLUDES cached tokens."""
         if not isinstance(usage, Mapping):
             return None
@@ -529,18 +574,33 @@ class UsageBreakdown:
             output = _count(usage.get("output_tokens"))
             if input_tokens is None or output is None:
                 return None
+            total = _reported(usage, "total_tokens")
+            if total is _MALFORMED or (total is not None and total != input_tokens + output):
+                return None
         details = usage.get("input_tokens_details")
-        cached = _count(details.get("cached_tokens")) if isinstance(details, Mapping) else None
-        base = cls.from_totals(input_tokens, output, cache_read_input_tokens=cached or 0)
+        cached = _reported(details, "cached_tokens")
+        short, long, invalid_writes = _cache_writes(details, None, official_openai=official_openai)
+        invalid = (
+            details is not None and not isinstance(details, Mapping)
+            or cached is _MALFORMED
+            or invalid_writes
+        )
+        read = cached if isinstance(cached, int) else 0
+        invalid = invalid or read + short + long > input_tokens
+        base = cls.from_totals(
+            input_tokens, output, cache_read_input_tokens=read,
+            cache_creation_5m_input_tokens=short, cache_creation_1h_input_tokens=long,
+        )
         if iteration_totals is not None:
             # Top-level details do not cover the compaction iteration: modality shares are unknown.
-            return base
+            return replace(base, modality_usage_invalid=invalid or bool(short or long))
         cached_split = _field(details, "cached_tokens_details")
         return cls._with_reported(
             base,
             cls._openai_details(details),
             cls._openai_details(usage.get("output_tokens_details")),
             cls._openai_details(cached_split) if cached_split is not None else None,
+            invalid=invalid,
         )
 
     @classmethod
@@ -767,6 +827,11 @@ def modality_token_charges(
     breakdown: UsageBreakdown,
     token_rates: object,
     required: Iterable[str] = (),
+    *,
+    base_text_rates: Mapping[str, Decimal | None] | None = None,
+    token_rates_above_200k: object = None,
+    token_rates_follow_text: bool = False,
+    above_threshold: bool = False,
 ) -> tuple[UsageBreakdown, list[ModalityCharge]]:
     """Split modality-priced tokens off an aggregate and return the text residual.
 
@@ -776,22 +841,39 @@ def modality_token_charges(
     aggregate-only billing always did. Invalid reported usage, an unreported
     ``required`` direction or a required direction without a rate raises
     ``ValueError``. Without rates and requirements the breakdown is unchanged.
+
+    With catalog-origin ``token_rates_follow_text``, a whole modality bucket
+    equivalent to the base text/cache rates remains text, so the caller's text
+    tier also prices that share. Validate its usage and required rates first.
+    Explicit modality tiers override only their supplied fields above the
+    caller's frozen threshold. Manual flat rates never inherit text tiers.
+    ``base_text_rates`` maps input/output/cache_read to per-token Decimal rates;
+    modality maps retain their configured per-million units.
     """
-    if token_rates is None:
-        token_rates = {}
-    if not isinstance(token_rates, Mapping) or set(token_rates) - set(MODALITIES):
-        raise ValueError("token rates are invalid")
-    rates: dict[str, dict[str, Decimal]] = {}
-    for name, fields in token_rates.items():
-        if not isinstance(fields, Mapping) or set(fields) - set(TOKEN_RATE_FIELDS):
+    def parsed_rates(value: object) -> dict[str, dict[str, Decimal]]:
+        if value is None:
+            return {}
+        if not isinstance(value, Mapping) or set(value) - set(MODALITIES):
             raise ValueError("token rates are invalid")
-        rates[name] = {key: _rate(value) for key, value in fields.items()}
+        result: dict[str, dict[str, Decimal]] = {}
+        for name, fields in value.items():
+            if not isinstance(fields, Mapping) or set(fields) - set(TOKEN_RATE_FIELDS):
+                raise ValueError("token rates are invalid")
+            result[name] = {key: _rate(rate) for key, rate in fields.items()}
+        return result
+
+    base_rates = parsed_rates(token_rates)
+    tier_rates = parsed_rates(token_rates_above_200k)
+    rates = {
+        name: {**base_rates.get(name, {}), **(tier_rates.get(name, {}) if above_threshold else {})}
+        for name in set(base_rates) | set(tier_rates)
+    }
     required = tuple(required)
     if any(item not in MODALITY_DIRECTIONS for item in required):
         raise ValueError("unknown required token modality")
     if not any(rates.values()) and not required:
         return breakdown, []
-    if breakdown.modality_usage_invalid:
+    if breakdown.modality_usage_invalid or not _modalities_consistent(breakdown, breakdown.modality_tokens):
         raise ValueError("provider modality usage is invalid")
     for item in required:
         modality, direction = item.rsplit("_", 1)
@@ -807,11 +889,18 @@ def modality_token_charges(
         modality_rates = rates.get(modality, {})
         tokens = breakdown.modality_tokens.get(modality, ModalityTokens())
         input_rate = modality_rates.get("input_per_million")
+        cached = tokens.cache_read_input_tokens
+        cache_rate = modality_rates.get("cache_read_per_million")
+        if input_rate is not None and tokens.input_tokens is not None and cached and cache_rate is None:
+            raise ValueError(f"{modality} cache read token rate is unavailable")
+        # Equal-rate buckets still require valid observed cache rates.
+        base = base_rates.get(modality, {})
+        text_equivalent = token_rates_follow_text and bool(base) and base_text_rates is not None and all(
+            rate == base_text_rates.get(key.removesuffix("_per_million")) for key, rate in base.items()
+        )
+        if text_equivalent and not (above_threshold and tier_rates.get(modality)):
+            continue
         if input_rate is not None and tokens.input_tokens is not None:
-            cached = tokens.cache_read_input_tokens
-            cache_rate = modality_rates.get("cache_read_per_million")
-            if cached and cache_rate is None:
-                raise ValueError(f"{modality} cache read token rate is unavailable")
             charges.append(ModalityCharge(f"{modality}_input", tokens.input_tokens - cached, input_rate))
             charges.append(ModalityCharge(f"{modality}_cache_read", cached, cache_rate or Decimal("0")))
             text_input -= tokens.input_tokens

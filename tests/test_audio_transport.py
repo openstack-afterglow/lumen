@@ -34,8 +34,32 @@ def _route(provider="openai", model="whisper-1", kind="stt", pricing=None):
 def _mock(monkeypatch, handler):
     client = httpx.AsyncClient
     monkeypatch.setattr(audio_transport.httpx, "AsyncClient", lambda **kwargs: client(
-        transport=httpx.MockTransport(handler), **kwargs,
+        **{**kwargs, "transport": httpx.MockTransport(handler)},
     ))
+
+
+@pytest.mark.asyncio
+async def test_gpt_transcribe_uses_the_file_endpoint_with_duration_pricing_and_plain_json(monkeypatch):
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        # Live shape (2026-11-10): the model reports audio duration, never tokens.
+        return httpx.Response(200, json={"text": "The blue lantern is on the table.",
+                                         "usage": {"type": "duration", "seconds": 2}})
+
+    _mock(monkeypatch, handle)
+    route = _route(model="gpt-transcribe", pricing={"audio_per_minute": "0.0045"})
+    assert audio_transport.validate_audio_request(route, kind="stt", format="audio/wav") == Decimal("0.000075")
+    assert audio_transport.audio_route_ready(route)
+    result = await audio_transport.transcribe_audio(route, data=_wav(), mime_type="audio/wav")
+    assert result.text == "The blue lantern is on the table."
+    assert result.segments is None
+    (request,) = requests
+    assert request.url == "https://api.openai.com/v1/audio/transcriptions"
+    assert b'name="model"' in request.content and b"gpt-transcribe" in request.content
+    assert b"verbose_json" not in request.content
+    assert audio_transport.available_timestamp_granularities(route) == []
 
 
 @pytest.mark.asyncio
@@ -261,6 +285,7 @@ def _token_route(*, provider="openai", kind="stt", envelope="0.1"):
 
 @pytest.mark.parametrize("kind,provider,model", [
     ("tts", "openai", "tts-1"), ("tts", "openai", "gpt-4o-mini-tts"), ("stt", "openai", "whisper-1"),
+    ("stt", "openai", "gpt-transcribe"),
 ])
 @pytest.mark.asyncio
 async def test_known_duration_only_audio_rejects_tokens_before_io(monkeypatch, kind, provider, model):
@@ -555,6 +580,7 @@ async def test_unsupported_or_invalid_timestamp_requests_fail_before_network(mon
     _mock(monkeypatch, lambda request: calls.append(request) or httpx.Response(200, json={"text": "x"}))
     unsupported = [
         _route(model="gpt-4o-transcribe"),
+        _route(model="gpt-transcribe", pricing={"audio_per_minute": "0.0045"}),
         _route(model="gpt-4o-mini-transcribe"),
         _route(provider="gemini", model="gemini-2.5-flash", pricing={"audio_input_per_second": "0.0001"}),
     ]

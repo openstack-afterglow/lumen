@@ -1,5 +1,137 @@
 # 운영 가이드
 
+## Agent Vault cutover (040)
+
+Migration 040 changes the chat-memory writer and vector source; never run a pre-040 writer alongside a Vault worker. Drain existing runs, stop old writers, take an encrypted backup, apply the manifest-verified migration, and start the new online-text worker. Keep admission closed until the legacy-memory import has caught up. Use the metadata-only query `SELECT vault_migration_status, COUNT(*) FROM chat_memories GROUP BY vault_migration_status` to inspect progress; NULL rows are pending or waiting for directory, encryption-key, or disabled-origin recovery. A missing or invalid `LUMEN_ENCRYPTION_KEY` pauses the whole batch and logs an error; it never seals rows. Rows whose project or domain is disabled are rechecked every 15 minutes and import automatically after re-enablement. Missing origins, unowned or deleted workspaces, malformed rows and credential-shaped content are not imported. Do not collapse them into global notes or expose their ciphertext.
+
+Inside a worker container, `python -m lumen.services.vault_migration status` prints read-only JSON without memory content or user IDs: row counts by sealed status (`pending` means NULL), pending rows split into `due` and `deferred`, and the origin project IDs of deferred rows with counts and next attempt time. Verify those project IDs against Keystone before reopening admission. No column stores why a row was deferred; each import batch logs one warning per origin and reason: `vault_import_deferred project_id=<id|-> reason=<reason> rows=<count> retry_after_seconds=<seconds>`. Reasons and retry delays: `origin_disabled` (15 minutes, the project or domain is disabled), `origin_unresolved` (60 minutes, Keystone returned inconsistent project or domain identity; operator attention needed), `directory_unavailable` (1 minute) and `decrypt_failed` (5 minutes; check the encryption key). Per-row memory IDs are logged only at debug level.
+
+The importer is idempotent, retains original legacy rows, and assigns new Vault records IDs at or above 2^40 to avoid colliding with imported vector IDs. Semantic recall catches up through the configured vector outbox after SQL import. Rolling back old code after Vault accepts writes would hide those writes; preserve both the Vault and legacy tables and reconcile explicitly before reopening traffic.
+
+Provision one random shared value of at least 32 UTF-8 bytes in Kolla passwords as `lumen_afterglow_ingress_secret`; the Lumen API container receives `LUMEN_AFTERGLOW_INGRESS_SECRET`. Configure the same value in Afterglow's server-side signer. Keep the API-to-BFF transport private or protected by TLS and never expose or log the signer header. Absent or short configuration disables `/v1/vault`, `/v1/memories`, and Vault context and tools in new runs without disabling ordinary chat. Drain admitted Vault runs before emergency key removal or replacement.
+
+The BFF signs the exact forwarded request using `X-Lumen-Ingress: v1:<timestamp>:<lowercase-hex-HMAC-SHA256>`. The message is UTF-8 newline-joined fields: `v1`, Unix seconds, uppercase method, raw forwarded path without its query, lowercase SHA-256 hex of the lone `X-Auth-Token` value, `X-Project-Id` or empty, and `X-Target-Project-Id` or empty. Lumen accepts an absolute time skew of at most 120 seconds. Send no bearer or API-key headers on this path; do not trust a client-supplied ingress header.
+
+**Degraded window with an unsigned BFF (Afterglow 1.32.28).** Lumen 0.6.21 is deployed before Afterglow 1.32.29. Until the new BFF signs requests, every dashboard request arrives without a valid `X-Lumen-Ingress`: `/v1/vault/*` and `/v1/memories*` return 403 `vault_ingress_unverified`, and new dashboard runs are admitted without `vault_ingress_verified`, so they get no Vault context, memory recall, post-run memory extraction or Vault tools. Ordinary dashboard chat, domain billing and API keys keep working. Runs admitted in this window stay without memory after the BFF upgrade; only runs admitted afterwards gain it. Keep the window short and announce that memory is temporarily unavailable; the same state applies whenever the secret is absent or mismatched between Lumen and Afterglow.
+
+## 0.6.20 롤아웃 메모
+
+- **Migration:** 없음. 최신 ledger는 035이며 `lumen-migrate` 상태가 깨끗해야 한다.
+- **순서:** 0.6.19와 같다. API admission 차단 → worker drain(실행 중 run 0 확인, 실패 시 중단) → worker 정지 → 암호화 백업 → `--tags lumen --skip-tags haproxy` reconfigure → 새 API·worker cohort 확인. 공식 OpenAI 텍스트 호출은 이제 무상태 예약(034 테이블)을 쓰므로 혼합 cohort로 오래 두지 않는다.
+- **카탈로그 추종 전환:** 운영 OpenAI 행 중 수동 단가가 카탈로그와 같아 장문 구간·12시간 캐시 쓰기 단가를 가리는 GPT-6.2 행과, billing basis 없는 불완전한 수동 이미지 단가가 남은 GPT Image 행은 배포 후 가격 필드를 null로 PATCH해 카탈로그를 따르게 한다. 저장값이 확인한 값과 정확히 같을 때만, 같은 행 잠금 안에서 비교한 뒤 바꾼다. 실제 관리자 override는 보존한다.
+- **행동 변화:** 공식 OpenAI 텍스트 호출은 요청 크기 기반 상한을 먼저 예약하므로 잔액이 부족하면 거절될 수 있다. 예약이 있는 공식 OpenAI 모델의 `/v1/messages`는 거절된다. `service_tier`는 `default`/`auto`만 허용한다. `gpt-transcribe` 실시간 전사는 파일 STT 행과 같은 모델 이름이므로 별도 OpenAI 공급자 행에 `realtime` 종류와 가격을 등록해야 노출된다.
+- **대시보드:** Afterglow 1.32.27의 OpenAI Image/Realtime Studio 확장은 0.6.20 capabilities에 의존한다. Lumen을 먼저 배포한다.
+- 2026-11-18 11:18:13–11:19:16 UTC에 DMS Lab에서 실행했다. Sandbox runtime은 계속 꺼 뒀다. 롤백 핀과 전체 컨테이너 수신증은 `/etc/kolla/.afterglow-rollout-backups/lumen-0.6.20-20261118T111551Z`, 암호화 DB 백업은 `/var/backups/lumen/pre-v0.6.20-20261118T111551Z`에 있다. 행 139·142·97·99의 카탈로그 추종 전환과 실행·과금 수신증은 `docs/testing.md`를 참조한다.
+
+## 0.6.19 롤아웃 메모
+
+- **Migration:** 없음. 최신 ledger는 035이며 `lumen-migrate` 상태가 깨끗해야 한다.
+- **순서:** API admission 차단 → worker drain(실행 중 run 0 확인, 실패 시 중단) → worker 정지 → 백업 → `--tags lumen --skip-tags haproxy` reconfigure → 새 API·worker cohort 확인. 무상태 Decisions 예약(034)은 이전·새 writer가 같은 테이블을 공유하므로 혼합 cohort로 오래 두지 않는다.
+- **Gemini Decisions 등록:** 배포 후 공식 Gemini API 키 공급자에 `gemini-decision-1`을 `model_kind=decision`으로 등록한다. 가격은 native catalog(입력 $0.10/1M)를 쓰며 관리자 수동 단가가 있으면 그것이 우선한다. 일반 채팅·호환·embedding·media 목록에는 나타나지 않고 `model_kind=decision` 목록과 `/v1/chat/decisions`, `/v1beta/decisions`에서만 쓴다.
+- **대시보드:** Afterglow Decision Studio의 Gemini 편집기는 capabilities 조회에 `model_kind=decision`을 보내므로 0.6.19 이전 Lumen에서는 "Lumen 업데이트 필요" 상태가 된다. Lumen을 먼저 배포한다.
+- 2026-11-18 07:21:14–07:22:18 UTC에 DMS Lab에서 실행했다. Sandbox runtime은 계속 꺼 뒀다. 롤백 핀과 전체 컨테이너 수신증은 `/etc/kolla/.afterglow-rollout-backups/lumen-0.6.19-20261118T071821Z`, 암호화 DB 백업은 `/var/backups/lumen/pre-v0.6.19-20261118T071821Z`에 있다. 실행·과금 수신증은 `docs/testing.md`를 참조한다.
+
+## 0.6.18 롤아웃 메모
+
+먼저 운영 DB에서 읽기 전용 사전 조회를 실행한다.
+
+```sql
+SELECT COUNT(*) FROM chat_mcp_servers WHERE scope='domain' AND owner_domain_id IS NULL;
+```
+
+결과가 0이 아니면 전환을 중단하고 소유 도메인을 운영자와 확인한다. 035는 위반 행을 자동 수정·삭제하지 않는다. MariaDB 11.4는 기존 행도 검사하며, 위반 시 `ck_chat_mcp_servers_domain_owner` 오류로 ALTER를 거부한다.
+
+순서: admission 차단 → 기존 실행·worker drain → writer 정지 → 백업 → 새 패키지의 `lumen-migrate --apply`로 035 적용 → 새 API·worker cohort 기동. 035는 새 writer보다 먼저 적용해야 한다. manifest checksum과 ledger를 사용하며, 적용된 SQL 수정이나 수동 ledger 삽입으로 우회하지 않는다. CHECK는 조직 행의 NULL 소유 도메인만 금지하며 개인·전역 행은 그대로 허용한다.
+
+Kolla 전환에는 항상 `--tags lumen --skip-tags haproxy`를 사용한다. 선택형 sandbox 활성화는 같은 drain된 전환에 묶되 별도 승인된 mTLS·고정 worker·기존 cluster/pool·정확한 image/manifest qualification을 먼저 완료한다.
+
+### 0.6.18 운영 반영 기록 (2026-11-18 UTC)
+
+- 준비: `/etc/kolla/pyproject.toml`의 `lumen` tag만 0.6.18로 바꾸고(`uv sync` dry-run 1 package), `globals.d/zzz-lumen-0.6.17.yml`을 `zzz-lumen-0.6.18.yml`(api `sha256:ed9bf22b…`, worker `sha256:94ebf64a…`, controller `sha256:5b6862cd…`, ClamAV·media·protocol 2 유지, runtime 설정 없음)로 교체했다. `pull`·`prechecks` rc0.
+- 전환(05:28 UTC): API 정지 → drain 검사(fail-closed: 비종료 run 0, model-call `reserved` 0, 무상태 예약 `reserved`/`unknown` 0) → worker 정지 → 035 위반 행 0을 단언한 뒤 암호화 백업 `/var/backups/lumen/pre-v0.6.18-20261118T051218Z`(MariaDB 67 tables, PostgreSQL dump 헤더 확인; 비밀값은 예측 불가 `mktemp -d` tmpfs 디렉터리에만 두고 종료 시 삭제) → `kolla-ansible reconfigure -i /etc/kolla/multinode --tags lumen --skip-tags haproxy` rc0(05:28:50–05:29:56, failed 0).
+- 결과: API/worker 새 digest·`0.6.18`·protocol 2·restarts 0, ledger에 `035-mcp-domain-owner-check`, `ck_chat_mcp_servers_domain_owner` 존재, 직접·공개 ready 200, ClamAV 그대로. Census 차이는 컨트롤러마다 `lumen_api`·`lumen_worker` 교체뿐이고 VIP·보호 설정 해시·runtime=false는 그대로다. 백업·census는 `/etc/kolla/.afterglow-rollout-backups/lumen-0.6.18-20261118T051218Z`.
+- 롤백 자료: 035는 additive CHECK다. 0.6.17로 되돌릴 때 CHECK를 지울 필요는 없다(0.6.17도 domain 행에 소유 도메인을 채운다).
+
+### 선택형 sandbox 활성화 보류 (2026-11-18)
+
+격리(gVisor RuntimeClass, PID 256, 기본 차단 CNI, controller·고정 worker mTLS, `list_owned` 2→1→0, 실행 간 파일·권한 격리)는 실제 cluster에서 확인했다. 그러나 gVisor 0.5/1.0 CPU에서 Markitdown 초기화가 6.5초~60초 이상으로 들쭉날쭉해(1.0 CPU에서도 60초 startup deadline 초과 관측) 첫 호출이 자주 실패하고, Playwright는 페이지 내용 증거를 얻지 못했다. 그래서 runtime을 켜지 않았다. 후속 조건: agent node의 gVisor rootfs/overlay/directfs 설정(노드 변경이므로 별도 승인), 또는 이미지 import 그래프 축소, 그리고 실제 Playwright 페이지 내용 증거. 같은 프로세스 그룹에서 `setsid`로 빠져나간 하위 프로세스는 재시작 fence가 확인하지 않으며, per-run Pod 경계(PID 256, 수명, 종료 시 삭제)로만 제한된다.
+
+## Gemini Decisions operations
+
+1. Use an active `gemini` provider with its official Gemini Developer API base and a
+   Gemini API-key credential. Use discovery to locate `gemini-decision-1` and confirm
+   `createDecision` in the generation methods. Discovery shows account visibility,
+   not an executable or paid request. Do not use a proxy base or subscription key.
+2. Store the model as `gemini/gemini-decision-1` with `model_kind="decision"`.
+   If the row already exists, explicitly change its kind.
+   Only the effective input price is required. Leave the stored input price null
+   to follow the official catalog, or set a deliberate per-million USD override.
+   Leave output, cache, and media rates unset. Do not treat an absent effective price
+   as free. No automatic model creation or reclassification occurs.
+3. Check the secret-free registered route and the explicit native
+   `GET /v1/chat/models?model_kind=decision` projection before enabling Decision Studio.
+   Use `lumen/<provider_id>/<model_id>` to target the exact row. Verify that the row
+   does not appear on ordinary chat, compat, CLI, embeddings, or media lists. Allow
+   20 MiB (20,971,520 bytes) for the Gemini Decisions request at each intended ingress
+   and BFF hop; inline base64 counts toward the cap. Do not relax unrelated route limits.
+
+The Gemini change adds no migration. It requires the existing migration 034 and a
+quota-writer cohort that counts stateless reservations. Do not enable new admission
+against quota writers that ignore those holds. To roll back, stop Decisions admission,
+drain in-flight calls, and preserve reservations and ledger events.
+
+For every Gemini call, the shared wallet admission reserves 262,144 input tokens at
+the frozen effective route price (stored input price before catalog). At the official
+[$0.10 per million input tokens](https://aistudio.google.com/docs/pricing#gemini-decision),
+the full-context bound is $0.0262144 before any local credit conversion. This is a
+quota reservation, not a flat charge or an image estimate. The
+[Decisions API](https://aistudio.google.com/docs/decisions-api) documents the context
+and image resolution labels. The
+[general media-resolution table](https://aistudio.google.com/docs/media-resolution#token-counts)
+does not establish token counts or a default for Decision 1. An omitted resolution
+is forwarded without a Lumen-supplied default.
+
+Lumen settles only validated provider input counts (with modality breakdown), zero
+output, and consistent totals within the context bound. Trusted usage remains settled
+if malformed answers cause a 502. Definite no-send failures and upstream
+400/401/403/404/413/415/422/429 rejections release the reservation; a possible send
+with missing, inconsistent, excessive, or otherwise untrusted usage does not. Do not
+automatically repeat a failed or uncertain call. The direct transport makes one
+attempt with one overall deadline. Inputs, image URLs, answers, credentials, and raw
+provider errors do not belong in logs or in reconciliation notes.
+
+For `unknown` or crash-left `reserved` rows, follow the existing
+[Decisions disposition procedure](api-reference.md#응답과-정산): correlate the event UUID
+with provider usage evidence before any settlement or definite-no-charge release.
+There is no automatic expiry or disposition endpoint.
+
+OpenSpec defines local contract, ASGI, fake-upstream HTTP, and real-MariaDB verification
+scenarios. Defined scenarios are not passing test receipts. An actual release,
+deployment, or paid-provider smoke call needs separate evidence.
+
+## 0.6.17 롤아웃 메모
+
+- **Migration:** 033(MCP domain scope)과 034(`chat_stateless_call_reservations`)는 새 API/worker를 기동하기 전에 적용한다. 둘 다 additive이지만 기존 writer는 무상태 예약을 quota에 반영하지 않으므로, 새 Decisions admission과 기존 writer가 quota를 공유하며 함께 돌면 안 된다. 순서는 admission 중지·worker drain → 백업 → migrate → 새 cohort 기동이다.
+- **Protocol v2:** 같은 API·worker cohort에서 함께 켠다. Worker 등록은 {1,2}를 광고하므로 drain 없이 섞지 않는다. v2에서 대기 중인 승인이 있으면 v1로 되돌릴 수 없다.
+- **ClamAV:** `enable_lumen_clamav: true`, `lumen_clamav_host`는 비운다. Host network, `127.0.0.1:3310`, 서명 신선도·PING·VERSION 확인 전에는 API/worker가 기동하지 않는다.
+- **Kolla reconfigure:** 항상 `--skip-tags haproxy`를 붙인다.
+- **네이티브 카탈로그:** 공식 endpoint 모델 중 저장 단가가 없는 행은 배포 즉시 카탈로그 단가로 과금된다. 운영 전후 표(Gemini 이미지·일부 텍스트, `gpt-image-1.5`·`gpt-image-2`, Perplexity `glm-5.3-flash`·`kimi-k3` 등)를 확인한 뒤 배포한다. 현재 rate card에 없는 Perplexity 모델 5개는 계속 미가격이다. 사용자 지정 base의 호환 공급자는 관리자 단가가 필수다. Perplexity Sonar는 provider 내장 검색을 계속 수행하며 검색 수수료는 아직 청구하지 않는다(기존 한계). 공급자 기본 웹 검색 gate는 수수료를 청구할 수 있을 때까지 닫혀 있다.
+- **운영자 레지스트리 정리(명시적 편집):** `stt`로 잘못 저장된 OpenAI 실시간 전사 모델은 `realtime`으로 바꾸고 잘못된 수동 단가를 지워 카탈로그 `realtime_input_per_minute`가 적용되게 한 뒤, 공급자 계정이 호출 가능할 때 활성화한다. 자동 SQL 변경은 하지 않는다.
+- **Decisions:** 공식 지원 모델은 `gpt-6-luna`(카탈로그 `decisions=true`). 불확실한 무상태 예약은 명시적 처분 전까지 quota에 남는다. 처분 API는 없으며 event UUID와 공급자 사용 증거를 대조한 뒤 유지보수 절차로만 정산·해제한다.
+- **Sandbox runtime:** 최종 0.6.17 sandbox 이미지·manifest digest와 mTLS 검증 전에는 `lumen_runtime_enabled: false`를 유지한다.
+- **ClamAV 포트:** 고정 이미지의 기본 `clamd.conf`에 `TCPSocket 3310`이 이미 활성이어서 `CLAMD_CONF_TCPSocket`은 중복 줄로만 붙고 clamd는 첫 값(3310)을 쓴다. 그래서 관리형 모드의 precheck는 `lumen_clamav_port == 3310`을 강제한다. 다른 포트가 필요하면 외부 검사기를 쓴다.
+
+### 0.6.17 운영 반영 기록 (2026-11-17 UTC)
+
+- 사전 검증: 세 컨트롤러에 고정 ClamAV 이미지를 받고 `lumen_clamav_signatures` 볼륨을 freshclam으로 채운 뒤(daily 28186), 역할과 같은 설정의 임시 컨테이너가 약 20초 안에 `127.0.0.1:3310`에서 PONG·VERSION을 반환함을 확인하고 정리했다(약 957MiB/4GiB).
+- 전환: `/etc/kolla/pyproject.toml`의 `lumen` tag만 0.6.17로 바꾸고 `uv lock --upgrade-package lumen`, `uv sync --inexact --no-install-package waygate`. `globals.d/zzz-lumen-0.6.17.yml`(세 digest, `enable_lumen_clamav: true`, `lumen_media_enabled: true`, protocol 2). `pull`·`prechecks` rc0 → API 정지 → 실행 59건 종료·예약 0 → worker 정지 → 암호화 백업 `/var/backups/lumen/pre-v0.6.17-20261117T194444Z` → `kolla-ansible reconfigure -i /etc/kolla/multinode --tags lumen --skip-tags haproxy` rc0(약 83초).
+- 결과: API/worker 새 digest·restarts 0·protocol 2, `lumen_clamav` healthy, 직접·공개 ready 200, census 차이는 Lumen 컨테이너뿐. 운영 스모크와 OpenAI 크레딧 소진 진단은 `docs/testing.md`의 같은 날짜 절에 있다.
+- 롤백 자료: 설정 백업과 전후 census는 `/etc/kolla/.afterglow-rollout-backups/lumen-0.6.17-20261117T194444Z`. 033·034는 additive이며, v2 대기 승인이 생긴 뒤에는 v1로 되돌리지 않는다.
+
+## 0.6.16 텍스트 임베딩 롤아웃 메모
+
+0.6.16에는 새 migration이 없다. `llm_models.model_kind`의 기존 `VARCHAR(16)`이 `embedding`을 저장한다. API/worker 이미지를 교체한 뒤 관리자 화면 또는 `python -m lumen.scripts.seed_providers`(`LUMEN_BOOTSTRAP_MODELS_JSON`에 정확한 입력 단가 제공)로 임베딩 모델을 등록해야 `/v1/embeddings`, `/v1beta/models/*:embedContent|batchEmbedContents`, `/v1/chat/embeddings`가 모델을 노출한다. 입력 단가가 없으면 해당 route는 가격 gate(`pricing_available=false`)로 닫힌다. Afterglow Embedding Studio는 이 Lumen이 먼저 배포된 뒤에만 `/chat/models?model_kind=embedding`을 호출할 수 있으므로 Lumen을 먼저 배포한다. 실제 공급자 호출, vendor 청구서 대조, 운영 롤아웃은 작성 시점에 검증하지 않았다.
+
 ## 기동과 readiness
 
 source checkout에서 service CLI를 실행하려면 먼저 `uv sync --extra service --locked`로 runtime dependency를 설치한다. `pyproject.toml`과 `uv.lock`이 다르면 중단하며, 의도한 dependency 변경은 개발 단계에서 lock을 갱신한 뒤 검증한다.
@@ -10,6 +142,82 @@ source checkout에서 service CLI를 실행하려면 먼저 `uv sync --extra ser
 4. `uv run lumen-worker`를 하나 이상 실행한다. managed runtime을 활성화했다면 전용 `uv run lumen-controller`를 시작하고 admin inventory에서 pool/resource 상태를 확인한다. `/v1/ready`만으로 worker/controller/cloud 가동 여부는 알 수 없다.
 
 `docker/Dockerfile`은 migration을 자동 실행하지 않는다. migration 누락 상태로 새 API/worker를 기동하지 않는다.
+## 0.6.15 release boundary
+
+0.6.15 was deployed to the API and worker on all three production controllers on 2026-11-13 KST, using pinned OCI indexes and revision `9f2d4e5431f00583f4053c7c8b7d4e5fc22435de`. Direct and public readiness returned 200. A disposable key completed a native text run and returned 401 after revocation. No real cloud-tool or grant reissuance was tested. Configuration backup: `/etc/kolla/lumen-0615-backup-20261112T171428Z/`; active pins: `/etc/kolla/globals.d/zzz-lumen-0.6.15.yml`. These explicit pins override role defaults and must be updated for the next release; without an explicit image tag, the Afterglow resolver falls back to `latest`.
+The first host's Kolla `--tags lumen` reconfigure also recreated HAProxy, ProxySQL and keepalived with newer Kolla image IDs than the other controllers. They recovered and public Lumen and Afterglow health returned 200; failover was not exercised. Their mounts and environment values match controller2. Comparing config inventories, 96 files match; main HAProxy config differs by local controller IP, ProxySQL's mysql_ifaces uses local controller IP, and controller1 alone has a pre-existing `wireguard.cfg` dated 2025-08-26. HAProxy config validation passed on all three. Mixed load-balancer image versions require operator review. Subsequent host reconfigures used `--skip-tags haproxy` and preserved those containers. Bootstrap migration and provider seeding ran through the normal role; no migration was added in this release.
+
+The 0.6.14 section below records the original pre-rollout plan; its historical production-version statement is superseded by the observation above.
+
+
+## 0.6.14 release boundary
+
+0.6.14 (annotated tag `0.6.14` on dev merge `77c4b127b44c285f373525c86155c6d8ce99ab76`, published 2026-11-10, not deployed) adds OpenAI media/realtime model coverage, the admission/wallet/refusal fixes, bootstrap schema repair and dev's MCP registry work. Production is at 0.6.13 with the ledger at 028, so a rollout applies migrations 029, 030 and 031 in order before the API starts; 030 aborts with 1062 on duplicate `chat_runs` idempotency keys (0 found on 2026-11-10) and the schema repair is default deny. Image and wheel digests are in CHANGELOG 0.6.14.
+
+## 0.6.13 standard-role release boundary
+
+Candidate0.6.13 is scoped from current remote dev c4527de / published0.6.12, not the separate dirty release/lumen-0.6.5 checkout. It changes native role defaults and actual OpenID classification only. It does not include Pi, CHAT3/durable4, historical account027 rewrites, dependency changes or new SQL. Published Kubernetes027 and forward028, existing Bifrost binary, protocol1/2 and SDK/plugin/sandbox versions remain byte-compatible.
+
+Relative to a fully migrated0.6.12 cohort there is no new migration. Older installations still require all existing schema/028 and credential-provenance prerequisites below. Preserve original SQL/Redis/PostgreSQL endpoints, encryption keys, provider credentials and pending/unknown journals; normal drain and matching API/online-worker/batch-worker/controller/bootstrap replacement remain mandatory. Inventory operator policy files/directories on every host and guest: absent YAML uses new defaults; existing grade-only overrides must be deliberately replaced/narrowed, never silently rewritten. No native IAM grants are added or removed, and existing key scope lists never expand.
+
+The canonical package/image workflows now accept numeric `X.Y.Z` and historical `vX.Y.Z` tags, enforce package/tag lockstep before publication and attach wheels for both. The intended new Git tag and package/OCI version are`0.6.13`. The independent operator-owned `lumen_source_version` commit pin remains unchanged; source-build operators must select the exact reviewed release commit explicitly. Local source qualification, tag publication, multiarch image qualification and operational acceptance are distinct receipts.
+
+## Valkey Sentinel primary routing (0.6.11)
+
+`[cache] redis_url` remains the Valkey data credential/database/TLS URL. Optional `redis_sentinel_addresses = [["controller-1", 26379], ["controller-2", 26379], ["controller-3", 26379]]` plus `redis_sentinel_master = "kolla"` enable primary discovery; both empty retain standalone/direct URL behavior. `redis_sentinel_username` (optional ACL user) and SecretStr `redis_sentinel_password` authenticate discovery separately from the URL's data-node credentials. Never reuse the data-server password unless the operator actually configured the same client AUTH on Sentinel. Kolla takes addresses from the existing `valkey` group and `valkey_sentinel_port`, master from `valkey_sentinel_monitor_name`, and optional discovery password from `valkey_sentinel_password`; service-specific overrides stay in the existing protected rendering path, never plaintext globals/example secrets.
+
+For TLS use `rediss://` and URL options such as `ssl_ca_certs=/etc/lumen/valkey-ca.pem&ssl_check_hostname=true`; trust material must be mounted/readable in every API/worker/controller/bootstrap process. Socket and TLS settings also protect Sentinel discovery; data username/password/DB never leak into discovery. URL options retain redis-py's precedence, except seed host/port and managed connection class are not selectable in Sentinel mode. Explicit socket connect/read timeouts must be finite, positive and at most30 seconds (defaults3/5). No alternate seed, replica or new HAProxy route exists when discovery fails. The locked client is redis-py5.0.0; newer documentation about RESP3 defaults in redis-py8 does not change this artifact's protocol behavior.
+
+A lost write reply is uncertain. Sentinel mode never automatically replays that command; a demoted-primary error disconnects and fails visibly, while a later independent operation discovers the new primary. Existing callers retain their cache fallback, durable DB polling or fail-closed semantics. Shutdown closes both data and discovery sockets. Coordinated process replacement still requires normal drain, protected backups/config identity comparison, matching versioned artifacts and read-only native canonical-client verification; do not fail over or write to the production Valkey cluster to test deployment. 0.6.11 does not alter migrations027/028 or remove the0.6.10 stopped-writer/schema prerequisites.
+
+## Private provider runtime and migration028 cutover
+
+**0.6.10 has fresh local synthetic qualification, not deployment approval.** See [testing](testing.md#fresh-local-qualification-2026-10-26) for source/runtime/image evidence and remaining gates. Published `027-kubernetes-sandboxes` remains byte-identical. Historical `027-provider-account-credentials` (`027_provider_account_credentials.sql`, SHA-256 `ee01a94044de1c5466c9627bd25e21ba22ec5ef03abf63c8494818775700711a`) is recognized only as an immutable existing receipt, never replayed, edited or inserted on a new installation. New028 is the only forward account cutover. The runner performs strict read-only schema/ledger/data preflight before first DDL, including ledger creation, and rejects unsupported/partial/ambiguous states.
+
+The actual read-only live projection on2026-10-26 found MariaDB10.11.19, both027 receipts and compatibility-repaired provider-owned auth-attempt identity. This was not a stopped-writer snapshot and proves neither migration success nor preservation under rollout. Independent review and a protected matching10.11.19 stopped-writer restore/apply/rerun rehearsal are mandatory before live schema mutation. Source fixes also isolate corrupt overdue-input runs and distinguish controller failures before SDK submission from unknown in-flight effects; neither fix authorizes provider/cloud replay.
+
+
+This is an unpublished source cutover, not a release or deployment receipt. API and worker now require the matching owned `lumen-bifrost` companion. Canonical runtime images include it; the platform-independent Python wheel alone does **not** install a native executable. For source/wheel service installations, build `runtime/bifrost/cmd/lumen-bifrost` with the Go 1.27.3 toolchain and committed `go.mod`/`go.sum`, install the resulting binary for the host OS/architecture, and set `BIFROST_EXECUTABLE` to its absolute path (or install `lumen-bifrost` on PATH). A reproducible source build command from `runtime/bifrost` is `go build -mod=readonly -trimpath -o /absolute/operator-owned/bin/lumen-bifrost ./cmd/lumen-bifrost`; create that private destination first. Do not substitute the stock Bifrost gateway or a binary from another revision. Verify the packaged binary version/platform and authenticated `single-attempt-v1` readiness in the final release acceptance; a Python import or wheel build alone does not prove inference readiness.
+
+`bifrost_executable`, `bifrost_startup_seconds` and `bifrost_shutdown_seconds` configure child lifecycle. Each API/worker owns a random-token loopback ephemeral-port child; it receives only minimal PATH, parent PID, internal token and explicit CA path variables, not inherited provider/cloud/database credentials, HOME or proxy configuration. Startup validates the pinned version, contract and protocols (`chat`, `responses`, `messages`, `count_tokens`, `embeddings`). Shutdown follows API/worker provider/auxiliary drain. A failed/closed child fails closed until a new service lifecycle; the next request must not restart/replay an uncertain execution. Never expose `/v1/execute` as a customer API or log its secret-bearing envelope.
+
+### Forward028 supported states and preservation boundary
+
+| Input | Exact required evidence | Forward action |
+| --- | --- | --- |
+| Empty database | No existing tables | Canonical001–031 bootstrap; no historical account027 receipt is invented. Migrations 030 (`chat_runs` idempotency unique index) and 031 (ORM index catch-up) are additive and later than the 028 cutover; apply them before the API that relies on 029. |
+| Published legacy026/027 | Complete immutable published prefix, exact source-derived legacy schemas, no account artifacts, strict supported MariaDB, drained nonterminal runs and no orphan auth attempts | Apply published Kubernetes027 if absent, then028 once; copy encrypted/env/subscription material and generation into default account credentials, bind auth attempts, retire only inline inference fields. |
+| Historical account027 | Exact old logical ID/path/checksum plus complete immutable prefix, exact canonical account schemas, retired inline authority and valid ownership/selection/auth-attempt identities | Preserve every old receipt and account row; record new028 only after validating its already-canonical result. |
+| Compatibility-repaired account027 | Above immutable receipts; exact seven-table inspected repaired shape including provider PK, nullable credential ID and `uq_legacy_compat_auth_credential`; exactly one unedited default account/credential per endpoint; server-side byte-equal legacy material/auth mode/status/expiry/generation; default selection/restrictions/weights; empty auth attempts/account usage and no durable column/JSON account references | Preserve original account/credential IDs and ciphertext; restore canonical credential-owned auth-attempt PK and retire identical endpoint inference copies without overwriting account rows. |
+| Receipted028 rerun | Exact canonical schema and immutable receipts with inline inference authority retired and identity relationships valid | No028 SQL replay or account reset. |
+
+Any partial table/column/index/FK/check/trigger shape, unknown ledger row or checksum, divergent material/policy, incoming unknown identity references, pending run or repaired-state account journal evidence is rejected before runner DDL with a fixed safe reason code. `AUTO_INCREMENT` counters and documented server display/default-charset aliases are not identity drift. Supported engines are strict MariaDB10.11.x/11.x; **production qualification must use actual10.11.19 and recorded sql_mode/default charset**, not a newer test engine alone. Future migrations changing these seven tables must extend the exact recognized states in the same source change.
+
+Before final rehearsal collect sanitized `SHOW CREATE TABLE` for `llm_providers`, `llm_provider_accounts`, `llm_provider_credentials`, `llm_provider_auth_attempts`, `chat_run_providers`, `chat_usage_logs`, `chat_provider_usage`; full migration logical IDs/paths/SHA256; engine/version/sql_mode/default charset; target triggers and incoming FKs; account/credential/default ownership cardinality; **server-side equality counts or keyed ciphertext digests**, never raw secrets; auth/usage/durable account-reference counts including submitted JSON. Recollect only after all writers stop, retain the encryption key separately, and compare restored pre/post journals and complete credential sets. A read-only live count cannot establish equality or absence of concurrent changes.
+
+Probes require an explicit current credential generation and registered active model; they can incur vendor cost and send at most one bounded request to that key. Settled relay history records only actual terminal usage receipts and preserves missing history as unknown. Neither API is synthetic health, an all-attempt journal, permission for subscription pooling, or authority to repeat an uncertain send.
+
+Coordinated upgrade procedure (not a rolling mixed-version contract):
+
+1. Record old/new source/image digests, binary version/platform, migration manifest/checksums, native authority policy, worker registrations and pending run/Batch/child/title/memory/compaction state. Preserve `LUMEN_ENCRYPTION_KEY`, SQL/Redis/PostgreSQL endpoints, CA/trust material, private config and unrelated data. Inventory every provider-start intent, checkpoint, unknown hold and usage event.
+2. Close new native/compat/media/realtime/Batch admission and administrative credential/auth mutation. Drain native/compat HTTP/SSE/WS, existing durable segments, coordinator and auxiliary jobs using existing owned drain controls. Recover known completed results and settle checkpoints without provider replay. Unknown work keeps its hold and identity; do not clear journals or submit it again under another key/engine. Block legacy pending interactive auth ingress until it is safely cancelled/expired and newly approved.
+3. Stop **all** old API/online and batch worker/controller writers after drain. Take a stopped-writer consistent MariaDB and PostgreSQL/checkpointer backup, retain the original encryption key separately, and prove restoration on an isolated target with matching engine/sql_mode and migration checksums. Do not run bootstrap against a guessed or shared production URL.
+4. With the new matching service artifact, run `lumen-migrate --apply`, then the exact same command again. Forward028 validates and creates or reconciles account schema, copies original legacy ciphertext/env references/generation only for the accepted pristine path, binds auth attempts, retires inline inference storage and adds account/backend usage allocation identity. An accepted repaired-state path preserves existing accounts/credentials and performs only the validated forward reconciliation; it never reapplies old027 or overwrites account secrets. Billing administrator keys remain separate. Compare complete pre/post credential identities/ciphertext digests/env/generation and all journal/hold/usage invariants, schema and ledger. MariaDB DDL can autocommit: partial failure leaves writers stopped and requires investigation or full protected restore, not a ledger edit or blind rerun.
+5. Start matching API/online and batch workers/controller with the same new schema and matching platform binary. Verify authenticated runtime proof, API readiness, worker leases/drain and selected credential metadata before opening admission. New unstarted legacy snapshots without the full credential reference require explicit fresh-current-authority re-admission; never silently bind them to the default account. Previously submitted/unknown work is not eligible for blind re-admission. Existing original-credential attenuation requirements below still apply.
+6. In a disposable synthetic environment first, qualify selected A/B keys, policy/operation denial before I/O, stale generation/revoke/refresh fencing, single upstream send on rejection/disconnect/truncation, checkpoint recovery and one customer debit with account allocations. Run the canonical source, SDK, Go, MariaDB migration/rerun, multiarch image execution and system/browser gates before promotion. Real provider/OAuth permission, vendor invoices and cloud/production remain separate approvals/gates.
+
+Rollback is not reverse DDL or migration-ledger deletion. Close admission and drain again; either use an explicitly qualified matching image/schema pair or restore the complete stopped-writer pre-cutover MariaDB/PostgreSQL state plus original keys/config with the old service set. Old code cannot recover inference secrets from retired endpoint columns on the new schema. Reconcile post-cutover provider-start/unknown/checkpoint/ledger effects before restoring; a backup restore never authorizes repeating an uncertain upstream call. Do not roll back only one API/worker or overwrite account credentials from an old environment seed.
+
+### Account pool administration
+
+Manage endpoint-owned accounts/credentials through the Keystone-only native admin API (see [API reference](api-reference.md#provider-account-and-credential-administration)) or Afterglow's administrator account panel. Configure endpoint `selection_policy`: `explicit` requires a current credential ID from that endpoint; `priority` uses ascending account/credential priority and stable IDs; `weighted` selects once with account weight × credential weight. Positive weights are required. This distributes **new admissions**, not retries after a provider error. Disable, expiry/cooldown, model IDs and operation restrictions are checked again before new I/O against the frozen credential.
+
+At account and credential levels, `allowed_model_ids:null` and `allowed_capabilities:null` mean unrestricted, while `[]` denies all. Operation tags are `chat,responses,messages,count_tokens,embeddings,search,image,tts,stt,realtime`. Model restrictions refer to endpoint-owned numeric model IDs, not public model strings. Set expiry/cooldown as aware timestamps. Credential secret/restriction/expiry/cooldown edits or disabling advance its generation; old frozen references fail rather than rotating. Re-enabling does not revive an invalidated generation. Environment-backed credentials persist only variable names, resolve in each executing process, and use encrypted DB key precedence; update every authorized process consistently. Runtime deployment does not import your shell's provider credentials into Go.
+
+API-key, ChatGPT device OAuth and Anthropic subscription modes stay separate. Subscription credentials do not accept API-key fields; refresh/rejection is locked and fenced to the same selected grant and token fingerprint. Device auth is credential-specific and owner/project-bound; status/metadata never return stored access/refresh tokens. Separate billing administrator keys do not authorize inference. Protocol support and an OAuth login do **not** grant vendor permission to pool consumer subscriptions for a public multi-user service; obtain applicable provider permission or use approved API accounts before enabling that deployment.
+
+`chat_provider_usage` attributes account/credential allocations in the same transaction as the single customer ledger debit. Account usage is Lumen-attributed usage, not provider balance/invoice reconciliation; pre-migration anonymous rows remain unknown/unattributed. Backend labels distinguish converter text from direct media/search/Codex paths.
+
 
 Cache 종료는 pinned Redis 5.0.0의 async `close()`로 client 소유 connection pool을 해제한 뒤 process-local client를 비운다. `aclose()` AttributeError가 있는 이전 이미지에서는 API shutdown이 DB teardown 전에 중단될 수 있다.
 
@@ -21,20 +229,46 @@ Cache 종료는 pinned Redis 5.0.0의 async `close()`로 client 소유 connectio
 
 `ModuleNotFoundError: lumen_plugin_api`가 migration 시작 전에 발생하면 SQL이나 ledger를 수정하지 않는다. 이미지의 installed distribution, lock과 workspace source 포함 여부를 확인하고 현재 소스로 다시 빌드한다. Stale lock을 그대로 사용하는 `--frozen`이나 실행 중 컨테이너의 임시 `pip install`로 우회하지 않는다. API/worker를 멈추고 local schema를 백업한 뒤 canonical migration을 재실행하며, 같은 migration 명령의 두 번째 실행도 확인한다. 기존 volumes와 암호화 키는 보존한다.
 
+## Service-local oslo.policy (locally exercised, not deployed)
+
+Use one operator policy across every API, online/batch worker and key/bootstrap process. Standard native project admin/manager/member manage owned resources and reader reads nonsecret resources; dedicated Lumen service roles and special personal-project provenance are no longer required. Native effective custom/group/domain/inherited and retained legacy implications remain authoritative when they reach those exact standard roles. Never bulk-edit native grants or reconstruct synthetic role aliases. Fresh enabled identity, exact source/issued-ID/key ceilings and raw human system verification remain mandatory.
+
+```toml
+[oslo_policy]
+policy_file = "/etc/lumen/policy.yaml"
+policy_dirs = []
+```
+
+Environment overrides are `OSLO_POLICY_POLICY_FILE` and JSON `OSLO_POLICY_POLICY_DIRS`. Missing files use code-registered defaults. Start with selected rules from installed `share/lumen/policy.yaml.sample` (also `lumen/policy.yaml.sample` in source), not an expanded role graph. Standard generator: `uv run --extra service oslopolicy-sample-generator --namespace lumen --output-file /tmp/lumen-policy.yaml.sample`. Effective-policy tooling uses `oslo.policy.enforcer` namespace `lumen`. The installed standard generator and all 40 registered defaults/sample parity were exercised locally; see `docs/testing.md` for the exact evidence boundary.
+
+```yaml
+"compat:completions:write": "role:member or role:manager"
+"native:tools:execute": "!"
+```
+
+Action names are the existing exact native/compat scope names plus `system:admin`. Rules use ordinary oslo.policy syntax (`role:`, `rule:`, `@`, `!`); custom roles must be exact trusted global native grants and satisfy the independent standard native-role floor. Policy can narrow but not give reader mutations or legacy-only service entitlement. Project admin/manager/member never become system administrators. `system:admin` remains verified-human-only even with `@`. Stored key scopes, original issued-ID/source ceilings, ownership, consent, provider prerequisites and new-I/O revalidation cannot be overridden.
+
+oslo.policy checks file/directory modification times during authorization, so updates apply on the next request/new-I/O gate. Change the file timestamp; do not retain an old timestamp while replacing contents. Malformed YAML/nonstring rules, malformed expressions and undefined/cyclic rule references deny rather than silently using prior allows. Use a directory bind mount for atomic rename updates; a single-file bind can retain the old inode, so update its contents in place or recreate the container after a safe preservation preflight. Confirm the mounted bytes on **all** API/workers, then compare authenticated `GET /v1/policy/capabilities` and the affected real action; the capability endpoint alone is not provider-execution proof. Reverting to reviewed previous YAML follows the same reload procedure, not role graph edits.
+
+Local/system Compose mounts `${LUMEN_POLICY_FILE:-./lumen/policy.yaml.sample}` read-only at `/etc/lumen/policy.yaml` for API and workers. Use one source file on every process. Kolla creates only operator directory `lumen_policy_directory` (default `/etc/kolla/lumen/policy`, mounted `/etc/lumen/policy.d:ro`), configures `lumen_policy_dirs`, and never templates or overwrites files inside it. Put reviewed YAML there, readable by appuser; `lumen_policy_file` defaults `/etc/lumen/policy.yaml`. Additional custom directories require matching mounts. Managed Nova API/worker guests must receive the same reviewed policy file/directory via the operator's image/config delivery and expose `oslo_policy_policy_file`/`oslo_policy_policy_dirs` in their allowlisted service config if paths differ; a host-only Kolla mount does not distribute files into guests. Do not enable a custom policy across mixed/default-only guests.
+
+Canonical API and worker images were built for linux/arm64 and linux/amd64; every actual runtime image read a mounted operator deny rule as appuser and retained an independently allowed default action. Installed-SDK loopback HTTP also exercised native policy reload and immutable credential/system boundaries. No container rollout, production native IAM mutation, paid inference or production acceptance was exercised. Before deployment, finish the documented production/managed-guest acceptance gates and preserve unrelated worktree/config/data and existing migration/credential-drain requirements.
+
 ## 설정
 
 `lumen.conf.example`은 실제 `Settings` 필드의 안전한 template다. 환경변수는 TOML보다 우선하며 field 이름의 대문자 환경변수(`DATABASE_URL`, `REDIS_URL`, `LUMEN_ENCRYPTION_KEY`)를 사용한다.
+`LUMEN_CONFIG_FILE`이 명시된 경우 그 파일만 읽으며, 누락·빈 TOML·문법/권한 오류는 시작 실패다. 다른 config나 개발 기본값으로 fallback하지 않는다. Kolla는 문자열을 JSON/TOML escape하여 렌더링하고 secret-bearing render task는 `no_log`로 보호한다.
 
-Local/system Compose는 관리형 runtime이 비활성화된 `RUNTIME_CONFIG={}`와 명시적 `http://localhost:<api-port>/api/v1/chat/mcp-oauth/callback`을 사용한다. 빈 문자열은 typed JSON 설정값이 아니며, 내부 Docker 서비스명과 개발 frontend 도메인은 OAuth 공개 callback으로 허용되지 않는다. 운영 배포는 외부에서 도달 가능한 HTTPS callback을 명시한다.
+Local/system Compose의 기본 `RUNTIME_CONFIG={}`는 관리형 runtime이 비활성화된 설정이다. `lumen-test integration|system` runner는 host의 `COMPOSE_PROFILES`를 비우고 `RUNTIME_CONFIG={"enabled":false}`로 고정해 manual cloud profile을 상속하지 않는다. 개발용 controller profile은 직접 Compose 명령으로만 선택한다. 명시적 `http://localhost:<api-port>/api/v1/chat/mcp-oauth/callback`은 개발 callback이다. 빈 문자열은 typed JSON 설정값이 아니며, 내부 Docker 서비스명과 개발 frontend 도메인은 OAuth 공개 callback으로 허용되지 않는다. 운영 배포는 외부에서 도달 가능한 HTTPS callback을 명시한다.
 
 | 영역 | 주요 필드 | 기본값/운영 의미 |
 | --- | --- | --- |
 | database | `database_url`, pool/connect timeout | URL default 없음; pool 20/overflow 10 |
 | cache | `redis_url`, `redis_db_index` | `redis://localhost:6379/8`, DB 8 |
 | encryption | `lumen_encryption_key` | 64 hex 필수 (fallback 없음) |
-| chat | `chat_default_model`, `chat_compat_run_timeout_seconds`, `chat_execution_protocol_version` | default model (virtual model `lumen` 백엔드), compat run timeout (기본 300초, 1..3600), protocol v1/v2 |
+| chat | `chat_default_model`, `chat_compat_run_timeout_seconds`, `chat_execution_protocol_version` | default model (virtual model `lumen` 백엔드), compat run timeout (기본 300초, 1..3600), protocol 기본 **1**; **2**는 명시적 opt-in |
 | retention | run event/checkpoint/memory retention | 24h / 7d / 365d |
-| optional stores | `chat_checkpointer_postgres_url`, `chat_memory_pgvector_url`, `chat_asset_s3_*` | configured feature에만 필요 |
+| optional stores | `chat_checkpointer_postgres_url`, `chat_memory_pgvector_url`, `chat_asset_s3_*` | encrypted PostgreSQL checkpointer는 protocol v2 필수; pgvector는 별도 선택 semantic index; S3는 configured asset feature에 필요 |
 | TLS/auth | `os_cacert`, `insecure`, Keystone fields | TLS verify 기본 활성; `insecure`는 예외적 개발 설정 |
 | Claude Gateway | `claude_gateway_base_url`, `claude_gateway_model`, `claude_gateway_provider`, `frontend_base_url` | public base는 origin + `/v1/claude-gateway`; loopback 외 HTTPS 필수. Provider 설정은 표시 이름이 아닌 공개 `api_provider` 선택자이며 해당 model이 그 selector에 등록되어야 inference 가능하다. 예시 기본 model은 `claude-opus-5-5`다. Selector 변경 시 Gateway 설정과 외부 클라이언트도 갱신한다. |
 
@@ -43,19 +277,40 @@ Local/system Compose는 관리형 runtime이 비활성화된 `RUNTIME_CONFIG={}`
 - `temperature` 같은 sampling 파라미터를 받지 않는다.
 - 강제 `tool_choice`(`any`/`tool`)를 거부한다.
 
-Lumen의 chat/agent·title·compaction은 설치된 LiteLLM 1.93의 parameter mapping을 사용한다. 다음은 source 계약이며 live provider 수용 증거가 아니다.
-- 지원하는 `reasoning_effort`는 LiteLLM이 `thinking: {type: "adaptive"}`와 `output_config.effort`로 변환한다.
-- API-key와 subscription 경로 모두 `drop_params`로 지원하지 않는 `temperature`를 제거한다.
-- 이 모델에서 LiteLLM에 전달된 `reasoning_effort="none"`은 thinking을 끄지 않고 effort를 생략한다. 실제 비활성화를 보장하는 값으로 사용하지 않는다. Native admission의 Anthropic 예외와 별개로 title은 frozen route가 광고한 effort만 선택하므로 `low`가 광고되면 `low`, effort metadata가 없으면 provider 기본값을 사용한다.
-- 다른 provider의 명시 `none`은 disable capability가 없으면 422다. Operator 기본 `chat_reasoning_effort="none"`은 그런 모델에서 생략하며, GPT-5 tool round의 암묵 `none`도 frozen route의 disable capability가 있어야 보낸다. 오래된 models.dev import는 budget `min`/`max`를 얻도록 재등록해야 한다.
-- Worker가 고정한 provider/model `config_version_hash`별로 reasoning 오류를 기억한다. 이름이 같은 다른 route나 새 configuration에 memo를 공유하지 않으며, frozen identity가 없는 호출은 process-wide memo를 재사용하지 않는다. 검증된 명시 `none`은 stale LiteLLM probe 때문에 생략하거나 오류 후 provider 기본 reasoning으로 바꾸지 않는다.
-- OpenAI wire에서는 explicit `none`의 `reasoning_effort`만 LiteLLM whitelist에 추가해 unknown model에서 `drop_params`가 조용히 삭제하지 못하게 한다. Provider가 이 값을 실제 거부하면 실패를 그대로 처리하며, 이 OpenAI override를 Anthropic/Gemini native mapping에 적용하지 않는다.
+Lumen의 chat/agent·title·compaction은 pinned Bifrost converters와 owned transport를 사용하며 설치된 LiteLLM mapper/`drop_params`에 의존하지 않는다. 모델별 thinking·sampling 변환은 해당 converter 계약으로 검증해야 하며 과거 LiteLLM 결과를 현재 binary의 증거로 재사용하지 않는다. Native Messages는 caller-owned thinking/output_config/context_management와 protocol headers를 보존한다. Title은 frozen route가 광고한 가장 낮은 effort를 선택하고 목록이 없으면 생략한다. 현재 durable execution→engine→graph는 payload의 reasoning_effort를 provider_client에 한 번 전달하며 GPT-5 암묵 none 주입, reasoning route-key 전달 또는 오류 memo 학습을 하지 않는다. 거절 뒤 다른 effort/provider-default로 재요청하지 않는다. 과거0.3.1 memo/mapper 운영 설명은 현재 admission·실행 기제가 아니다.
 
-공식 OpenAI direct route(`provider_type=openai`, `api_base` 없음 또는 공식 `https://api.openai.com[/v1]`)의 native 대화, title 및 stateless Chat Completions 호환 입력은 LiteLLM의 explicit Responses bridge를 통해 upstream `/v1/responses`로 전송한다. 외부 OpenAI-compatible base에는 적용하지 않고 ChatGPT subscription도 별도 인증/transport를 유지한다. 이는 공개 Lumen endpoint나 `chat_conversation.completions` action 이름을 바꾸지 않는다. Catalog에 없는 공식 모델은 요청 범위에서 native SSE를 사용하며 알려진 non-streaming 모델의 LiteLLM 판단은 유지한다. Native graph는 실제 `response.completed` 없는 스트림을 실패로 기록하고 Chat Completions로 자동 재요청하지 않는다(중복 과금/툴 실행 방지). 이 계약은 로컬 synthetic provider를 통한 wire/graph 검증이며 운영 `gpt-6-sol` 완료 증거가 아니다.
+공식 OpenAI direct route(`provider_type=openai`, `api_base` 없음 또는 공식 `https://api.openai.com[/v1]`)의 native 대화·title·stateless chat-shaped 입력은 owned Bifrost converter 경계에서 upstream `/v1/responses`로 전송한다. 외부 OpenAI-compatible base는 Chat Completions, ChatGPT subscription은 별도 Codex HTTP transport를 유지한다. 공개 endpoint나 durable action 이름은 바뀌지 않는다. Native stream은 실제 완료 terminal이 필요하며 truncation을 Chat Completions 재요청으로 복구하지 않는다. 이 source 계약은 현재 live provider 수용 증거가 아니다.
 
 Caller가 파라미터를 소유하는 compat 경로는 Opus 5.5 제약을 대신 맞춰 주지 않는다.
 - Anthropic-native `/v1/messages` passthrough는 caller 파라미터를 바꾸지 않는다. `thinking.type: "disabled"`, `budget_tokens`, 강제 `tool_choice`를 보내면 provider의 400이 그대로 반환된다.
-- OpenAI-compatible `/v1/chat/completions`도 caller의 `tool_choice`를 전달한다. LiteLLM은 `required`를 제거하지 않고 Anthropic `{"type": "any"}`로 변환하므로 역시 provider 400이 된다.
+- OpenAI-compatible `/v1/chat/completions`도 caller의 `tool_choice`를 전달한다. 변환 경로의 provider-specific tool choice 수용은 해당 provider 계약에 따르며 거절 시 자동 재요청하지 않는다.
+
+### Protocol v2 opt-in cohort와 승인·resume
+
+일반 chat의 기본 protocol은 **1**로 유지한다. `CHAT_EXECUTION_PROTOCOL_VERSION=2`는 기존 `Settings.chat_execution_protocol_version`의 환경변수이고 TOML의 `[chat] chat_execution_protocol_version = 2`보다 우선한다. Kolla 운영자는 `globals.yml`/inventory에 **정수** `lumen_chat_execution_protocol_version: 2`를 명시한다(기본 `1`, 허용값 `1|2`). 이 한 변수가 shared `lumen.conf`의 `[chat] chat_execution_protocol_version`과 `lumen_service_environments`의 **API·worker 모두** `CHAT_EXECUTION_PROTOCOL_VERSION` 문자열에 렌더링되며 `tasks/start.yml`의 기존 `env` 경로로 전달된다. Host shell의 export만으로 Kolla 컨테이너 설정을 바꾸지 않는다. Local/system Compose는 기존 `${CHAT_EXECUTION_PROTOCOL_VERSION:-1}` shared API/worker 환경을 그대로 사용한다.
+
+**Opt-in 전에 충족할 prerequisite:**
+
+- 기존 schema-first coordinated cutover와 백업/복원 절차를 따른다. 같은 승인된 release/plugin wheel·config·digest의 API와 해당 queue/pool을 실행할 worker를 하나의 qualified cohort로 준비한다. 이 설정은 배포 단위 admission selector이지 user/project별 feature flag가 아니다. Opt-in traffic/queue의 API·worker 설정을 일치시키며, 미검증 mixed-version rolling 배포나 다른 cohort의 worker claim을 안전하다고 추정하지 않는다.
+- Kolla의 `lumen_enable_checkpointer: true`와 `lumen_checkpointer_postgres_url`이 필요하다. URL은 기존 `lumen_postgres_mode: external` + `lumen_external_postgres_url` 또는 `bundled` + `lumen_postgres_*`에서 계산되고, API·worker에 `CHAT_CHECKPOINTER_POSTGRES_URL`로 전달된다. 기존 PostgreSQL authority/선택 모드는 바꾸지 않는다. 두 프로세스가 같은 checkpoint store와 원래의 **64 hex** `LUMEN_ENCRYPTION_KEY`(Kolla `lumen_encryption_key`)를 사용해야 한다. Checkpoint serializer는 이 키에서 domain-separated AES-GCM subkey를 유도하며 plaintext/in-memory fallback은 없다. PostgreSQL role에는 대상 schema의 `USAGE, CREATE` 및 saver setup/read/write에 필요한 권한이 있어야 한다. pgvector URL만 제공하는 것은 checkpointer 준비가 아니다.
+- Kolla precheck는 `1|2`, v2의 enabled checkpointer·PostgreSQL URL 및 기존 암호화 키 형식을 assert할 뿐 live DB 초기화나 승인 실행을 증명하지 않는다. API·worker 각각에서 `chat checkpoint PostgreSQL initialized`를 확인하고 API `/v1/ready`의 `database=true`, `plugins=true`, **`checkpointer=true`**와 실제 worker registration/heartbeat·protocol/plugin digest를 확인한다. `checkpointer=null`인 readiness 200이나 `/v1/health`만으로 v2를 열지 않는다. API는 configured saver 초기화 실패 시 시작을 중단하며, native v2 admission은 saver가 unavailable이면 **503** `configured chat execution protocol is not deployed`로 거부한다. API readiness만으로 worker의 saver 상태를 알 수 없다.
+- Admission을 열기 전에 승인된 disposable/staging cohort에서 실제 encrypted checkpoint를 사용한 approve·deny·pending input·worker resume와 재연결 후 run/SSE 복구를 수용한다. 기존 [managed agent 승격 절차](testing.md#managed-agent-runtime-승격-체크-실행-결과가-아닌-절차)는 deployment gate이며 local synthetic/process readiness receipt를 운영 v2 승인 qualification으로 승격하지 않는다. Delegation/code를 함께 열면 기존 agent budget·sandbox/runtime·pool/image policy prerequisite도 별도로 충족해야 한다.
+
+**Generic authenticated remote MCP/Afterglow connector 등록 prerequisite:**
+
+- 기존 `POST /v1/admin/mcp-servers` 또는 `PATCH /v1/admin/mcp-servers/{id}` 관리 경로로 `transport="http"`인 **HTTPS public-network Streamable HTTP URL**을 등록한다. Loopback/private endpoint나 stdio/legacy SSE를 허용하기 위해 기존 SSRF 경계를 완화하지 않는다.
+- `auth_mode="admin"`과 administrator-managed `Authorization: Bearer …` header를 기존 encrypted extension secret 저장 흐름으로 제공한다. Header 값은 write-only이며 plaintext DB/문서·shell history·log에 넣지 않는다. Connector credential은 기존 Lumen/Keystone 사용자 권한이나 승인 authority를 대체하지 않는다.
+- Global 등록/활성화만으로 사용자에게 실행 권한을 주지 않는다. 각 **owner user/project**가 현재 `config_version`에 대해 기존 `PATCH /v1/mcp-servers/{id}/activation`으로 opt-in하고, agent/run의 기존 **selected `mcp_ids`**에 해당 서버를 포함해야 한다. Disable/re-enable·config/credential 변경 뒤에는 기존 selection/activation fence를 다시 충족해야 한다.
+- 저장된 `effect_overrides`가 exact remote method를 `read`로 지정했다면 **실제로 읽기만 하는 명시적 method**인지 확인한다. 현재 MCP 등록/수정 API에는 이 override의 write field가 없으므로 임의 payload나 직접 DB 수정으로 read 예외를 만들지 않는다. 이름·remote annotation으로 읽기를 추정하지 않으며 unknown/browser action은 기본 **`external_mutation`**으로 유지한다. 기존 v2 run policy가 `external_mutation`을 허용해야 하고, 공개 요청은 `features.tool_policy.approval_mode="required_for_mutations"`(기본값) 또는 `"always"`를 사용한다(예: `{"features":{"tool_policy":{"approval_mode":"required_for_mutations"}}}`). Mutation은 기존 graph runtime의 승인 경계를 통과하며 `"ask"`는 이 공개 필드의 허용값이 아니다. Protocol v2 선택이나 connector opt-in 자체는 effect 승인 권한이 아니다.
+- Endpoint 인증은 사용자 실행 인가와 별도다. [Remote MCP authenticated context](agent-platform.md#remote-mcp-authenticated-context)의 host-created context·frozen credential epoch·current owner/config fence를 유지한다. Generic connector 계약은 원격 서비스의 browser/session 격리를 보장하지 않으며, 그런 capability는 해당 서비스에서 별도로 검토·수용해야 한다. Afterglow connector도 기존 scoped credential·frozen approval 경계를 사용한다.
+
+**기존 native 승인 API를 그대로 사용한다**([API 계약](api-reference.md#sse-승인-사용량-및-헬스)):
+
+- `POST /v1/runs/{run_id}/approvals/{call_id}`에 `{"decision":"approve"}` 또는 `{"decision":"deny"}`를 보낸다. 두 결정 모두 같은 endpoint다. Authenticated owner user/project와 `native:runs:write` scope를 요구하며 frozen tool arguments/binding/dispatch HMAC을 검증한다. 같은 결정 재전송은 idempotent, 다른 결정은 **409**, 다른 owner/missing run·call은 **404**다. Protocol v1 또는 v2 미활성 설정은 **422**다. Pending approval의 만료 후 결정은 `deny`로 기록되므로 응답의 실제 `decision/status`를 확인한다.
+- Ask-user 응답은 `POST /v1/runs/{run_id}/interactions/{interaction_id}`에 `{"response":{"option_ids":["<offered-option-id>"],"text":null}}`를 보낸다. 같은 owner/project·write scope와 저장된 response schema를 사용한다. 같은 normalized 응답은 idempotent, 다른 이미 저장된 응답은 **409**이고 만료된 pending interaction은 `timeout`으로 기록된다.
+- 마지막 pending approval/interaction이 해소되면 기존 MariaDB transaction이 `awaiting_input` run을 `queued`로 전환하고 decision/interaction event와 `run.stage.changed`를 기록한 뒤 Redis wake hint를 보낸다. 응답의 `run_status`, `pending_approvals`, `pending_interactions`가 재개 여부를 나타내며 HTTP 성공은 tool 실행/전체 run 성공이 아니다. Worker는 PostgreSQL checkpoint의 실제 interrupt를 읽고 기존 discriminated `tool_approval`/`children` resume payload를 만든다. **별도 public `/approve`, `/deny`, `/resume` endpoint나 새 승인 원장을 만들지 않는다.** Deny는 tool dispatch를 거부하는 결정이지 run cancel이 아니며 취소는 기존 `POST /v1/runs/{run_id}/cancel`이다. Client는 `GET /v1/runs/{run_id}`와 `GET /v1/runs/{run_id}/events`의 cursor replay로 후속 결과를 확인하며 새 completion을 만들어 resume을 흉내 내지 않는다.
+
+배포 qualification은 template 문자열·env 복사를 검사한 결과로 대신하지 않는다. `tests/test_config_deployment.py`의 실제 설정 로딩/precedence/validator와 Kolla precheck의 v2/checkpointer·runtime 경계를 검증하고, 같은 wheel/manifest/allowlist cohort의 실제 API·worker readiness와 native 승인·resume·run-scoped resource 회수를 별도로 수용한다. Local synthetic Compose의 encrypted checkpointer readiness와 budget 없는 temporary/persistent chat 완료는 real IAM/provider, remote OAuth epoch rotation, native child terminal 또는 Kubernetes tool acceptance의 증거가 아니다. 각 실행의 source/image와 한계는 별도 receipt로 보존한다.
 
 ### Chat asset S3 contract
 
@@ -65,25 +320,117 @@ Ceph RGW clients use SigV4 path-style requests and calculate request/response ch
 
 ### 설치된 Python plugin 승인
 
-`[lumen.plugin_config]` 또는 `PLUGIN_CONFIG` JSON은 설치된 distribution **이름·버전**, entry-point kind/name 승인 목록과 실제 선택을 정의한다. `lumen.conf.example`의 `allowlist`는 기본 database(0.1.1)/memory/tools/skills/MCP wheel의 정확한 예시다. 명시적 allowlist를 쓰는 운영자는 database plugin 0.1.1 이미지와 승인 버전을 함께 갱신해야 하며, 불일치하면 API/worker가 시작을 중단한다. 외부 plugin은 `lumen-plugin-api` 공개 계약에만 의존해 wheel을 만들고(`uv build --wheel <package-dir>`), 별도 conformance kit(`lumen-plugin-api[testing]`)로 검증한 뒤 승인된 배포 환경의 API와 worker 이미지 **모두**에 설치한다. Wheel 변경은 이미지와 allowlist/config 동시 변경 및 프로세스 재시작이 필요하며, `/v1/plugin-bindings` POST는 Python 패키지 설치가 아니다. 임의 사용자 업로드/온라인 installer는 없다.
+`[lumen.plugin_config]` 또는 `PLUGIN_CONFIG` JSON은 설치된 distribution **이름·버전**, entry-point kind/name 승인 목록과 실제 선택을 정의한다. `0.6.9` candidate의 `lumen.conf.example` allowlist는 plugin API/MCP/memory/tools/skills `0.1.1`, database `0.1.2` cohort와 일치한다. 명시적 allowlist를 쓰는 운영자는 API·worker 이미지와 승인 버전을 함께 갱신해야 하며, 불일치하면 시작을 중단한다. 외부 plugin은 `lumen-plugin-api` 공개 계약에만 의존해 wheel을 만들고(`uv build --wheel <package-dir>`), 별도 conformance kit(`lumen-plugin-api[testing]`)로 검증한 뒤 승인된 배포 환경의 API와 worker 이미지 **모두**에 설치한다. Wheel 변경은 이미지와 allowlist/config 동시 변경 및 프로세스 재시작이 필요하며, `/v1/plugin-bindings` POST는 Python 패키지 설치가 아니다. 임의 사용자 업로드/온라인 installer는 없다.
 
-선택한 plugin의 설치·버전·manifest/API version·설정 schema·host capability 검증에 실패하면 시작을 중단한다. 등록되지 않은 plugin code를 fallback import하지 않는다. API/worker는 시작 시 registry를 load/start하고 종료 시 close한다. 현재 controller entry point는 plugin registry를 시작하지 않고 DB 및 cloud provider preflight만 수행한다. Admin `GET /v1/admin/plugins`는 manifest/readiness를, `GET /v1/admin/plugin-bindings`는 승인된 tool/skill export 인스턴스를 보여 준다. Binding의 변경은 active run 재인가에 영향을 주므로 rollout 전에 동시 실행 중인 run을 확인한다.
+선택한 plugin의 설치·버전·manifest/API version·설정 schema·host capability 검증에 실패하면 시작을 중단한다. 등록되지 않은 plugin code를 fallback import하지 않는다. API/worker/controller는 시작 시 registry를 load/start하고 종료 시 close한다. Controller entry point는 DB 초기화와 registry 시작 뒤 configured cloud provider preflight 및 internal listener/reconciliation을 수행한다. Admin `GET /v1/admin/plugins`는 manifest/readiness를, `GET /v1/admin/plugin-bindings`는 승인된 tool/skill export 인스턴스를 보여 준다. Binding의 변경은 active run 재인가에 영향을 주므로 rollout 전에 동시 실행 중인 run을 확인한다.
 
 ### Managed cloud runtime 선택과 기동
 
-기본 `runtime_config.enabled=false`에서는 고정 worker로 운영한다. Managed pool을 활성화하려면 `RUNTIME_CONFIG` JSON 또는 `[lumen.runtime_config]`에 `deployment_id`, HTTPS `controller_url`, `listen_host`/`listen_port`, 내부 `tls`(`ca_file`, `ca_key_file`, `cert_file`, `key_file`), `dispatch_key`의 env/file secret reference, 명시적 `managed_networks` CIDR, `cloud_profiles`, `pools`를 제공한다. Kolla에서는 `lumen_runtime_enabled`와 완전한 `lumen_runtime_config`를 운영자가 제공해야 하며 이미지/flavor/network를 자동 추론하지 않는다. CA 키와 cloud application credential은 controller에만 전달하고 API/worker/sandbox에 넣지 않는다. Controller는 독립 HTTPS listener에서 bootstrap/dispatch를 받고 지원되는 Nova provider preflight 뒤 reconciliation을 시작한다; 이 listener를 public API ingress에 연결하지 않는다.
+기본 `runtime_config.enabled=false`에서는 고정 worker로 운영한다. Managed pool을 활성화하려면 `RUNTIME_CONFIG` JSON 또는 `[lumen.runtime_config]`에 `deployment_id`, HTTPS `controller_url`, `listen_host`/`listen_port`, 내부 `tls`(`ca_file`, `ca_key_file`, `cert_file`, `key_file`), `dispatch_key`의 env/file secret reference, 명시적 `managed_networks` CIDR와 `pools`를 제공한다. Nova pool은 `cloud_profiles`, Kubernetes sandbox pool은 `kubernetes_clusters`를 참조한다. Kolla에서는 `lumen_runtime_enabled`와 완전한 `lumen_runtime_config`를 운영자가 제공해야 하며 이미지/flavor/network/cluster를 자동 추론하지 않는다. CA 서명 키·dispatch key·cloud application credential·Kubernetes bearer token은 controller에만 전달하고 API/worker/sandbox에 넣지 않는다. Controller는 enabled pool마다 실제 provider의 `preflight(pool)`이 성공한 뒤 독립 HTTPS listener와 reconciliation을 시작한다; 이 listener를 public API ingress에 연결하지 않는다.
 
-Kolla가 runtime을 활성화하면 TOML의 `[lumen]` 아래에는 JSON을 TOML 문자열로 인코딩한 `runtime_config`가 들어가며 시작 시 typed config로 파싱된다. Controller는 root-owned `lumen_controller_secrets_dir`의 CA 서명 키·dispatch key를 읽기 위해 **controller 컨테이너에서만 root**로 실행한다(호스트 Docker socket은 마운트하지 않는다). Stock worker는 이 디렉터리를 마운트하지 않는다. 운영자는 `lumen_worker_secrets_dir`에 public CA, 전용 operator client certificate/key 세 파일만 같은 basename으로 별도 배치해야 한다. `tls.ca_file`, `tls.operator_client_cert_file`, `tls.operator_client_key_file`은 컨테이너의 `/etc/lumen/controller/<name>`을 참조한다. Worker 디렉터리는 root:root 0750, 세 파일은 root:root이고 group-readable 0440/0640(공개 CA·certificate는 0444/0644도 가능), client key는 0440/0640만 허용한다. Controller의 `ca_key_file`, server key, `dispatch.key`를 worker 디렉터리에 복사하면 precheck가 거부한다. Source build 모드에서도 runtime 활성화 시 `docker/Dockerfile`의 controller target을 API/worker와 함께 빌드한다.
+Kolla가 runtime을 활성화하면 TOML의 `[lumen]` 아래에는 JSON을 TOML 문자열로 인코딩한 `runtime_config`가 들어가며 시작 시 typed config로 파싱된다. Controller는 root-owned `lumen_controller_secrets_dir`의 CA 서명 키·dispatch key를 읽기 위해 **controller 컨테이너에서만 root**로 실행한다(호스트 Docker socket은 마운트하지 않는다). Stock worker는 이 host 디렉터리를 마운트하지 않는다. 운영자는 별도 `lumen_worker_secrets_dir`(기본 `/etc/kolla/lumen/worker`)에 public CA, **전용 fixed-worker client certificate/key** 세 파일을 같은 basename으로 배치하고, **모든 enabled Kubernetes sandbox pool**의 `profile.tool_manifest_file`을 `/etc/lumen/controller/` 아래의 상대경로 그대로 복제한다. 이 별도 디렉터리만 worker의 `/etc/lumen/controller:ro`로 마운트하며 `tls.ca_file`, `tls.worker_client_cert_file`, `tls.worker_client_key_file`은 `/etc/lumen/controller/<name>`을 참조한다. `tls.operator_client_cert_file`/`tls.operator_client_key_file`은 controller-to-guest readiness probe 전용이고 worker identity가 아니다. Worker root와 manifest의 정확한 ancestor directory만 root:root **0750**, non-symlink로 준비한다. 세 identity 파일은 root:root이고 group-readable 0440/0640(공개 CA·certificate는 0444/0644도 가능), client key는 0440/0640만 허용한다. Manifest 사본은 root:root **0444/0644** regular file이고, 비어 있지 않은 최대 **1 MiB** bytes가 controller 원본 및 각 pool의 `tool_manifest_sha256`와 일치해야 한다. 다른 파일·불필요한 디렉터리·symlink는 Ansible inventory와 Python material precheck 모두 거부한다. Controller의 CA 서명 키·server key·operator probe key·`dispatch.key`·cloud/Kubernetes credential·qualification을 worker 디렉터리에 복사하지 않는다. Source build 모드에서도 runtime 활성화 시 `docker/Dockerfile`의 controller target을 API/worker와 함께 빌드한다.
 
-Cloud profile은 project/region/interface/CA/Keystone application credential(env 또는 file reference)/`purpose=trusted|sandbox`를 명시한다. Trusted API/worker와 sandbox는 **서로 다른 OpenStack project**를 사용한다. 현재 유효한 pool 조합은 Nova `api|worker|sandbox`뿐이다. Zun trusted pool은 sandbox-only provider와 맞지 않고, Zun sandbox도 필수 namespace/cgroup/no-new-privileges 격리 정책을 provider가 강제하지 않으므로 **설정 검증에서 거부한다**. Zun을 사용하려면 해당 isolation을 create/preflight에서 강제하고 검증하는 구현이 선행되어야 한다. Enabled trusted pool에는 DB connection budget, API pool에는 operator-created Octavia ingress(`ingress_member_port`는 공개 HTTP, 별도의 `api_readiness_port`는 기본 8013), sandbox pool에는 workspace/memory/CPU/PID 및 격리 capability policy가 필요하다. Nova profile은 flavor/guest image ID와 SHA-256 hash를 검증한다. Sandbox image와 host isolation 사전 요구사항은 기존 격리 운영 절차를 따른다.
+Kolla에서 **`lumen_runtime_enabled: true`와 `enable_lumen_worker: true`이면**, sandbox dispatch 사용 여부와 관계없이 `tls.worker_client_cert_file`/`tls.worker_client_key_file` pair와 비어 있지 않은 `fixed_workers`가 필수다; 누락하면 `runtime_worker_identity`로 precheck가 실패한다. `fixed_workers`의 각 항목은 `{id, certificate_fingerprint}`이며 fingerprint는 operator-approved leaf의 SHA-256 64 lowercase hex다. Leaf는 내부 CA가 발급한 유효한 non-CA `clientAuth` certificate이며 URI SAN은 정확히 하나인 `spiffe://lumen/fixed-worker/<id>`다. Worker precheck는 CA 일치·서명·유효기간·fingerprint·cert/key pair와 controller private material의 재사용 여부를 검사한다. Worker registration/heartbeat의 fingerprint와 controller의 live registration·해당 run lease fence 검사는 별도 gate다; approved fixed-worker identity가 controller probe/cluster 관리 권한을 부여하지 않는다. Nova managed worker는 기존 resource/generation bootstrap·renewal identity를 계속 사용한다.
 
-Sandbox guest의 cgroup v2 parent는 `cgroup.controllers`에 `cpu memory pids`가 보이는 것만으로 충분하지 않다. 관리자 프로세스를 별도 leaf cgroup으로 이동하고 지정한 `SANDBOX_CGROUP_PARENT/cgroup.subtree_control`에서 세 controller가 실제 활성화되었는지 확인한다. 누락 시 daemon/workload는 workspace tmpfs mount 이전에 실패한다. `packages/lumen-sandbox/IMAGE.md`의 disposable Docker 양쪽 아키텍처 검증은 namespace/메모리/PID/디스크/네트워크 한계의 **로컬** 증거일 뿐, 운영 Nova/KVM security group·bootstrap mTLS 검증을 대체하지 않는다.
+Cloud profile은 project/region/interface/CA/Keystone application credential(env 또는 file reference)/`purpose=trusted|sandbox`를 명시한다. Trusted API/worker와 Nova sandbox는 **서로 다른 OpenStack project**를 사용한다. 유효한 pool 조합은 Nova `api|worker|sandbox`와 Kubernetes **on-demand `sandbox`**다. Zun trusted pool은 sandbox-only provider와 맞지 않고, Zun sandbox도 필수 namespace/cgroup/no-new-privileges 격리 정책을 provider가 강제하지 않으므로 **설정 검증에서 거부한다**. Zun을 사용하려면 해당 isolation을 create/preflight에서 강제하고 검증하는 구현이 선행되어야 한다. Enabled trusted pool에는 DB connection budget, API pool에는 operator-created Octavia ingress(`ingress_member_port`는 공개 HTTP, 별도의 `api_readiness_port`는 기본 8013), sandbox pool에는 workspace/memory/CPU/PID 및 격리 capability policy가 필요하다. Nova profile은 flavor/guest image ID와 SHA-256 hash를 검증한다. Sandbox image와 host isolation 사전 요구사항은 기존 격리 운영 절차를 따른다.
 
-Cloud provider의 `ACTIVE`는 서비스 readiness가 아니다. Controller는 소유권 label과 generation, 1회용 bootstrap token(10분), controller CA로 검증된 CSR 서명, certificate fingerprint, worker registration/heartbeat 또는 API guest 전용 mTLS `/v1/ready`·sandbox `/readyz`를 별도로 확인한다. Nova API image는 `guest_bootstrap --role api -- COMMAND`를 **foreground** entrypoint로 사용해야 한다. Guest entrypoint는 별도 mTLS readiness port에서 loopback public HTTP `/v1/ready` 응답의 database/plugins/checkpointer 상태를 검증한다; operator probe client certificate와 해당 port에 접근 가능한 managed-network security group, public HTTP command의 `ingress_member_port` 일치가 필수다. Octavia 공개 member port를 mTLS probe port와 혼동하거나 guest command를 daemonize하지 않는다. Trusted certificate는 1시간이며 boot timeout + max lifetime + drain grace + 60초 안전 여유가 이 안에 들어가야 한다. Controller는 새 ingress admission을 막고 resource 삭제를 요청하며, API guest supervisor는 certificate 만료 최소 60초 전에 public process group을 종료한다. Controller/Octavia 장애 시에도 이 foreground supervisor가 실행 중이어야 만료 후 외부 admission을 막을 수 있다. Sandbox는 run deadline을 포함한 인증서를 받아야 하고 인바운드 mTLS/권한 검증 외의 네트워크와 서비스 credential을 갖지 않는다. `GET /v1/admin/runtime-pools`, `/v1/admin/runtime-resources`, `/v1/admin/agent-project-quotas/{project_id}`(Keystone admin)로 inventory/기본 0의 project cap과 reservation을 관측한다. 이는 provider 실측 smoke를 대신하지 않는다.
+**Kubernetes sandbox prerequisite, controller-only credential과 manifest 사본:**
+
+- 운영자는 먼저 명시적인 owner/project의 **기존 Drover-managed Kubernetes cluster**를 준비한다. Lumen/Kolla는 cluster·VM·node를 생성/변경/삭제하지 않는다. RuntimeClass·CNI 설치와 실제 runtime/network qualification은 별도 operator prerequisite다. 선택적 renewable source는 해당 기존 cluster의 Drover `sandbox-connection`만 호출하며, Drover가 deployment/pool 전용 namespace·최소 RBAC·baseline default deny를 멱등 준비한다. Lumen은 준비된 namespace 안의 **on-demand sandbox Pod·bootstrap Secret·per-resource NetworkPolicy·NodePort Service lifecycle만** 소유한다. Namespace나 cluster lifecycle을 Lumen pool 생성/삭제에 연결하지 않는다.
+- `kubernetes_clusters[]`는 `id`, explicit HTTPS origin `server`, `ca_file`, `namespace`, `runtime_class_name`, `runtime_class_handler`, `cluster_cidrs`, `qualification_file`, `qualification_sha256`와 **정확히 하나의** `bearer_token` 또는 `drover` source를 제공한다. 기존 static `bearer_token: {file: "/etc/lumen/controller/kubernetes/drover/token"}` 설정도 유효하다. 두 source를 함께 넣거나 모두 생략하면 typed validation이 거부한다. Ambient kubeconfig/`KUBECONFIG`, admin kubeconfig, 다른 cloud identity로 보충하지 않는다. RuntimeClass handler는 `runsc` 또는 `kata`/`kata-…`이며 실제 cluster CIDR을 제공한다.
+- Pool은 `backend="kubernetes"`, `role="sandbox"`, **`min_replicas=0`**, 유한한 양수 `max_replicas`, immutable `image="<registry>/<image>@sha256:<64 lowercase hex>"`, 명시적 sandbox workspace/memory/CPU/PID 한도와 lifetime을 사용한다. `profile.backend="kubernetes"`와 `profile.cluster_profile_id`로 cluster 항목을 참조하며 `cloud_profile_id`, `network_id`, `security_group_ids`, trusted `guest_profile_id`는 넣지 않는다. `profile.tool_manifest_file`/`tool_manifest_sha256`는 controller 입력의 실제 bytes를 pin하고, `tool_manifest_path`(기본 `/opt/lumen-tools/manifest.json`)는 immutable sandbox **image 내부** 경로다. Kubernetes-only + fixed-worker 배포에서는 Batch를 기본 비활성(`lumen_batch_enabled: false`)으로 유지한다. Batch opt-in은 별도의 managed `online_text`·`batch` worker pool과 `workload_pools` mapping을 요구하며 Kubernetes sandbox pool로 대체하지 않는다.
+
+Kolla의 canonical host root는 `lumen_controller_secrets_dir`(기본 `/etc/kolla/lumen/controller`), controller의 read-only container root는 `/etc/lumen/controller`다. 다음은 cluster profile ID `drover`의 상대경로 배치 예시다. Typed field에는 host path가 아닌 container path를 넣는다. Manifest만 worker의 기존 제한 mount와 API의 별도 public-only mount에 같은 상대경로로 복제하고 credential/qualification은 controller에만 둔다.
+
+| Typed field | Operator host 파일 (기본 root) | Controller container path |
+| --- | --- | --- |
+| `kubernetes_clusters[].ca_file` | `/etc/kolla/lumen/controller/kubernetes/drover/ca.pem` | `/etc/lumen/controller/kubernetes/drover/ca.pem` |
+| `kubernetes_clusters[].bearer_token.file` | `/etc/kolla/lumen/controller/kubernetes/drover/token` | `/etc/lumen/controller/kubernetes/drover/token` |
+| `kubernetes_clusters[].qualification_file` | `/etc/kolla/lumen/controller/kubernetes/drover/qualification.json` | `/etc/lumen/controller/kubernetes/drover/qualification.json` |
+| `pools[].profile.tool_manifest_file` | `/etc/kolla/lumen/controller/kubernetes/drover/tools.json` | `/etc/lumen/controller/kubernetes/drover/tools.json` |
+| `kubernetes_clusters[].drover.password.file` (renewable 전용) | `/etc/kolla/lumen/controller/drover/password` | `/etc/lumen/controller/drover/password` |
+| `kubernetes_clusters[].drover.ca_file` (Keystone/Drover HTTPS trust) | `/etc/kolla/lumen/controller/drover/ca.pem` | `/etc/lumen/controller/drover/ca.pem` |
+
+위 manifest의 worker host 사본은 `/etc/kolla/lumen/worker/kubernetes/drover/tools.json`이며 worker 안에서는 동일한 `/etc/lumen/controller/kubernetes/drover/tools.json`으로 보인다. Basename만 `worker/tools.json`으로 평탄화하지 않는다. Kolla는 `lumen_public_manifest_source_dir`의 pinned manifest digest·schema를 먼저 검증한 뒤 승인된 public bytes만 `lumen_api_tools_dir`(기본 `/etc/kolla/lumen/api-tools`)의 같은 상대경로로 복제한다. Source directory 기본값은 controller가 활성인 host에서는 controller root, 나머지 host에서는 기존 worker directory다. API-only host는 public staging directory를 명시할 수 있다. API는 public-only directory를 `/etc/lumen/controller:ro`로 마운트하므로 manifest 설정 path를 바꾸지 않는다. API directory에는 활성 manifest와 정확한 ancestor directory만 허용한다; password·signing key·worker key·Kubernetes token·qualification은 거부한다. API selected-tool admission은 동일한 pinned public manifest를 읽고, worker도 DB/plugin 초기화·registration·새 claim 전에 manifest pin·크기·schema를 검증한다. Worker/controller는 실행 전에 frozen selection을 다시 검증하며 오류를 도구 누락이나 다른 실행 경로 fallback으로 숨기지 않는다.
+
+공유 loader는 최대 1 MiB의 pinned manifest bytes와 version 1, 중복 없는 profile/tool 이름, absolute command, JSON Schema object, 허용 effect를 검증한다. Pin으로 승인한 MCP 서버의 `input_schema`는 그대로 보존하며 builtin/plugin 전용 closed-object 규칙을 적용하거나 `additionalProperties: false`를 덧붙이지 않는다. 일반 plugin `ToolDefinition` 검증 정책은 바뀌지 않는다. 읽기·pin·schema 오류는 `runtime_kubernetes_manifest`로 드러난다.
+Graph binding 이름이 builtin/plugin/`run_code` 또는 앞서 주입한 다른 pool의 tool과 충돌해도 `runtime_kubernetes_manifest`로 실패하며, 먼저 있던 binding을 유지한 채 manifest tool을 조용히 누락하지 않는다.
+
+Static source의 Kolla `bearer_token`은 **`{file: "/etc/lumen/controller/…"}`**만 허용한다. Provider 자체의 기존 env reference 지원과 달리 role은 `bearer_token.env`와 mount 밖 경로를 거부한다. Renewable source에는 static token 파일이 필요 없다. 경로는 canonical이고 symlink가 없어야 한다. Controller root·nested directory는 root-owned 0700/0750, worker root·정확한 manifest ancestor는 root:root 0750으로 준비한다. Controller CA는 root-owned regular 0400/0600/0440/0640/0444/0644, static token·qualification·manifest 원본은 0400/0600이다. Worker manifest 사본은 root:root 0444/0644다. API public-only root·ancestor는 root:root 0755, manifest는 0444/0644로 non-root API가 읽는다. Operator precheck만 controller material을 검사하고, 별도의 API/worker role precheck는 각자의 mount만 받아 보호된 controller 참조를 열지 않는다. Worker key의 controller signing/listener/probe key 재사용 검사는 controller-side 검사에서 유지한다.
+
+**기존 cluster의 renewable Drover source:**
+
+`drover`는 다음 field만 허용한다. `endpoint`는 HTTPS Drover origin 또는 `/v1`, `auth_url`은 HTTPS Keystone `/v3`다. `user_id`와 `project_id`는 실제 native password identity의 명시적 ID다. `password`는 `ControllerSecretRef`인 `{file: "/etc/lumen/controller/drover/password"}`만 받고 env/inline password를 거부한다. `ca_file`은 `/etc/lumen/controller/drover/` 아래 canonical trust bundle path다. `cluster_id`는 기존 cluster의 canonical lowercase UUID다. `namespace_uid`와 `service_account`는 운영자가 실제 scoped connection에서 관측한 exact 값이다. `request_timeout_seconds`는 정수 1..300(기본 30), `refresh_margin_seconds`는 정수 30..120(기본 60)이다. Password 파일은 root:root regular **0600**, trust CA는 root:root regular 0400/0600/0444/0644이며 parent와 leaf symlink를 거부한다.
+
+Controller는 갱신마다 fresh Keystone password token을 발급받아 응답의 user/project, `methods=["password"]`, project scope와 남은 TTL ≥600초를 검증한다. 그 token만 사용해 명시적 `cluster_id`의 `POST /v1/clusters/{id}/sandbox-connection`에 `{deployment_id, pool_name, runtime_class_name}`을 보낸다. Deployment/pool은 현재 runtime/pool 설정에서 오며 다른 cluster나 권한을 선택하지 않는다. 응답 server·CA certificate identity·namespace·namespace UID·service account·RuntimeClass가 pin과 다르면 거부한다. Scoped token의 expiry는 미래이며 **응답 수신 시점의 남은 TTL이 900초 이하**, native token expiry 이하여야 한다. Drover가 요청 도착 후 발급하므로 outbound latency를 900초 한도에 잘못 더하지 않는다.
+
+동시 요청의 갱신은 mutex singleflight이고 wall/monotonic clock 양쪽으로 expiry 전에 갱신한다. HTTP client·pinned SSL context를 재사용하되 요청별 Authorization header를 따로 만든다. 401은 사용한 lease만 무효화하며 **그 요청을 재시도하지 않는다**. 특히 Pod/Secret/Service/NetworkPolicy POST·DELETE의 timeout/불확실한 응답은 재전송·자동 삭제 근거가 아니다. 실패한 갱신은 이전 token으로 fallback하지 않는다. IAM/Drover revocation은 다음 bounded renewal 또는 Kubernetes 401에서 차단되며 즉시 revocation oracle을 주장하지 않는다. Controller 종료는 in-flight 작업/stream을 drain한 뒤 credential/HTTP client를 닫는다. Token은 controller 메모리에서만 쓰며 SQL·API·worker·Pod에 전달하지 않는다.
+
+Operator는 production namespace의 실제 UID와 qualification을 pin해야 한다. 이전 throwaway qualification namespace, 과거 cluster endpoint/CA, broad admin kubeconfig를 runtime 입력으로 재사용하지 않는다. 위 계약과 synthetic 검증은 실제 native IAM·Drover·Kubernetes rollout 수용의 증거가 아니다.
+
+**한 controller와 여러 fixed API/worker host 배치:** `enable_lumen_controller`는 host별 bool template을 지원하므로, 예를 들어 `enable_lumen_controller: "{{ inventory_hostname == 'dms-controller1' }}"`로 한 host만 선택한다. 나머지 host는 typed config 검사와 각자의 public-manifest/worker-mTLS precheck만 수행하며 controller password·CA signing key·dispatch key를 요구하거나 마운트하지 않는다. Private dispatch 파일 stat도 enabled controller host에만 적용한다. 모든 host의 `runtime_config.controller_url`은 같은 명시적 HTTPS controller endpoint를 가리키며, `lumen_controller_listen_address`는 선택한 host의 실제 bind IP, `lumen_controller_listen_port`와 typed `listen_port` 기본값은 **8013**이다. 각 host에 controller service를 켜고 다른 host IP에 bind하는 방식으로 배치하지 않는다.
+
+Controller의 `tls`에는 `ca_file`, `ca_key_file`, `cert_file`, `key_file`, 전용 `operator_client_cert_file`/`operator_client_key_file`과 fixed worker용 `worker_client_cert_file`/`worker_client_key_file` 경로를 설정한다. Signing/listener/operator private material과 `dispatch_key.file`은 controller host에만 둔다. 각 worker host는 같은 public CA와 자기 전용 client leaf/key를 worker directory에 둔다; leaf의 URI SAN은 `spiffe://lumen/fixed-worker/<id>`, `fixed_workers`에는 모든 허용 worker의 `{id, certificate_fingerprint}`를 등록한다. Fingerprint는 각 leaf의 SHA-256 lowercase 64 hex이며 승인 목록과 실제 host leaf가 일치해야 한다. API는 이 worker key를 받지 않는다. 인증서 SAN·trust·native owner/project·namespace UID와 실제 routing은 operator가 별도로 검증하며 새 LB route를 만들지 않는다.
+
+**Namespace·network·qualification gate:**
+
+1. 전용 namespace에 `lumen.dev/deployment`, `lumen.dev/pool` label과 같은 key의 exact 원문 annotation을 준비한다. 일반적인 label 값은 `deployment_id`/pool `name` 그대로이고 Kubernetes label 형식/길이를 넘는 값은 provider의 `h-` + SHA-256 앞 60자리 selector 규칙을 따른다. `pod-security.kubernetes.io/enforce=restricted`와 전체 Pod를 선택하는 `lumen-default-deny`(`podSelector: {}`, `policyTypes: [Ingress, Egress]`, ingress/egress allow 없음)를 사전 배치한다. 별도 broad allow policy로 이를 우회하지 않는다; 다른 policy는 해당 deployment/pool의 exact owned per-resource policy여야 한다.
+2. Controller credential에는 대상 namespace의 Pods·Services 각각 `get,list,create,delete`, Secrets `get,create,delete`, NetworkPolicies `get,list,create,delete`, namespace/RuntimeClass `get`과 non-persisted authorization review 권한만 준다. `authorization.k8s.io`의 `selfsubjectaccessreviews`·`selfsubjectrulesreviews`는 `create`만 허용하며, 기본 identity 조회 grant인 **`authentication.k8s.io`의 정확한 `selfsubjectreviews` resource에 대한 `create`만** 추가 허용한다; 다른 resource·verb나 wildcard 허용이 아니다. Wildcard·namespace-admin·Secret `list/watch`·무관한 resource operation은 preflight가 거부한다. 다른 namespace/cluster의 grant까지 namespace review가 발견하는 것은 아니므로 operator가 전체 credential scope를 별도로 제한/qualification한다. Pod에는 service-account token을 automount하지 않는다.
+3. Controller와 fixed/managed worker host에서 **해당 Pod가 실행되는 node IP(`status.hostIP`)의 할당된 NodePort**로 연결할 수 있어야 한다. 방화벽·routing은 이 source host들에서 cluster에 설정된 TCP NodePort 범위(기본 `30000–32767`, 변경했다면 실제 범위)로의 접근을 허용해야 하며, Pod IP 직접 접근을 전제로 하지 않는다. Controller/worker의 `managed_networks`에는 연결 대상 **node IP들**도 포함한다. Service는 `externalTrafficPolicy: Local`로 nodePort→Pod TCP8013을 전달하여 원래 source IP를 보존한다; `profile.controller_ingress_cidrs`에는 controller와 fixed/managed worker의 실제 source 주소를 exact host CIDR(`/32` 또는 `/128`)로 모두 넣어 Pod ingress policy와 일치시킨다. `bootstrap_egress_cidrs`도 HTTPS `controller_url`의 port로 bootstrap할 exact host CIDR만 받는다.
+
+   `egress="none"`(기본)은 bootstrap 외 외부 egress/DNS를 열지 않으며 `dns_server_cidrs`는 비어 있어야 한다. `egress="public"`은 **1–3개 explicit `dns_server_cidrs` exact host CIDR**를 요구한다. Pod는 `dnsPolicy: None`, 해당 host IP들만 nameserver로, `ndots: "1"`과 빈 search 목록을 사용하여 cluster/host DNS·search suffix를 상속하지 않는다. Public policy는 해당 DNS host의 UDP/TCP53과 private/metadata/cluster CIDR을 제외한 public TCP80/443만 연다. 사이트별 추가 제외 범위는 **`profile.egress_deny_cidrs`**에 strict network CIDR로 명시한다(기본 빈 tuple, 최대 64개, host bit가 설정된 network는 거부); 이 범위도 public TCP80/443 허용 대상에서 제외한다. 실제 CNI enforcement·source IP 보존·NodePort routing·DNS·controller/worker↔sandbox 연결과 runtime의 CPU/memory/workspace/PID 한도를 operator가 qualification해야 한다; API policy object 존재는 그 증거가 아니다.
+4. Operator-approved qualification JSON은 `version=1`, `server`(trailing slash 제외), `namespace`/`namespace_uid`, `runtime_class_name`/`runtime_class_handler`/`runtime_class_uid`/`runtime_class_spec_sha256`, `cluster_cidrs`, `pool_digest`, 실제 `runtime_probe_sha256`/`cni_probe_sha256`, `measured_pids_max`(1..sandbox `pids_limit`)를 결합한다. `runtime_class_spec_sha256`는 RuntimeClass에서 metadata/apiVersion/kind를 제외한 canonical JSON SHA-256이다. `qualification_sha256`는 report 파일 전체 bytes를 pin한다. **설정에 `egress_deny_cidrs`를 생략해도 기본 Pydantic `model_dump(mode="json")`에 `egress_deny_cidrs: []`가 포함되어 기존 Kubernetes pool의 `pool_digest`가 바뀐다.** Digest에 기본값 제외나 custom 호환 처리를 넣지 않는다. Cutover 전에 기존 resource를 drain·정리하고 새 pool digest와 실제 network/runtime evidence로 qualification을 재생성한 뒤 파일 hash pin을 갱신한다. Provider identity에도 이제 Pod UID와 함께 Service UID가 포함되고 `auxiliary-uids`에도 Service UID가 기록된다; 이전 compact identity 형식은 거부되므로 기존 resource를 새 identity로 자동 adopt한다고 가정하지 않는다. 예시/boolean attestation을 실제 probe evidence로 바꾸어 적지 않는다. Kolla precheck는 파일 권한·bytes hash와 정적 field binding을 검사할 뿐 live UID/spec/RBAC/network를 조회하지 않는다.
+5. 실제 deployment gate는 controller 시작 시 enabled pool마다 호출하는 **`KubernetesProvider.preflight(pool)`**다. API에서 non-terminating namespace ownership/`restricted`, RuntimeClass handler와 qualification의 UID/spec binding, manifest pin, default deny와 나머지 policy의 exact spec/ownership, complete `SelfSubjectRulesReview`를 확인해야 listener/reconciliation이 시작된다. Create 전에도 같은 preflight를 다시 수행한다. 이 문서는 이 gate의 source 계약이며 Drover 배포·Kubernetes live preflight·sandbox 실행·production isolation 수용의 실행 결과가 아니다.
+
+**Run-scoped Kubernetes MCP tool path (source-defined, native/production acceptance pending):**
+
+Protocol v2 durable worker는 자기 run lease의 owner/fence를 graph에 전달한다. Graph는 enabled Kubernetes sandbox pool의 pinned tool manifest를 읽어 승인된 Playwright/filesystem tool을 기존 effect policy·approval·durable tool segment 경로에 등록한다. 일반 remote `mcp_ids` 등록과는 별도이며, 이 로컬 stdio MCP 경로를 위해 public remote transport의 SSRF 제한을 완화하지 않는다.
+
+첫 승인된 호출은 `ensure_sandbox_for_run`으로 해당 run/pool의 sandbox를 on-demand 확보한다. Worker는 controller에서 run/resource generation/lease fence/call fingerprint에 묶인 capability를 받은 뒤 identity-pinned mTLS로 sandbox의 `POST /v1/mcp/executions`를 호출하고 `GET /v1/executions/{id}`로 결과를 회수한다. Pod 안의 승인된 stdio MCP process가 도구를 실행하며 cluster token·controller signing key는 받지 않는다. Terminal/cancel/descendant 종료는 기존 durable sandbox release intent와 controller의 exact owned-resource 회수 경로를 따른다. HTTP/SSE disconnect나 외부 connector의 세션 종료가 이 lifecycle을 대신하지 않는다.
+
+호출 전 authenticated `GET /v1/workspace`에서 durable revision을 읽으므로 도구별 closure나 승인 대기 전 worker의 로컬 카운터를 재사용하지 않는다. MCP stdio response frame은 8 MiB, execution-status HTTP body는 frame+64 KiB envelope, 개별 generated file은 5 MiB로 제한한다. Model/display preview는 각각 JSON-escaped UTF-8 8/16 KiB 이내이며 긴 전체 텍스트는 기존 generated-file asset 경로에 보존한다. 따라서 binary/base64나 긴 snapshot 자체를 64 KiB durable tool-result checkpoint에 복사하지 않는다. `tools_enabled=false`는 sandbox·delegation 광고와 실행 모두 거부한다.
+
+Migration027(`027_kubernetes_sandboxes.sql`)은 runtime pool/resource에 nullable cluster/namespace 열과 provider identity unique index를 추가하고 기존 OpenStack scope nullable 및 backend CHECK를 확장한다. 새 ORM writer는 이 열이 없는026 schema를 읽을 수 없으므로 백업·기존 admission/worker/controller drain·정지 뒤 schema-first로 교체한다. 기존 Nova/Zun row 값은 보존되지만 Kubernetes row가 생긴 뒤 old writer와의 혼용/이미지만 되돌리는 rollback을 보장하지 않는다. 복원 snapshot에서 upgrade·read/write·재적용과 cold restore를 먼저 검증하고, rollback은 보존한 DB/checkpointer/키와 이전 cohort를 함께 복원하는 경계로 취급한다.
+
+운영 승격 전에는 실제 Drover cluster의 runtime/CNI·NodePort·mTLS·resource 한도, current cohort의 native discovery→approve/deny→resume→tool result/journal, run 간 격리와 terminal/cancel/descendant 회수를 관측해야 한다. Image build/import·manifest pin·readiness만으로 성공을 표시하지 않는다. 현재 미검증 경계는 [테스트 수용 상태](testing.md#run-scoped-kubernetes-tool-cutover-acceptance-pending)에 기록한다.
+
+
+Nova sandbox guest의 cgroup v2 parent는 `cgroup.controllers`에 `cpu memory pids`가 보이는 것만으로 충분하지 않다. 관리자 프로세스를 별도 leaf cgroup으로 이동하고 지정한 `SANDBOX_CGROUP_PARENT/cgroup.subtree_control`에서 세 controller가 실제 활성화되었는지 확인한다. 누락 시 daemon/workload는 workspace tmpfs mount 이전에 실패한다. `packages/lumen-sandbox/IMAGE.md`의 disposable Docker 양쪽 아키텍처 검증은 namespace/메모리/PID/디스크/네트워크 한계의 **로컬** 증거일 뿐, 운영 Nova/KVM security group·bootstrap mTLS 검증을 대체하지 않는다.
+
+Cloud provider의 `ACTIVE`는 서비스 readiness가 아니다. Controller는 소유권 label과 generation, 1회용 bootstrap token(10분), controller CA로 검증된 CSR 서명, certificate fingerprint, worker registration/heartbeat 또는 API guest 전용 mTLS `/v1/ready`·sandbox `/readyz`를 별도로 확인한다. Nova API image는 `guest_bootstrap --role api -- COMMAND`를 **foreground** entrypoint로 사용해야 한다. Guest entrypoint는 별도 mTLS readiness port에서 loopback public HTTP `/v1/ready` 응답의 database/plugins/checkpointer 상태를 검증한다; operator probe client certificate와 해당 port에 접근 가능한 managed-network security group, public HTTP command의 `ingress_member_port` 일치가 필수다. Octavia 공개 member port를 mTLS probe port와 혼동하거나 guest command를 daemonize하지 않는다. Trusted leaf는 기본 1시간이며 supervisor가 기본 20분마다 새 key/CSR로 갱신·활성화한다. 정상 갱신은 child PID와 기존 연결을 유지하고 VM의 전체 수명을 한 leaf 안에 제한하지 않는다. 갱신 실패 시 현재 leaf 또는 CA 만료 중 더 이른 시각의 60초 전 cutoff에 앞서 신규 admission/claim을 막고 cutoff에서는 process group을 종료한다. Controller/Octavia 장애 시에도 이 foreground supervisor가 실행 중이어야 신뢰 만료 후 작업을 막을 수 있다. Sandbox의 run-deadline certificate 계약은 변경하지 않는다. `GET /v1/admin/runtime-pools`, `/v1/admin/runtime-resources`, `/v1/admin/agent-project-quotas/{project_id}`(Keystone admin)로 inventory/기본 0의 project cap과 reservation을 관측한다. 이는 provider 실측 smoke를 대신하지 않는다.
 
 Managed runtime의 controller CA에는 `BasicConstraints CA=true`, `KeyUsage keyCertSign`, strict X.509 검증을 위한 `SubjectKeyIdentifier`가 필요하다. Bootstrap guest leaf의 `AuthorityKeyIdentifier`는 CA의 실제 `SubjectKeyIdentifier`를 사용한다. CA에 이 확장이 없으면 공개키에서 유도하지만, 운영 strict 검증에 그 CA가 적합하다는 뜻은 아니다. 최신 OpenSSL의 strict 검증은 leaf 식별자가 없으면 dispatch 전에 TLS 연결을 거부한다. 기존 CA를 자동 교체하지 말고 실제 운영 CA 확장과 guest mTLS 연결을 확인한다.
 
-Octavia member create/re-enable는 MariaDB pool lease fence 아래에서 실행되지만 SDK가 Octavia에 반영한 뒤 응답 전에 실패하면 member ID가 원장에 기록되지 않을 수 있다. API guest를 제거하거나 해당 pool을 정상 완료로 판단하기 전 Octavia pool에서 `lumen-<resource_id>` member를 조회하고 남은 enabled member를 operator가 disable/delete한다. Name 조회가 일시적으로 비어 있는 경우에도 실제 cloud 상태 확인 없이 삭제 완료나 traffic 차단을 추정하지 않는다.
+Octavia member create/re-enable는 MariaDB pool lease row lock을 SDK thread의 실제 완료까지 유지하며, 진행 중 lease를 갱신한다. 응답 유실 뒤 durable one-shot intent를 재전송하지 않고 resource/generation tag·name·address·port·subnet이 모두 일치하는 member만 adopt한다. 이미 기록된 member ID는 직접 `get_member(member_id,pool_id)`로 확인하며 SDK `ResourceNotFound`만 부재 증거다. 빈 name listing이나 다른 read 오류로 traffic 차단/삭제 완료를 추정하지 않는다. 불명확한 create는 VM/할당량을 유지하므로 operator는 정확한 소유권과 cloud 상태를 대조해야 한다; name만 보고 다른 member를 disable/delete하지 않는다.
+
+### Admission·scale-in·Kolla ingress
+
+`api_max_active_requests`, `api_max_sse_connections`, `api_max_websocket_connections`는 단일 guest process의 예약 상한이다. HTTP는 ASGI 진입에서, SSE는 auth/schema 이후 provider I/O·durable admission 전에, WS는 ticket/token 소비·upstream 전에 예약한다. HTTP/SSE 포화는 429와 `Retry-After: 1`, drain은 503이며 WS handshake도 HTTP 503으로 거부한다. `api_max_body_bytes`는 Content-Length와 실제 receive bytes에 적용된다. Health/readiness/private drain은 사용자 capacity에서 제외한다. 기존 연결은 새 한도나 drain으로 강제 종료하지 않는다.
+
+HTTP/SSE/WS reservation과 실제 active counter는 마지막 body/socket close만으로 해제하지 않는다. ASGI finally 및 provider/usage 정산·iterator close가 끝날 때까지 유지한다. Compat SSE pending read/drain은 shielded inline cleanup으로 기다리며 detached task로 넘기지 않는다. API scale-in은 durable intent → private admission fence ack → member weight 0/admin-up 및 member/pool ACTIVE → 10초 이내 zero HTTP/SSE/WS와 현재 fence ack → member 삭제/부재 및 pool ACTIVE → Nova 삭제 순서다. 정산이 막힌 guest를 fresh-zero로 오인하거나 grace 초과만으로 강제 회수하지 않는다.
+
+API/online text/online media/batch reconcile은 독립 pool lease(30초, 10초 갱신)를 사용한다. 수요는 HTTP+WS(SSE 중복 합산 없음), worker SQL eligibility aggregate 및 bounded service-time EWMA로 계산한다. DB/PG의 fixed/controller reserve와 pool별 budget을 분리하고 normal demand에는 replacement surge를 쓰지 않는다. Stale registration은 serving capacity가 아니지만 physical occupancy에 남는다. Replacement는 새 guest가 실제 ready(또는 API ingress ACTIVE)일 때만 기존 guest를 drain한다. Worker 삭제는 durable ack와 live run/auxiliary lease 및 local auxiliary count 0을 모두 요구한다.
+
+`lumen_api_dynamic_ingress_vip`가 있을 때만 내부/public HAProxy backend가 validated VIP/port의 `custom_member_list`로 전환된다. 없으면 기존 inventory backend를 유지한다. Readiness health path는 `/v1/ready`, container liveness는 `/v1/health`다. `lumen_api_proxy_idle_timeout_seconds`의 client/server/tunnel timeout을 양 listener와 Octavia client/member data timeout(ms)에 맞춘다. Shared external TLS frontend는 실제 `haproxy_external_single_frontend_options`에 **client** timeout만 설정한다; server/tunnel은 backend에 남기며 frontend에 `timeout tunnel`을 넣지 않는다.
+
+Kolla precheck는 release의 strict `RuntimeConfig`, 실제 controller mount의 root-owned regular TLS/dispatch 파일 존재·private 0600/0400, guest config mode/hash·합성 Settings 정책, CA signing/SKI/expiry, explicit reserves 및 operator Glance/OCI attestations를 확인한다. Batch/media에는 HTTPS S3·credential·scanner와 명시적 encryption mode(`none|AES256|aws:kms`, KMS key 필수)를 요구한다. `REPLACE_WITH_*`, `YOUR_*`, `EXAMPLE_*`와 zero UUID cloud identity는 `runtime_cloud_identity`로 거부한다. Attestation과 파일 metadata 검사는 live cloud 조회나 TLS chain acceptance 증거가 아니며 cloud quota/Octavia provider capability·실제 deployment 수용은 별도 gate다.
+
+
+### Trusted guest artifact·설정·갱신
+
+`deploy/nova/build-guest.sh`는 native Ubuntu 24.04 amd64/arm64 builder에서 실행한다. 필수 입력은 `--role api|worker`, `--arch amd64|arm64`, digest-pinned `--image`, dated Ubuntu squashfs의 `--ubuntu-url`/`--ubuntu-sha256`, `--ubuntu-snapshot`, Docker package lock의 `--docker-packages`/`--docker-packages-sha256`, `.qcow2`로 끝나는 `--output`이다. DIB·skopeo·qemu-img 등 build tool을 미리 제공해야 하며 입력 hash·package version/architecture·OCI platform을 검증한다. 출력은 qcow2, `.sha256`, `.manifest.json`이다. Guest는 검증해 preload한 immutable OCI image ID를 `--pull=never`로 실행한다. Boot 중 apt/pip/image pull은 하지 않는다. 실제 qcow2 build·Glance 등록·Nova boot는 별도 staging gate이며 로컬 artifact test만으로 완료 표시하지 않는다.
+
+Release 첨부는 수동 `.github/workflows/nova-guest.yml`만 사용한다. Canonical `dev`/`main`에서 이미 게시된 `v*` tag, 그 tag의 full commit SHA, 같은 release의 `lumen-api`/`lumen-worker` GHCR index digest와 public pin JSON을 입력한다. JSON은 정확히 `{"dib_version":"X.Y.Z","amd64":{...},"arm64":{...}}`이며 architecture마다 `ubuntu_url`, `ubuntu_sha256`, `ubuntu_snapshot`, `docker_packages_url`, `docker_packages_sha256` 다섯 key만 허용한다. `deploy/nova/release.py`는 tag/commit 일치, release 게시, 해당 commit의 builder 존재와 push/dispatch `docker-build.yml`·`release.yml` 성공, required reviewer + self-review 금지 `nova-guest-build` environment를 확인한다. Version tag의 manifest bytes가 입력 digest와 같고 선택한 platform config의 OS/architecture/revision label이 release와 일치해야 build한다. Native amd64/arm64 runner의 네 role 산출물은 publish job이 portable checksum·manifest provenance/pin·qemu-img check로 다시 검증하고 같은 이름 asset을 덮어쓰지 않는다. 이 workflow는 PR 코드나 cloud credential을 받지 않으며 Glance 등록·Nova boot를 수행하지 않는다.
+
+Guest unit/container에는 `docker stop --time -1`과 `TimeoutStopSec=infinity`를 적용해 자체의 짧은 강제 종료 한도를 제거했다. 다만 기존 root supervisor는 외부 SIGTERM에서 child를 10초 후 SIGKILL하므로, 이 outer 설정만으로 operator stop/reboot의 active-call drain이 보장되지는 않는다. Controller scale-in은 persisted worker drain→zero-live-lease ack→child 자체 종료를 사용한다. Managed pool 활성화 전에 실제 supervisor/operator shutdown 수용과 이 cutoff 정책을 별도로 결정하고 검증한다. 종료 지연은 강제 재배정 근거가 아니며 disposable test-layer의 `down -v --timeout 1`을 운영 shutdown에 사용하지 않는다. Artifact build toolchain(DIB/skopeo/qemu-img), dated OS snapshot, Docker lock의 모든 dependency 및 checksum, API/worker OCI digest와 Glance `os_hash_value`를 release evidence에 함께 보존한다. amd64/arm64 builder 명칭은 pool/Glance의 x86_64/aarch64 명칭과 구분한다.
+
+
+Trusted pool의 `guest_profile_id`는 controller의 `guest_profiles` 항목을 참조한다. Profile의 config 파일은 root-owned regular 0600이며 `config_sha256`와 일치해야 한다. `config_keys`와 `secret_env_names` allowlist 밖의 값은 전달하지 않는다. Resource 생성 시 profile ID/digest를 동결하고 guest는 mTLS `GET /v1/runtime/guest-config`의 role/resource/generation/image/profile을 cloud-init identity와 대조한다. Mode/hash 오류는 503 `guest_profile_unavailable`, profile 변경은 409 `guest_profile_changed`이며 child를 시작하지 않는다. DB/Redis/encryption 등 서비스 secret만 전달하고 cloud credential·CA signing key·dispatch key는 controller에 남긴다.
+
+Root supervisor는 `/var/lib/lumen/identity/<version>/`를 root:appuser 0750, identity 파일을 0440으로 쓰고 `current` symlink를 원자 교체한다. `/run/lumen/lumen.conf`와 allowlisted secret을 제공한 뒤 child를 appuser UID/GID·별도 process group으로 시작한다. Bootstrap token은 root-only 0600으로 읽고 교환 후 제거한다. 갱신 UUID/key/CSR과 pending version을 activate 전에 저장해 응답 유실·재시작을 복구한다. Controller activation은 resource와 registration fingerprint를 한 transaction에서 바꾸며 current/유효 previous pin만 일반 내부 호출에 허용한다. 기본 previous overlap은 120초이며 pending pin은 activation에만 허용한다. 이미 활성화된 요청의 renew는 409 `renewal_already_activated`; 복구는 저장된 pending certificate로 activate replay를 수행한다.
+
+API private `POST /v1/drain`은 allowlisted operator mTLS certificate와 `{resource_id,generation,fence}`를 요구한다. Root-only `/var/lib/lumen/drain/state.json`의 최대 fence를 유지하며 낮은 fence는 거부한다. Supervisor는 per-boot token으로 loopback-only `/v1/internal/drain`에 전달하고 재시작/갱신 뒤에도 다시 적용한다. Private readiness의 load는 실제 HTTP/SSE/WS counter와 10초 이내 timestamp를 요구한다; 누락·stale 값은 0으로 대체하지 않는다. 공개 readiness는 draining 동안 503이며 private counters는 provider/정산 cleanup까지 살아 있다. 실제 Nova/Octavia 및 장기 연결 수용은 별도 staging gate다.
+
 
 ## Media 모델 운영과 realtime 장애 대응
 
@@ -99,6 +446,26 @@ Migration `020_media_model_registry.sql`로 model kind/media 가격을 준비한
 
 Media reservation은 provider I/O 직전에 user wallet row lock으로 월·주·API-key 사용액과 `reserved|unknown` bound를 합산한다. 비용이 확정되면 actual usage ledger와 `settled` 상태가 같은 transaction에 기록된다. Provider result 불확실 시 자동 release 금지: `chat_runs`, `chat_run_segments`, `chat_model_call_reservations`, `chat_usage_logs`의 run_id와 provider 청구 내역을 대조하고 비용·asset 상태를 결정한 뒤 관리 승인 하에 원장/hold를 일관되게 수동 조정한다. Realtime admission 후 Redis ticket 발급 실패 시 queued run은 동일 `Idempotency-Key`로 재요청해 ticket을 다시 발급할 수 있지만 사용된 ticket/진행 중 session은 재사용할 수 없다. Browser ticket은 60초 단일 소비이며 회전·로그아웃·project 전환에서 WS와 마이크를 닫는다.
 
+### OpenAI image·음성·realtime 모델 커버리지 (2026-11-10, source only)
+
+지원 모델 ID와 kind별 wire는 [API reference](api-reference.md#이미지유한-오디오실시간-음성)가 정본이다. 2026-11-10 운영 계정 키로 공식 OpenAI에 대해 transport 단독 호출을 확인했다. 실행 worker 컨테이너에 임시 `lumen/`을 올려 서비스 재시작·DB 쓰기 없이 호출하고 제거했다. 관측 범위: 이미지 7개 모델 생성·편집, 사용자 지정 size, `xhigh`, `complexity`, `n=2`; TTS 3개; STT 4개; relay 대화 6개, 전사 2개, 번역 1개, 라이브 1개와 kind별 whitelist 거절 3건. 이 기록은 새 catalog 과금, GIF/SVG entitlement 또는 배포를 검증한 것이 아니다.
+
+토큰 기준에서 미설정 단가의 캐시 사용량은 `provider_result_unknown`/hold `unknown`으로 남긴다. 2026-11-10 로컬 실제 호출에서 캐시 단가 없는 `gpt-realtime`·`-mini`·`-1.5`가 반복 호출 시 간헐적으로 이 상태가 되었고 단가 추가 후 12회 모두 `completed`였다. 당시 로컬 실제 공급자 스택에서 `gpt-image-1`만 계정에 없는 모델로 실패했다. 현재 종료된 `gpt-image-1`은 실행 allowlist에서 제거했다. Direct OpenAI Images의 cache 적용 범위와 예약 방법은 [이미지 자금 예약 정책](#openai-images-funding-policy)을 참조한다.
+
+**동시 admission·지갑·거절 정산 (이번 변경에서 수정).** (1) 마이그레이션 `030_chat_runs_idempotency_index.sql`이 `chat_runs (project_id, user_id, client_request_id)` unique 인덱스 `uq_chat_runs_idempotency`를 만든다. ORM 모델은 처음부터 선언했지만 baseline이 만들지 않아, 같은 멱등 키의 동시 admission은 `SELECT ... FOR UPDATE`의 gap 락으로만 직렬화됐고 같은 gap 락이 같은 provider 동시 admission을 MariaDB 1213 교착(HTTP 500)시켰다(로컬 동시 이미지 8건 중 7건). 이제 이미지·오디오·realtime admission은 READ COMMITTED로 실행하고 unique 인덱스가 권위가 된다. 경합한 중복은 1062로 실패하고 기존 `IntegrityError` 경로가 승자 run을 돌려준다. **인덱스 없이 READ COMMITTED만 적용하면 같은 키 12건이 run 12개로 admitted되므로(중복 실행·과금) API보다 migration을 먼저 적용해야 한다.** 중복 키가 있는 DB에서는 `1062`로 중단되므로 적용 전에 `SELECT project_id, user_id, client_request_id, COUNT(*) FROM chat_runs GROUP BY project_id, user_id, client_request_id HAVING COUNT(*) > 1;`를 확인한다(운영 DB는 2026-11-10 읽기 전용 조회에서 36행·중복 0건). (2) `credit._get_or_create_wallet`은 지갑이 없으면 no-op `INSERT ... ON DUPLICATE KEY UPDATE`와 잠금 재조회로 만들고, `credit.precheck`는 REPEATABLE READ 스냅샷을 쥐므로 잠금 충돌(1020/1205/1213)을 `budgets.retry_deadlocks`로 재시도한다. 신규 사용자의 동시 첫 요청이 더 이상 wallet 기본 키 중복이나 교착으로 실패하지 않는다. (3) 온라인 이미지·TTS·STT에서 provider 거절의 HTTP 상태가 기존 `_REJECTION_STATUSES`(400, 401, 403, 404, 413, 415, 422, 429)에 있으면 추론 이전의 거절로 보고 run을 `provider_rejected`로 실패시키며 hold를 같은 트랜잭션에서 0원으로 정산한다(이전에는 Batch만). 그 밖의 실패는 계속 `provider_result_unknown`/hold `unknown`이다. 호출자는 400(400/413/415/422), 429, 502(401/403/404, 운영자 설정 문제)를 받고 메시지에 provider 숫자 상태가 들어간다. **provider가 거절된 미디어 요청에 실제로 과금하는지는 확인하지 않았다(예: 생성 후 safety 차단).** 청구서와 대조하고, 과금이 확인되면 이 규칙을 좁혀야 한다.
+
+**네이티브 텍스트 admission (이번 변경에서 수정).** `create_persistent_run`, `create_run`, `create_temp_run`, `create_compaction_run`(`durable_runs/admission.py`)은 REPEATABLE READ에서 멱등성 `SELECT ... FOR UPDATE`(새 키의 gap 락) → `_lock_run_configurations` → INSERT 순서여서 media와 같은 MariaDB 1213 교착이 났다. 처음에는 코드 검사만으로 의심했고 재현하지 않았지만, 같은 사용자가 같은 provider로 12건을 동시에 보내는 통합 테스트(`tests/integration/test_text_admission_concurrency.py`)가 수정 전 코드에서 12개 케이스 중 8개를 실패시켰다(2026-11-10 전체 결과 `8 failed, 4 passed`, 실패한 케이스마다 12건 중 11건이 `1213`): temp의 distinct key·one-key, persistent의 distinct key, run의 distinct key를 `innodb_snapshot_isolation` ON/OFF 모두에서. persistent·run의 한 키 12건은 같은 대화 행 락이 직렬화하므로 수정 전에도 통과했다. 이제 네 함수의 transaction은 첫 문장으로 `SET TRANSACTION ISOLATION LEVEL READ COMMITTED`를 실행하고, `_replay_idempotency_race` 데코레이터가 같은 키 경합의 패자가 만난 `IntegrityError`(unique `uq_chat_runs_idempotency`)를 승자 run의 replay로 바꾼다(다른 intent면 기존 `idempotency_key_reused_with_different_intent`). **migration 030이 먼저 적용돼 있어야 한다.** 수정 후에는 12개 케이스가 모두 통과한다. `create_compaction_run`에도 같은 수정을 적용했지만 이를 직접 실행하는 동시성 테스트는 없다.
+
+**스키마 인덱스 드리프트와 부트스트랩 자체 복구 (이번 변경에서 수정).** baseline이 `CREATE TABLE`로 만들어져 ORM `Index(...)`가 migration에 반영되지 않았다. 2026-11-10 대조에서 unique 4개(`uq_chat_runs_parent_delegation`, `uq_chat_run_segments_boundary`, `uq_chat_run_segments_ordinal`, `uq_chat_run_turn_message_event`)와 일반 인덱스 44개(예: `idx_chat_runs_temp_status`, `idx_chat_runs_root_status`가 없어 활성 run `FOR UPDATE` 조회가 잠금 스캔이었다)가 DB에 없었고(테이블·컬럼은 모두 일치), migration `031_orm_index_catchup.sql`이 테이블당 하나의 `ALTER TABLE ... ADD [UNIQUE] INDEX IF NOT EXISTS`로 48개를 한 번에 추가한다(online InnoDB DDL, 재실행 안전). 운영 DB는 같은 날 읽기 전용 조회에서 네 unique 키 모두 중복 0건이었고 테이블이 작다(최대 127행). unique 추가는 중복 키가 있으면 1062로 중단하고 데이터를 지우지 않는다. **forward028 정확 비교는 `chat_usage_logs`의 두 인덱스(`idx_chat_usage_user_created`, `idx_chat_usage_project_created`)를 `provider_account_migration.POST_CUTOVER_INDEXES`로 무시한다.** 그렇지 않으면 031 이후 모든 `lumen-migrate` 재실행이 `schema_drift_chat_usage_logs`로 거부된다. 또한 `lumen-migrate --apply`(compose `migrate`, Kolla bootstrap, CI)는 검증된 ledger를 적용한 뒤 `lumen/scripts/schema_repair.py`로 실제 스키마를 `lumen/data/schema_snapshot.sql`과 비교해 **추가만 하는 복구**를 자동 실행한다. **복구 기준은 ORM이 아니라 이 snapshot이다.** snapshot은 ledger migration만으로 만든 DB의 `SHOW CREATE TABLE`(AUTO_INCREMENT·표시 폭·테이블 기본 charset 제거)이고, `tests/integration/test_schema_index_drift.py`가 ledger 결과와 다르면 실패시킨다. 처음 구현은 ORM `create_all`로 테이블을 만들었는데, 실제 실행에서 `datetime(6)`가 `datetime`으로, `DEFAULT 'reserved'`·`DEFAULT current_timestamp(6)`가 사라지고 FK·key 이름이 달라졌으며 탐지기가 타입·기본값을 보지 않아 영원히 "드리프트 없음"으로 보고했다. 지금은 snapshot DDL로 만들어 기본값·정밀도·key·FK 이름이 ledger와 같다. 자동 복구 대상: 없는 nullable 또는 DEFAULT가 있는 컬럼(PK·FK·CHECK 컬럼 아님, snapshot 정의 그대로 추가), 없는 index·unique key(unique는 먼저 중복 키 조회), 그리고 **빈 상태로 다시 만들어도 되는 임시 조정 테이블 4개의 누락**(`chat_scheduler_leases`, `chat_worker_registrations`, `chat_memory_owner_locks`, `chat_gateway_device_grants`: lease·worker 등록·lock row·대기 중 device 로그인이라 실행 중인 시스템이 스스로 다시 만든다). 복구한 항목은 WARNING 로그 `schema repair: ...`로 남는다. **정책은 기본 거부다(`schema_repair.RECREATABLE_EMPTY`).** 이 4개 외의 모든 테이블(65개 중 61개)은 누락돼도, 그 테이블의 컬럼이 누락돼도 복구하지 않고 첫 DDL 이전에 모든 이유를 나열하며 `MigrationLedgerError`로 실패해 API·worker가 뜨기 전에 막힌다. 사용자 콘텐츠·대화 이력·잔액·자격 증명·run journal·cloud resource를 빈 테이블로 조용히 바꾸면 손실이 가려지거나 잔액이 초기화되기 때문이고, 실행기 자신의 `_verify_active_paths`가 membership·active path 누락을 DDL 이후에야 거부하기 때문이다(전체 integration 실행에서 실제로 관찰했다). 처음에는 비밀·잔액 이름 패턴(65개 중 36개 보호)으로 판단했으나 agents·skills·memories·run events 같은 사용자 데이터가 조용히 비워진다는 점에서 기본 거부로 바꿨고, 새 테이블은 이 목록에 넣기 전까지 보호된다. 목록은 상수 하나다. 그 밖의 실패 사유: DEFAULT 없는 NOT NULL 컬럼·PK·FK·CHECK 컬럼 누락, 중복 키가 있는 unique. **보호 테이블의 index·key는 복구하지만 CLI에서 닿는 범위가 다르다.** 계정 테이블 7개(`provider_account_migration.REPAIRED_SCHEMA`)는 `inspect_account_state`가 `SHOW CREATE TABLE`을 정확히 비교하며 앞서 실행되므로, `POST_CUTOVER_INDEXES` 두 개 외의 KEY가 없으면 복구 단계 전에 `schema_drift_<table>`로 거부된다. 나머지 보호 테이블(예: `chat_api_keys`, `chat_runs`)의 key는 복구된다. presence는 테이블·컬럼·key 이름으로만 비교하며 컬럼 타입·기존 컬럼의 nullability·FK 제약·DB에만 있는 객체는 비교하거나 고치지 않는다(서버별 표기 차이와 데이터 손실 위험). 테이블이 없어 복구된 경우 데이터는 복구되지 않는다. `--apply` 없이 실행하면 ledger가 모두 적용된 DB에서 드리프트를 `schema-repair: ...` 항목으로 보고하고 0이 아닌 코드로 끝난다. `--no-schema-repair`는 ledger migration만 적용하며 통합 테스트 계층이 migration의 누락을 가리지 않도록 쓴다(운영 사용 금지). migration이 테이블을 바꾸면 snapshot을 다시 만든다: `LUMEN_UPDATE_SCHEMA_SNAPSHOT=1 uv run lumen-test integration -k schema_snapshot`(안 하면 위 테스트가 실패한다). 이 복구는 accepted OpenSpec 요구사항 "Schema changes MUST use additive migrations and update manifest checksums"의 예외이므로 `openspec/changes/bootstrap-schema-repair`가 MODIFIED requirement로 기록한다. 검증: `tests/integration/test_schema_repair.py`(합성 테이블 SQL DDL 동일성), `tests/integration/test_schema_repair_real_schema.py`(실제 스키마에서 임시 조정 테이블 3개, 컬럼 하나, 보호 테이블의 key를 지운 뒤 실제 `lumen-migrate` CLI로 복구해 DDL이 snapshot과 글자 그대로 같음, 보호 테이블 누락은 CLI 실패), `tests/test_schema_repair_policy.py`.
+
+### OpenAI realtime 대화 token hold
+
+2026-11-18 공식 가격표 기준 catalog는 `gpt-realtime-2.1`, `-2.1-mini`, `-2`, `-1.5`, `gpt-realtime`, `gpt-realtime-mini`(snapshot alias `gpt-realtime-2025-08-28`, `gpt-realtime-mini-2025-12-15` 포함)를 `billing_basis: "tokens"`로 둔다. Text 입력·cached·출력은 `token_pricing`, audio 입력·cached·출력과 image 입력·cached는 `media_pricing.token_rates`에 정확한 USD/1M 값으로 있다. 정산은 provider `response.done` usage를 modality별로 나누어 계산하며 분 단위 대체 요금을 쓰지 않는다. Usage 누락·불일치·hold 초과는 `unknown`이다.
+
+OpenAI는 realtime 대화의 session 단위 예약액을 공개하지 않는다. 그래서 `reservation_usd`가 없는 OpenAI 대화 route의 hold는 Lumen funding 정책으로 정한다(`realtime_transport._derived_token_hold`·`response_bound_usd`, plan의 `reservation_source: "duration_policy"`). **최악 응답 bound**: Lumen은 모든 OpenAI token 세션에 `max_output_tokens: 4096`과 retention-ratio truncation(`post_instructions: 16384`)을 고정하고 client가 바꾸지 못하게 한다. 응답 하나는 instructions(4096자 → 16,384 byte)·function tools(16,384 byte)·overhead 512 token을 최고 text 입력 단가(일반·cache read 중 큰 값)로, 대화 16,384 token을 최고 입력 단가(text/audio/image의 일반·cache read 모두 비교)로, 출력 4,096 token을 최고 출력 단가로 계산한 값을 넘을 수 없다고 본다. text token이 UTF-8 1 byte 이상이라는 가정과 `max_output_tokens`가 reasoning을 포함한다는 가정은 공식 문서에 명시되지 않은 [INFERENCE]다. **Duration 부분**: 공식 비용 안내의 사용자 audio 100 ms당 1 token, assistant audio 50 ms당 1 token을 근거로 admission 최대 시간 1초마다 입력 100 token(이후 최대 10개 응답에서 uncached로 다시 읽힘)을 최고 입력 단가로, 출력 30 token(assistant audio 20 + transcript text 10)을 최고 출력 단가로 계산한다. Hold = duration 부분 + 최악 응답 2개. 예: `gpt-realtime-2.1`은 최악 응답 $0.919552, 300초 hold $1.536 + $1.839104 = $3.375104, 10초 $1.890304; `-2.1-mini`는 최악 응답 $0.265728, 300초 $1.011456. 여기에 margin과 credit 환율을 곱하며, 잔액이 이 hold보다 적으면 provider I/O 전에 402로 거절한다. Relay는 응답 usage가 확정될 때마다 frozen 단가로 누적하고, 누적 + 2 × 최악 응답이 hold를 넘으면 새 응답을 시작하지 않고 세션을 끝낸 뒤 진행 중 응답을 drain한다. 응답 하나가 최악값을 넘으면(가정 위반) 즉시 끝낸다. 따라서 위 가정이 맞는 한 확정 비용은 hold를 넘지 않는다. 가정이 틀려 넘으면 정산은 `unknown`으로 남아 운영자 처분이 필요하다. 관리자가 설정한 `reservation_usd`는 최악 응답 2개 이상이어야 한다. 미달이면 관리자 저장 요청에서 최소 USD와 함께 오류를 반환한다. 기존 미달 행은 audio capability gate에 `realtime_reservation_too_small`을 표시하며 실행할 수 없다. Token 세션은 upstream이 고정 limits, 이후 VAD·도구 설정을 두 차례 확인하기 전에 client audio나 명령을 전달하지 않는다.
+
+관리자가 모델에 양의 `reservation_usd`를 설정하면 그 값이 우선한다. Derived hold 예외는 OpenAI provider에만 적용된다. Gemini Live의 token 기준은 공개된 초당 audio token 근거가 없어 계속 `reservation_usd`가 필요하며, 없으면 관리자 저장 단계에서 거절된다. `gpt-transcribe` 실시간 전사는 realtime row의 `realtime_input_per_minute`($0.0045/분)로 Lumen 측정 입력 시간을 청구하며 file STT 단가로 대체하지 않는다. `(provider_id, model_name)`이 unique이므로 기존 stt `gpt-transcribe` row와 다른 OpenAI provider 항목에 realtime row를 만든다. 전사(`gpt-live-transcribe`, `gpt-realtime-whisper`, $0.017/분)와 번역(`gpt-realtime-translate`, $0.034/분)은 Lumen이 측정한 입력 PCM 시간으로 청구한다. 번역은 provider usage event가 없다. 라이브(`gpt-live-1`, $0.05/분, 초 단위)는 provider가 `session.closed`에 보고한 최종 `usage.seconds`로 청구한다. 누적 `session.usage.updated`는 진행값으로만 보관하고 합산하지 않는다. 최종값 누락(provider 연결 종료·오류)·형식 오류·감소·예약 최대 시간 초과는 Lumen 연결 시간으로 대체 청구하지 않고 hold를 `unknown`으로 남긴다. 번역은 공개된 usage event가 없어서만 Lumen 측정 입력 시간으로 청구한다. Lumen은 WebSocket만 쓰므로 WebRTC 초기화 15초 선과금 경로는 없다. Live delegation(별도 Responses 과금)은 거부한다. Reasoning effort는 `gpt-realtime-2`/`-2.1`에서만 설정할 수 있다. Reasoning token은 보고된 출력 usage로 정산되며 hold 정책은 바꾸지 않는다. 이미지 입력과 function calling은 `gpt-realtime-2.1`/`-2.1-mini`/`-2`/`-1.5` token 세션에서만 열리며 위 최악 응답 bound 안에서 image/text token으로 정산된다. 이미지는 저장하지 않고 header 크기만 검사하며 ClamAV를 거치지 않는다(provider로만 전달).
+
 ## Kolla 로그와 비동기 채팅 실패 추적
 
 Kolla 역할은 API·worker·controller의 `LUMEN_LOG_DIRECTORY=/var/log/kolla/lumen`을 설정하고 `kolla_logs` 볼륨에 프로세스별 `api.log`, `worker.log`, `controller.log`를 남긴다. 디렉터리 소유권은 컨테이너의 비root API·worker 사용자에 맞춰 기동 전에 준비한다. 이 변수를 설정하지 않은 로컬 개발에서는 파일 로그를 만들지 않으며 기존 표준 출력/오류 로그를 유지한다. 운영 파일 접근 권한과 보존·수집 정책은 호스트 로그 관리자에게 위임한다.
@@ -109,15 +476,78 @@ Kolla 역할은 API·worker·controller의 `LUMEN_LOG_DIRECTORY=/var/log/kolla/l
 
 ## Queue, lease, recovery
 
-API는 MariaDB journal에 run을 commit한 뒤 Redis `afterglow:chat:runs`에 best-effort wakeup을 보낸다. Redis는 authoritative queue가 아니다. worker DB polling이 wakeup 유실을 복구한다.
+API는 MariaDB journal에 run을 commit한 뒤 run의 class/pool hint key `afterglow:chat:runs:{workload_class}:{pool_id|fixed}`에 best-effort wakeup을 보낸다. Redis는 authoritative queue가 아니다. Worker는 hint가 없어도 매 loop에서 자기 registration의 class/pool/protocol/plugin 조건으로 DB를 polling한다. 이전 전역 `afterglow:chat:runs` key는 더 이상 사용하지 않는다.
 
-Worker lease는 45초다. run이 `running`이 아니거나 lease owner/expiry가 다르면 write를 중단한다. stale recovery는 중단된 provider segment를 재queue하거나 indeterminate provider result로 fail-closed 처리한다. worker는 pending approval/interaction expiry와 temporary thread purge도 수행한다.
+`worker_workload_classes`(`WORKER_WORKLOAD_CLASSES`)의 고정 기본값은 `["online_text","online_media"]`다. Batch를 고정 환경에서 실행하려면 별도 process에 `["batch"]`만 설정한다. `batch`는 online class와 함께 둘 수 없고 `realtime`은 worker class가 아니다. Runtime-disabled admission은 `worker_pool_id IS NULL`인 fixed run만 만든다. Managed admission은 설정된 class→pool의 persisted pool row를 사용하며 다른 pool이나 fixed worker로 fallback하지 않는다. Title/memory/outbox/workspace/input-expiry/temp-purge maintenance는 online_text worker만 실행한다. Online text worker를 0으로 두면 이 maintenance가 멈춘다.
+
+Worker lease는 45초다. run이 `running`이 아니거나 lease owner/expiry가 다르면 write를 중단한다. Stale recovery는 중단된 provider segment를 재queue하거나 indeterminate provider result로 fail-closed 처리하며 각 worker는 자기 registration이 claim할 수 있는 run만 실행한다. Batch `api_completion`과 media는 provider I/O 전에 hold/의도를 commit한다. 불명확한 결과는 `unknown` hold로 남기고 자동 재호출하지 않는다. Checkpoint가 있으면 provider I/O 없이 한 번만 정산한다.
+
+SIGTERM drain은 registration을 `draining`·`accepting=false`로 먼저 commit한다. 그 뒤 새 run/auxiliary claim은 거부되지만 소유한 run lease 갱신, 이미 시작한 auxiliary provider/S3 step, checkpoint와 정산은 계속한다. Live run lease, title/memory/outbox/Batch coordinator lease와 `auxiliary_active`가 모두 0일 때만 `drain_ack_at`을 기록하고 process가 종료된다. `auxiliary_active`는 증거 없이 자동 초기화하지 않으므로 ack가 멈추면 registration·lease row와 해당 process 상태를 함께 확인한다.
 
 `worker_concurrency`는 프로세스당 활성 run 상한(기본 4), `worker_heartbeat_seconds`는 registration 간격(기본 5초)이다. Managed worker 등록은 1회용 bootstrap이 완료된 resource generation과 leaf certificate fingerprint를 고정한다(기존 무바인딩 row는 018 이후 재등록 필요). Heartbeat와 새 claim은 현재 resource generation/certificate, 20초 이내 heartbeat, protocol, frozen plugin digest 및 accepting 상태를 확인한다. Draining worker는 새 claim을 중단하지만 이미 소유한 유효 lease의 capability 요청은 계속할 수 있다. API guest는 별도 mTLS readiness port에서 loopback-only `/v1/ready?include_load=1`의 활성 요청(SSE 포함)과 최근 60초 streaming 첫 text delta p95를 전송한다. Controller는 probe 실패·누락 시 ingress를 drain하고 stale telemetry를 0 부하로 해석하지 않으며, 측정된 수요와 2회 high/300초 low gate로 replica를 조정한다. Public `/v1/ready`에는 load 정보가 없다. 단일 API process가 아닌 guest command는 이 process-local 계측의 집계를 제공하지 않으므로 지원하지 않는다.
 
+## Batch 운영
+
+Batch는 `batch_enabled=true`를 API와 모든 worker에 같은 release로 설정할 때만 열린다. 꺼져 있으면 Batch/Files route는 503 `batch_unavailable`이고 coordinator도 실행되지 않는다. 필요 조건은 다음과 같다.
+
+- **Worker 분리:** 실행용 batch-only worker(`WORKER_WORKLOAD_CLASSES=["batch"]`)를 별도 process로 둔다. Online worker는 batch run을 claim하지 않는다.
+- **Coordinator:** 최소 1개의 `online_text` worker가 살아 있어야 한다. 이 worker가 validation, materialization window, projection, cancel/expiry, 결과 발행과 Batch file GC를 수행한다. 없으면 이미 running인 run은 끝나지만 새 dispatch와 finalization은 멈춘다. Coordinator lease owner는 registration UUID이며 drain ack 조건에 포함된다.
+- **Storage/scanner:** Files upload와 native image edit/STT 입력에는 기존 HTTPS S3(bucket·encryption policy)와 ClamAV가 필요하다. ClamAV의 `MaxFileSize`/`MaxScanSize`는 업로드 상한 `batch_jsonl_max_bytes`(기본 200,000,000)를 덮어야 하며 넘으면 업로드는 fail-closed다. Lumen이 생성한 `batch_output` 파일은 scan하지 않으므로 이 한도를 받지 않는다.
+- **설정값:** 기본은 batch 8/project 32 queued+running window, native 1,000 items/10 MiB, JSONL 50,000행/200,000,000 bytes/행 4 MiB, upload slot 4, 결과 TTL 7일(`output_expires_after` 1시간–30일), 입력 TTL 30일, cancel grace 600초다. `api_max_body_bytes`는 활성 Batch 입력 상한보다 작을 수 없다.
+- **처리 시간:** Coordinator는 online text worker당 1초마다 한 batch step을 수행하고 validation은 step당 최대 100행/1 MiB다. 따라서 50,000행 JSONL은 로컬 실측상 약 10분 뒤 `in_progress`가 된다. Cancel/expiry는 run이 없는 항목을 step당 5,000개씩 freeze하며 실행 중 항목은 grace 안에서 결과를 회수한다. 로컬 50,000행 cancel은 68.4초였다.
+- **Managed runtime:** Runtime을 켠 배포는 `online_text`와 `batch` pool mapping을 모두 가져야 한다. Batch pool은 min 0을 허용하며 queued 수요만으로 0→N을 시작한다.
+
+Batch text 항목은 `provider_once_supported`가 허용하는 frozen adapter/operation만 받으며 미지원 route는 validation에서 `provider_once_unsupported`다. 모든 owned provider dispatch는 단일 시도 계약이다. LiteLLM-era loopback/source 추적 증거는 과거 receipt이며 새 converter의 전체 provider acceptance를 대체하지 않는다. 결과가 불명확한 항목은 `unknown`과 hold로 남고 자동 재호출하지 않는다. 운영자는 provider 측 기록과 `chat_model_call_reservations`/`chat_usage_logs`/`chat_provider_usage`를 대조한다. `result_storage_unavailable`로 끝난 batch의 item/run/ledger는 보존하고 저장소를 복구해 조사하며 성공으로 다시 표시하지 않는다.
+
 ## Migration과 cutover
 
+Original-token attenuation cutover는 새 SQL migration을 추가하지 않고 기존 run/item capability JSON에 non-secret `credential_authority`를 저장한다. **구 persisted run/Batch/child/auxiliary에는 original reduced-credential provenance가 없을 수 있으므로 이 변경만으로 과거 snapshot을 qualified라고 간주하지 않는다.** Owner ID나 현재 system-admin 여부에서 사라진 original ceiling을 복원하지 않는다.
+
+운영 전 새 native/Batch admission을 막고, 기존 queued/running/waiting child/realtime 및 title/memory/compaction 작업과 미확정 provider-start intent를 inventory한다. 이미 시작한 provider 결과 회수·completed checkpoint replay·정산은 drain하여 보존하며 강제 재호출·journal 삭제로 전환하지 않는다. Original credential provenance를 증명할 수 없는 legacy 작업은 새 I/O를 계속시키지 말고 기존 owned cancellation/결과 회수 절차로 종료한 뒤 새 API에서 authenticated original credential로 재입력한다. Admission·batch coordinator·online/batch workers를 호환 버전으로 함께 전환하고 old writer/worker와 혼합하지 않는다. 이 drain/re-admission boundary의 실제 운영 실행과 배포 수용은 별도 검증이며 이번 source/test-defined 변경의 증거가 아니다.
+
+이전 pending MCP OAuth request도 owner ID만 가지고 original credential ceiling을 잃었을 수 있다. Cutover에서는 MCP OAuth start/callback ingress를 함께 차단하고 provenance 없는 기존 request를 재사용하지 않는다. 기존 row의 실제 `expires_at`까지 만료되게 한 뒤 새 human-only start로 승인하며, current owner가 system admin이라는 이유로 구 callback state를 qualified라고 간주하지 않는다. Device approval 역시 새 API의 unrestricted-human 경계를 사용한다. 이 문서는 운영 변경을 수행했다는 증거가 아니며, 새 schema나 token/state backfill을 요구하지 않는다.
+
 적용된 SQL migration/checksum은 immutable이다. 유지보수 cutover는 admission 차단·API/worker/controller stop → backup/DB readiness → `lumen-migrate --apply` → 호환 API/worker/controller start 순서다. 적용 뒤 동일 command를 다시 실행해 pending migration이 없는지 확인한다. Kolla의 migration-before-start 자동화만으로 **기존 실행 중인 컨테이너를 중지했다는 뜻은 아니다**. rolling mixed-version deployment는 지원 전제가 아니다.
+
+### Prepaid domain pools (migration 037)
+
+After the schema-first cutover, a system administrator must fund each inference domain using `POST /v1/admin/domain-pools/{domain_id}/topups` with `Idempotency-Key` and `{amount_credits, note?}`. Use a fresh key for each distinct deposit; replay the same key and body after an uncertain response. `GET /v1/admin/domain-pools` lists provisioned pools. Admin PATCH accepts `admin_ceiling_credits` and `is_active`. Human domain managers use GET/PATCH `/v1/domain-pool` with `manager_monthly_limit_credits`; `null` clears a monthly limit, while `0` blocks paid work. All amounts support eight decimal places.
+
+To recover the outcome of a top-up whose response was lost, call `GET /v1/admin/domain-pools/{domain_id}/topups/{idempotency_key}` (system administrator only, same auth as the POST). It returns `{"found": true, "entry": {"kind": "topup", "amount_credits", "balance_after", "note", "created_at", "actor_user_id"}}` for the committed ledger row, with decimals as strings and `created_at` in ISO 8601. An unknown key returns `200 {"found": false, "entry": null}`, never 404; then no deposit committed for that key in that domain, and replaying the POST with the same key and body is safe. Keys are namespaced per domain and must not contain `/`.
+
+No migration copies user balances or retroactively charges a domain. Unfunded domains fail closed with `domain_credit_insufficient`. Inactivating a pool or lowering its limit blocks new admissions without invalidating previously funded holds. Known zero-cost refusals release the hold; do not auto-expire `unknown` rows. Reconcile unknown amounts against provider evidence before changing the hold and ledger. Take the domain pool lock before changing either; do not edit the balance or reservation cache independently.
+
+Domain-billed text requires enforceable input/output bounds and known prices before dispatch. The prepaid envelope reserves the frozen context at the highest applicable input rate; ensure the pool and per-user guard can cover that envelope. Paid native web search without a provider-enforced request limit is unavailable on this path. A disconnect without complete provider usage retains an `unknown` hold; there is no automatic release or pool API for manual disposition.
+
+Each text model in `GET /v1/admin/models` and `GET /v1/chat/models` carries `domain_billing: {"ready", "reason_code"}`. Domain-paid chat admission (including `model=lumen`) rejects an unready model with 422 `requested chat capability is not available: domain_billing (<reason_code>)` instead of failing at provider start. Reason codes: `pricing_unavailable` (no input or output price), `output_budget_unenforced` (a priced output the provider does not bound, for example ChatGPT subscriptions), and `context_limit_unknown` (a priced input without a context window). Readiness uses the prepaid bound's worst-case rates over input, cache and modality prices, so a zero-rate model is always ready. The context limit comes from the native catalog (`context_window`, else `max_input_tokens`), then the legacy models.dev import for direct providers, then an administrator override; `llm_models` has no separate column. Compatible and custom models often have no catalog entry. To fix `context_limit_unknown`, set `capabilities.context_limit` with `PATCH /v1/admin/models/{id}`. The override is the full capability object, so send the intended flags with it.
+
+The same bound is not domain-only. Personal and Claude Gateway keys bill the user wallet with bounded stateless holds, so the actor-wide monthly guard counts in-flight calls. A priced call to a compatible or uncatalogued model through `/v1/chat/completions`, `/v1/responses`, `/v1/messages` or the Gateway therefore returns 422 `pricing_unavailable` ("Model context or output bound unavailable") without `capabilities.context_limit`, whatever the payer. Treat `domain_billing.ready=false` with `context_limit_unknown` as "unusable by any API key and by domain-paid chat", and set the limit before cutover.
+
+The same rule covers every other frozen route a domain-paid run can bill: an enabled advisor route is refused at admission with 422 `requested chat capability is not available: advisor (<reason_code>)`, and a delegated child agent with its own unready model fails with `child_route_unavailable` before the child is created. Children without a pinned model inherit the parent's already-checked route.
+
+Title and memory jobs stay system-funded; only in-run context compaction is domain-paid, through the title model. `GET /v1/admin/title-model` reports `{model_id, model_name, domain_billing, domain_compaction_route}`. When the title model is missing or not domain-billing ready, domain-paid runs freeze their own chat model as the compaction route (`domain_compaction_route: "execution_model"`), which admission already checked, so compaction never fails mid-run on a missing bound. There is no non-model truncation fallback. Before cutover, list affected models read-only with the domain-scope probe (`repository.list_models(active_only=True)`; it prints ids, names and provider types only and marks the title model).
+
+### User/domain scope backfill (migration 036)
+
+Drain and stop the old API/workers and apply migration 036 with `lumen-migrate --apply` before starting compatible writers. Take a recoverable backup and retain the existing Lumen encryption key separately. For predictable migration timing, run `python -m lumen.scripts.backfill_domain_scope --apply` after schema migration with the configured MariaDB URL and Keystone admin identity, before opening ingress. New API processes also schedule the same job in their startup lifecycle; a MariaDB advisory lock admits one worker at a time. Readiness does not wait for the job. Do not mix schema-036 writers with previous versions.
+
+The job pages distinct origin projects, asks Keystone for each exact enabled project ID and domain, and stages verified pairs in a connection-local MariaDB temporary table. The database account needs `CREATE TEMPORARY TABLES`. The job reports counts only. Unresolved origins and rows that conflict with a live configuration remain origin-only, under current live membership. The command exits nonzero if another job holds the lock, any projects are unresolved, or any rows conflicted. Correct the cause and rerun the same command; it does not repeat committed work. Historical timestamps and project provenance are kept. Organization MCP server rows and shared OAuth bundles are not converted.
+
+The backfill converts origin identifiers to `utf8mb4` before applying `utf8mb4_bin` across the UNION and temporary-table lookup, so the installation's mixture of `utf8mb3` and `utf8mb4` columns does not prevent migration. New `chat_extension_archives` tables declare `utf8mb4_bin`. Installations with the original 036 receipt keep their existing archive table and receipt; the runner does not replay or rewrite either.
+
+The job groups personal MCP rows by template or normalized URL, and HTTP tools by normalized URL. Newest update time, then highest ID, wins. When a project already had several labels for the same identity, the job preserves those groups and matches cross-project rows by label, using the newest group if no label matches. It archives the full losing configuration and its original activation, OAuth state and encrypted credentials, and updates private agent bindings to the winner. A previous activation never approves a different configuration. For shared published MCP server IDs it also archives losing per-project OAuth/activation state; it never discards their tokens or timestamps.
+
+Use `GET /v1/archived-connections` and `POST /v1/archived-connections/{archive_id}/restore` as the owning user with current domain membership. Organization-owned archives use `/v1/domains/{id}/archived-connections` and require live domain manager authority. Lists return metadata only, newest first, with bounded `limit` and optional `before_id`. Restoring an extension reuses its original ID, disambiguates colliding labels or tool names, and keeps agent bindings on their canonical IDs. Pending OAuth states do not revive. Restoring a prior OAuth bundle or activation on a published server swaps it into the user/domain slot, archives any displaced live state, and advances the revision fence. A stale archived configuration revision does not become consent for the current server revision.
+
+### Earlier migrations
+
+Elastic/Batch 후보의 additive migration은 022(runtime routing), 023(trusted identity), 024(batch ledger), 025(batch expiry default)다. 025는 이미 적용한 024를 수정하지 않고 MariaDB의 column-reference DEFAULT zero-date 오류를 교정한다. 모두 적용한 뒤 동일 `lumen-migrate --apply`를 재실행한다. `api_completion`과 Batch 상태를 모르는 구 worker를 신 schema의 실행자와 섞지 않는다. Runtime/Batch 활성화는 고정 worker 수용, managed guest/ingress 수용 및 별도 운영 cutover 승인 이후다.
+
+MCP opt-in 변경은 additive `026_mcp_owner_activation.sql`을 API/worker보다 먼저 적용한다. 기존 global source의 owner activation은 backfill하지 않으므로 배포 뒤 사용자가 각 현재 configuration을 명시 승인한다. Ordinary API-key expiry 발급은 기존013 column을 재사용하며 중복 expiry DDL·기존 무만료 키의 만료 backfill은 없다. Fresh `issuance-policy`를 모르는 구 API와 새 frontend를 혼합하지 않는다. Afterglow cloud consent는 별도 Afterglow086 migration과 호환 BFF를 요구한다.
+
+이 변경의 local disposable schema 결과는 production qualification이 아니다. 실제 배포 전 동일 production revision/snapshot·manifest/checksum·engine/sql_mode, 원래 암호화 키와 ledger/checkpointer 상태를 보존한 격리 복원에서 기존 writer/신규 schema 및 신규 writer/기존 schema, mixed-version API/worker/queue, backup+restore를 별도 평가한다. 해당 evidence가 없는 현재는 admission drain·backup·정지·schema-first coordinated cutover만 제시하며 rolling 호환성을 주장하지 않는다. DB outage로 얻은 fail-closed401은 key expiry 증거가 아니므로 healthy SQL 및 미만료 key positive control을 함께 확인한다.
+
+
 
 초기 media 후보를 `019-media-model-registry` / `019_media_model_registry.sql`로 적용한 DB에서 canonical `020-media-model-registry`가 `Duplicate column name 'model_kind'`로 실패할 수 있다. Runner는 두 SQL의 SHA-256이 정확히 `51f2d55f7ec84b8273a8b16ae5c92dd0269cc8dac88b8ac4c7b763b127a98d05`이고 기존 `model_kind`가 `VARCHAR(16) NOT NULL DEFAULT 'text'`, `media_pricing`이 nullable JSON(MariaDB의 LONGTEXT + 정확한 JSON_VALID 제약)이면 DDL 없이 canonical 이력만 추가한다. 예전 이력과 모든 데이터는 그대로 보존한다. Dry-run은 이력을 추가하지 않고 pending으로 보고한다. 파일명·checksum·열·JSON 제약 불일치 또는 예전 ledger가 없는 duplicate column은 자동 승인하지 않는다.
 
@@ -208,17 +638,58 @@ Lumen의 root `lumen` wheel은 Kolla 역할을 shared data로 포함한다. Koll
 ### 1. 휠 패키징 및 최초 배포
 - **휠 빌드**: repository root에서 `uv build --wheel`로 `lumen-<release-version>-py3-none-any.whl` 아티팩트를 생성한다.
 - **Kolla 환경 설치**: Kolla Ansible environment에 `pip install --no-deps lumen-<release-version>-py3-none-any.whl`을 수행하면 역할 자산이 `share/kolla-ansible/ansible/roles/lumen`에 설치된다.
-- **최초 배포 명령어**: 새 bootstrap CLI를 포함한 이미지/source pin을 준비한 뒤 `kolla-ansible -i <inventory> deploy --tags lumen` 명령으로 precheck, config, database/Keystone preconditions, DB migration(`lumen_bootstrap`), provider 등록(`lumen_provider_bootstrap`), container startup을 순차 실행한다.
+- **최초 배포 명령어**: 새 bootstrap CLI를 포함한 이미지/source pin을 준비한 뒤 `kolla-ansible -i <inventory> deploy --tags lumen` 명령으로 image pull/source build, precheck, config, database/Keystone preconditions, DB migration(`lumen_bootstrap`), provider 등록(`lumen_provider_bootstrap`), container startup을 순차 실행한다. Standalone `precheck`/`config`는 exact release image가 각 lumen host에 이미 있어야 하며 암묵적 registry pull을 하지 않는다.
 - **PostgreSQL 모드 선택**: 기본값 `lumen_postgres_mode="external"`은 `lumen_external_postgres_url`이 반드시 필요하다. 역할이 PostgreSQL을 관리하게 하려면 `/etc/kolla/config/afterglow/globals.yml`에서 `lumen_postgres_mode: "bundled"`를 선택하고 `secrets.yml`에 강한 `lumen_postgres_password`를 제공한다. 둘 중 하나를 명시하지 않은 stock defaults는 precheck에서 fail-closed 한다.
 
-### 2. 독립 wheel/image release
-#### 0.6.2 현재 목표
+### 선택적 컨트롤러별 ClamAV
 
-- **root package release**: `v0.6.2` tag push 시 `.github/workflows/release.yml`은 `lumen.__version__ == 0.6.2`을 확인하고 root·plugin·sandbox wheel을 GitHub Release에 첨부한다. Root manifest·`uv.lock` 일치는 아래 게시 계약과 locked image build에서 확인한다. `workflow_dispatch`는 release 첨부를 수행하지 않는다. 이미 게시된 `v0.6.0`을 이동하거나 덮어쓰지 않는다. `0.6.1`은 main에 병합됐지만 `v0.6.1` tag·GitHub Release·`0.6.1` image tag가 없다. Main/dev의 floating·SHA image 게시와 versioned release는 별개이며 0.6.2는 그 수정의 첫 tagged release를 목표로 한다.
-- **runtime image tag**: Kolla 역할의 API/worker/controller `lumen_image_tag` 기본값은 `0.6.2`이다. `.github/workflows/docker-build.yml`의 별도 `v0.6.2` 실행이 `linux/amd64,linux/arm64` 이미지를 GHCR에 게시하기 전에는 이 ref로 배포하지 않는다. Wheel Release 성공만으로 이미지 게시나 Kolla 배포가 보장되지 않는다. `lumen_source_version`은 별도 source-build commit pin이며 기본값 `c561a155...`는 이번 릴리스가 아니므로 운영자는 정확한 검증 commit으로 override해야 한다.
+기본 `enable_lumen_clamav: false`는 기존 외부 검사기(`lumen_clamav_host`, `lumen_clamav_port`)를 그대로 사용한다. `true`로 켜면 `lumen` 그룹의 각 컨트롤러에 `lumen_clamav`를 생성하며, API/worker의 host network와 같은 호스트의 `127.0.0.1:3310`으로 연결한다. Stock Kolla는 Docker bridge/NAT를 끌 수 있으므로 검사기는 **host network**이고 clamd 자체의 `TCPAddr`를 loopback으로 제한한다. Docker bridge·포트 publication·HAProxy listener를 만들거나 Docker daemon의 iptables/forwarding을 변경하지 않는다. 원격 worker guest의 loopback은 다른 호스트이므로 별도의 외부 검사기 구성이 필요하다.
+
+```yaml
+enable_lumen_clamav: true
+lumen_clamav_host: ""  # managed mode에서는 외부 host override를 비운다
+lumen_clamav_bind_address: "127.0.0.1"
+lumen_clamav_port: 3310
+lumen_clamav_image_ref: "clamav/clamav-debian:1.4.6@sha256:806639a6e3a45ae1d6f3932722c3e016e5b93452f93d444538f697c39d6af16b"
+lumen_clamav_volume: "lumen_clamav_signatures"
+lumen_clamav_memory: "4g"
+lumen_clamav_cpus: 2
+lumen_clamav_pids_limit: 256
+lumen_clamav_ready_retries: 180
+lumen_clamav_signature_max_age_hours: 72
+```
+
+버전과 immutable digest를 함께 고정한다. 관리 모드의 port는 공식 image의 clamd 설정과 일치하는3310으로 고정한다(외부 검사기 모드의 custom port는 유지). Kolla precheck는 public bind·외부 host 충돌·다른 managed port·mutable image·무제한 자원 설정을 거부한다. 서명은 컨트롤러별 named volume에 영속하며 updater는 매시간 실행하고 clamd는30초마다 변경을 재확인한다. 검사기는 DB/Keystone/S3/provider credentials를 받지 않는다. 컨트롤러당4GiB/2CPU quota를 예약하고, signature reload 중 메모리 중복·cold download 지연을 고려한다.
+
+**Egress와 readiness:** 각 컨트롤러의 DNS 및 `database.clamav.net` HTTPS egress가 필요하다. 서명 CDN의 단순 `curl HEAD`403은 실제 Freshclam 성공도 실패도 확정하지 않으므로 updater의 실제 결과를 확인한다. 프로세스 또는 TCP port가 열렸다는 이유로 ready로 간주하지 않는다. `start.yml`은 API/worker 시작 전에 host-side `validate_clamav.py`로 PING/PONG, VERSION의 양수 서명 version과 build date를 확인한다. 서명은 기본72시간 이내여야 하며 미래5분 초과·누락·손상·truncated 응답은 실패한다. 최대 허용 age는 운영자가1–168시간 범위에서 정하며 기본 재시도는180회/5초 간격이다(각 socket 작업 timeout 별도). Stale bundled DB, 다운로드 실패 또는 미반영 reload는 배포를 차단한다. 가짜 signature 생성, age 완화나 scan 우회로 실패를 숨기지 않는다. 기존 실행 중인 앱을 자동 정지하지 않으므로 승인된 drain/cutover 절차는 별도로 수행한다.
+
+**승인된 rollout:** 기존 operator 설정·이미지·S3·schema·암호화/checkpointer identity를 보존하고 검토된 wheel/role을 같은 Kolla environment에 설치한다. `pull → prechecks → reconfigure --tags lumen --skip-tags haproxy`를 첫 컨트롤러에서 수행하고, scanner image/resource/listen 주소와 실제 Freshclam/PING/VERSION·렌더된 `chat_clamav_host`를 확인한 뒤 나머지 컨트롤러로 진행한다. 정상 media smoke는 별도 승인 예산을 따르며 EICAR는 운영으로 보내지 않는다.
+
+**Rollback:** 관리 모드를 유지할 때는 이전에 검증한 image digest와 설정을 복원해 같은 role로 reconfigure하고 서명 volume은 보존한다. 외부 검사기로 복원하려면 `enable_lumen_clamav:false`와 원래 private `lumen_clamav_host`를 설정한 뒤 앱을 reconfigure한다. 외부 host도 비우면 asset pipeline은 fail-closed다. 비활성화는 기존 scanner/서명을 암묵적으로 삭제하지 않는다. Scanner만 제거하려면 정확한 호스트에 `include_role: {name: lumen, tasks_from: destroy}`를 `lumen_services: {}`, `enable_lumen_clamav:true`와 함께 실행해 앱 loop를 비우고 named scanner만 제거한다. Volume은 유지된다. 일반 `kolla-ansible destroy --tags lumen`는 API/worker도 제거하므로 scanner-only 정리에 사용하지 않는다.
+
+### 2. 독립 wheel/image release
+#### 0.6.8 published and deployed (2026-10-14)
+
+- **root package release**: Release commit `2417886bc6f320f3b0f0438ed0fe5b8ab12c2640`의 exact-SHA CI와 tag `0.6.8` Package Release/Docker가 성공했다. Preserved MCP owner consent/key expiry, delegated cloud discovery/queued graph ownership, balanced controller를 dev와 통합하고 newest direct-system/session protections 및 credential isolation을 유지한다. Fresh2026-10-14 local qualification은 [testing](testing.md#068-local-qualification-2026-10-14)에, 별도 publication/production 결과는 [production receipt](testing.md#068-production-rollout-2026-10-14)에 기록했다. 과거0.6.7 및 별도 WIP qualification은 원래 snapshot 증거로 유지한다. Tag의 `release.yml`은 root version 일치를 확인하고 root/plugin/sandbox wheels를 GitHub Release에 첨부하며 `workflow_dispatch`는 Release 첨부를 하지 않는다.
+- **runtime image tag**: Kolla 역할의 API/worker/controller `lumen_image_tag` 기본값은 `0.6.8`이다. API/worker 이미지는 `linux/amd64,linux/arm64`로 게시됐고 production의6replicas는 pinned digest와 OCI revision `2417886b`에 일치한다. Wheel Release 성공만으로 이미지 게시나 Kolla 배포가 보장되는 것은 아니므로 별도 Docker/production receipt를 사용한다. `lumen_source_version`은 별도 source-build commit pin이며 기본값 `c561a155...`는 이번 릴리스가 아니므로 운영자는 정확한 검증 commit으로 override해야 한다. 기존 source checkout이 dirty하거나 HEAD가 pin과 다르면 자동 reset 없이 거부한다.
 - **기본 이미지 네임스페이스**: Kolla 역할은 `ghcr.io/openstack-afterglow/lumen-api:<image-tag>`, `ghcr.io/openstack-afterglow/lumen-worker:<image-tag>`, runtime-enabled일 때 `ghcr.io/openstack-afterglow/lumen-controller:<image-tag>`를 사용한다. `ghcr.io/openstack-afterglow/lumen-sandbox`는 별도 게시 이미지이며 Kolla 서비스 컨테이너가 아니라 운영자가 sandbox cloud pool `image`에 정확한 ref로 지정한다. Operator는 역할의 exact digest ref override를 그대로 유지할 수 있다.
 
-0.6.2 게시 계약: release commit에서 root manifest·`lumen.__version__`·`uv.lock`의 `0.6.2` 일치를 확인하고 `uv sync --extra service --extra dev --frozen`, `uv run lumen-test contract`, `uv run lumen-test integration`, `uv run lumen-test system`, `uv build --wheel`을 수행한다. `v0.6.2` tag workflow가 CI 이후 두 플랫폼의 API/worker/controller/sandbox 이미지를 GHCR `0.6.2`·`sha-<short-sha>`에 게시하는지 확인한다. 같은 tag 실행은 `docker/metadata-action` 기본 `latest=auto`로 `latest`도 갱신하며 이후 `main` push도 `latest`를 옮긴다. `v0.6.0` tag push는 동시 Docker 실행 두 개를 만들었고 나중 실행이 `0.6.0`·`latest`를 다른 digest로 덮어썼으므로, 모든 tag 실행이 끝난 뒤 GHCR에서 version tag digest를 다시 확인하고 Kolla에는 `latest`가 아닌 그 digest를 고정한다. 기존 API/worker/controller를 중지하고 DB 백업·migration 021 적용·재실행 no-op을 확인한 뒤 새 이미지를 함께 기동한다. 이 patch는 새 migration을 추가하지 않는다. Explicit plugin allowlist는 `lumen-database-mariadb`0.1.1을 matching image와 함께 승인해야 한다. CI·이미지 게시·wheel release는 운영 Kolla 배포를 대체하지 않는다.
+0.6.8 production cutover는 canonical Kolla(`--skip-tags haproxy`)로 완료했다. Terminal gate 뒤 API 정지·재확인·worker 정지로 old/new cohort를 분리했고 cold MariaDB restore는 **63tables/5,540rows**가 정확히 일치했다. Cold checkpointer PostgreSQL dump는 **4tables**다. Ledger는 **26**으로 유지되어 migration은 없었고 provider6rows는 변경 없이 새 worker registration **3rows**만 추가됐다. API는 healthy, restart/error log0, `/v1/ready`는 **200×3+public**이다. Immutable digest는 [production receipt](testing.md#068-production-rollout-2026-10-14)에 고정했다. Migration026은 owner-consent table이며 기존 global approval을 backfill하지 않는다. 누락된 older installation은 모든 writer 정지·backup 뒤 migration 적용·재실행 no-op을 확인하고 새 서비스를 기동한다. Old API/worker/controller는 activation-generation/assignment gates를 모를 수 있어 mixed-version rolling 및 old/new controller cohort 혼합을 허용하지 않는다. Production no-migration cutover도 Admission drain → accepted run/auxiliary work 및 제출된 controller SDK 작업 정산 → API/worker/controller/managed guest를 포함한 모든 DB writer 정지 → MariaDB/PostgreSQL/S3 및 별도 원래 암호화 key recovery backup·restore-test → matching services 기동 순서를 따른다. 새 schema 아래 구 writer와 구 schema 아래 새 writer 호환성은 미검증이다. Rollback은 같은 stopped-writer 경계에서 원래 snapshot/key/ledger/checkpointer를 복원하는 절차를 별도 검증해야 하며 consent table 삭제나 구 binary만 재시작하는 것으로 대신하지 않는다. Batch/runtime은 기본 disabled이며 opt-in gate를 보존한다. Plugin allowlist의 `lumen-database-mariadb`0.1.1과 image를 맞춘다. OCI/source/guest qcow2/Glance hash pin은 서로 대체하지 않는다. Migration026 및 shared Redis controller 경계는 이 문서의 MCP opt-in·balanced controller 절을 따른다. Unchanged `guest_api` supervisor는 SIGTERM 후 최대10초에 SIGKILL한다. Guest drain 완료·ack 전에 stop/reboot하지 말고 outer Docker/systemd timeout으로 active-call drain을 보장한다고 주장하지 않는다.
+
+Migration acceptance caveat: `extensions_store.list_for_user` reads `chat_mcp_activations` even for user-owned MCP sources, while the optional catalogue route maps `ChatStorageUnavailable` to `[]`. An empty successful `GET /v1/mcp-servers` is therefore not migration/readiness proof: verify the migration ledger/table and a known owner-approved positive control. New workers reject old global-MCP fingerprints lacking activation generation; do not backfill queued consent or delegated snapshots from later live grants. Older workers do not enforce the new consent fence. [INFERENCE from the older permissive key-create request model] an older API may ignore an unknown `expires_at` field and issue a nonexpiring key; route issuance only to matching upgraded APIs and inspect the returned deadline. Ordinary expiry uses existing013 `DATETIME(6)` and does not backfill existing NULL deadlines. Cross-version graph/checkpoint takeover remains unqualified even though private event turn ordinals introduce no DDL.
+
+Global administration은 현재 검증된 role-ID DAG에서 exact global `admin`에 도달하는 Keystone **system** assignment만 인정한다. 0.6.7은 실제 system rows를 `role_assignments.list(user=user_id, system="all")`로 읽고 `scope.system.all is True`를 확인한 뒤 동일 DAG로 확장한다. 직접 system grant를 누락하는 Keystone `effective=True`는 이 조회에서만 제거한다. Project membership은 계속 `project=project_id, effective=True`로 group/inherited grant를 포함하며 enabled user/project와 current graph 검증을 유지한다. Directory-read credential은 role catalog·inference rules·effective project assignments·actual system assignments를 조회할 수 있어야 한다. Project/domain admin label과 API key는 global admin이 아니며 API key owner가 system admin이어도 key는 tenant-bound다. Domain-admin 운영자는 명시적인 system grant가 필요하다. Directory client의 요청별 15초 timeout·authority outage(503)·fail-closed 정책은 유지한다.
+
+게시된 0.6.4/0.6.5의 Claude Code safeguards 호환성 수정은 이 release에도 유지되므로 installer에 환경 변수를 수동 추가할 필요가 없다. 기존 endpoint/API key 설정을 유지하며 client-side workaround를 배포 전제 조건으로 추가하지 않는다. Dependency·plugin·SDK 버전과 source-build pin은 이번 patch에서 변경하지 않는다. Role installer가 `/v1/cli/models`를 요구하므로 Lumen catalog 배포·인증 smoke를 먼저 통과한 뒤 Afterglow installer를 배포한다.
+
+**Operating evidence boundary:** 과거 owner report와 qualification은 해당 version/snapshot의 기록으로 유지한다.0.6.8 CI/tag/package·API/worker image publication과 coordinated production rollout은 완료했다. Native/global-admin allow 및 project/domain/API-key denial, MCP owner approval/revocation, issued-key expiry positive/negative의 authenticated production acceptance와 real-provider/controller/sandbox 수용은 이번 receipt에 없다. **잔여 위험:** old0.6.7 dms-controller3 worker는300s drain 뒤 SIGKILL(exit137)됐다. Live run/job/memory-outbox/batch-queue lease가 모두0인데 registration의 `auxiliary_active=1`이 남아 `acknowledge_drain`이 성공하지 않았고,2026-10-05/06의 더 오래된 registration5개도 같은 미확인 drain을 보인다.0.6.8이 만든 문제가 아닌 기존 drain-acknowledgement defect로 follow-up이 필요하다. Lumen `REDIS_URL`도 read-only replica인 dms-controller1 Valkey를 가리키며 Sentinel master는 dms-controller3이다. Lumen error는 관측되지 않았지만 같은 wiring이 Waygate writes를 깨뜨리므로 Sentinel/master-routed 설정을 별도 수정해야 한다. Schema-first는 missing migrations가 있는 다른 installation에 적용한다.
+
+#### 로컬 release gate와 별도 operator gate
+
+- **Source/package:** locked service+dev sync, architecture freshness, root/SDK contract·lint, datastore integration(migration 적용·재실행), isolated `lumen-test system`, 다섯 plugin conformance와 standalone sandbox test를 release tree에서 실행한다. Root 및 plugin API/default plugin/sandbox wheels를 각각 build하고 깨끗한 venv에 root wheel을 `--no-deps` 설치해 Kolla helper/template/tasks와 migration manifest/SQL을 확인한다. Nova builder는 wheel asset이 아니므로 exact release tag source checkout의 `deploy/nova` executable hooks와 manifest의 `artifact_source_sha256`을 대조한다. `release.yml`의 설치 검사는 `tasks/main.yml`만 확인하므로 전체 package inventory gate를 대신하지 않는다.
+- **Images/runtime:** publication workflow와 같은 `docker/Dockerfile`의 `lumen-api`, `lumen-worker`, `lumen-controller`, `lumen-sandbox`를 각각 `linux/amd64,linux/arm64`로 실제 build한다. 각 architecture에서 migration CLI import, workspace plugin distributions/sources, sandbox Node/Python version을 실행 확인하고 disposable canonical Compose에서 migration → API readiness → online/batch worker heartbeat → fake-provider HTTP/SSE/asset/Batch path를 확인한다. Sandbox의 실제 namespace/cgroup/tmpfs isolation acceptance는 별도이며 parse/mock/build 성공으로 대체하지 않는다. System stack은 provider credentials를 fake로 고정하고 internal network에서 공식 provider DNS를 fake service로 resolve하므로 유료 inference smoke를 요구하지 않는다.
+- **Cloud/artifact:** 승인된 native Ubuntu 24.04 양쪽 architecture runner와 실제 SHA-256 inputs가 없으면 qcow2 build gate는 blocked다. API/worker role 각각 build한 qcow2·manifest/checksum을 검증하고 Glance에 exact hash/architecture로 등록한 뒤 staging Nova bootstrap/mTLS profile delivery·identity renewal/reboot/drain, Octavia ready/weight-zero/status/tags, SSE/WS routing을 확인한다. Trusted/sandbox 별도 project·application credential scope, Nova quota/firmware/network/SG, controller-only signing/cloud secrets 및 worker-only client mount, DB/PG fixed/controller/pool/surge budgets, S3 encryption/scanner와 PostgreSQL TLS acceptance는 운영자가 제공하고 검증한다. 외부 provider의 유료 호출은 명시적 승인이 없는 release gate에 포함하지 않는다.
+
 
 #### v0.3.1 당시 운영 가이드 (현재 기본값이 아님)
 
@@ -232,9 +703,9 @@ Lumen의 root `lumen` wheel은 Kolla 역할을 shared data로 포함한다. Koll
 - **역할 업데이트**: 새 root wheel을 Kolla environment에 재설치하여 `share/kolla-ansible/ansible/roles/lumen` 자산을 동기화한다. 설치는 Kolla config owner로 `pip install --no-deps --force-reinstall`을 실행한다. 이전 wheel을 root로 설치했다면 owner 설치 뒤 pip가 root 소유 stash(`site-packages/~umen*`, role의 `~*` 디렉터리)를 지우지 못해 `pip show lumen`이 실패하므로 그 stash만 제거한다(0.5.0 rollout에서 확인·정리).
 
 ### 4. Upgrade vs. Reconfigure 동작 및 마이그레이션 보장
-- **Reconfigure 명령어 및 순서 (`reconfigure.yml`)**: `kolla-ansible -i <inventory> reconfigure --tags lumen` (`precheck` → `pull` → `config` → `bootstrap_service` (DB migration → provider registration) → `start`)
-  - Reconfigure 실행 시 최신 갱신 이미지를 먼저 pull하여, `bootstrap_service` 단계의 DB 마이그레이션이 항상 갱신된 최신 이미지 코드로 실행되도록 보장한다.
-- **Upgrade 명령어 및 순서 (`upgrade.yml`)**: `kolla-ansible -i <inventory> upgrade --tags lumen` (`pull` → `config` → `bootstrap_service` (DB migration → provider registration) → `start`)
+- **Reconfigure 명령어 및 순서 (`reconfigure.yml`)**: `kolla-ansible -i <inventory> reconfigure --tags lumen` (`pull/source build` → `precheck` → `config` → `bootstrap_service` (DB migration → provider registration) → `start`)
+  - 이미지는 precheck 전에 각 host에서 취득하고 migration·provider bootstrap·start는 `pull: never`로 같은 local ref를 사용한다. 운영자는 immutable digest refs를 제공하며 실행 중 별도 tag retag/pull을 금지한다. Source mode도 같은 commit pin으로 먼저 build한다.
+- **Upgrade 명령어 및 순서 (`upgrade.yml`)**: `kolla-ansible -i <inventory> upgrade --tags lumen` (`pull/source build` → `precheck` → `config` → `bootstrap_service` (DB migration → provider registration) → `start`)
 - **기동 선행 보장**: `deploy`, `upgrade`, `reconfigure` 모두 관리하는 API/Worker/Controller 서비스 컨테이너 start 단계 전에 migration과 provider bootstrap을 수행한다. 혼합 버전 회피를 위한 기존 컨테이너 admission 중지/정지는 운영자가 cutover에서 확인한다.
 
 ## 보존, backup, restore
@@ -251,6 +722,281 @@ MariaDB journal/credential metadata(015/016 plugin binding·pool/resource·deleg
 - controller: admin pool/resource inventory의 requested/unknown/booting/ready/draining/deleting 및 provider 소유권, bootstrap/certificate/`readyz`, Octavia membership을 따로 확인한다.
 - Redis 장애: wakeup 지연; worker DB polling과 Redis connection log를 확인한다.
 - provider/MCP 오류: journal의 safe error, run provider snapshot, worker log를 함께 본다.
+- CLI catalog: `GET /v1/cli/models` 503은 chat DB 장애이며 installer가 기존 설정을 유지해야 하는 상태다. 행이 `usable=false`면 `disabled_reason`대로 확인한다: `provider_credentials_missing`은 admin provider의 `has_credentials`/`api_key_source`·구독 상태(Claude 구독 만료 포함), `pricing_unavailable`은 모델 input/output 가격, `text_unavailable`은 effective text gate 비활성·`streaming=false`·비어 있지 않은 input/output modality 목록의 text 불가(없음/null/빈 목록은 unknown), `tools_disabled`는 저장된 capability override/models.dev `tool_call`, `subscription_protocol_unsupported`는 ChatGPT device route(호환 endpoint 미지원)다. Claude 구독은 Messages만 광고하며 Responses 요청은 provider 호출 전 400이다. 비활성화·삭제한 provider/model의 route token은 다른 route로 대체되지 않고 404가 되므로 사용자는 installer를 다시 실행해 새 token을 고른다.
 - migration 오류: API/worker/controller를 중지하고 migration ledger, schema, checksum을 확인한다.
 
 API key, provider/MCP/Git secret, raw tool argument를 log/alert에 기록하지 않는다.
+
+## Balanced infrastructure controller participation and handoff
+
+Status: **test-passed locally**, not live-verified, under native OpenSpec `balanced-infrastructure-controller`, from the parent's 2026-10-14 frozen public-clone receipt: focused 110 passed; disposable MariaDB/Redis integration 110 passed, 3393 deselected (multiprocess, late-join/digest, crash takeover and locked assignment-loss tests, with ON/OFF SQL modes where parametrized); contract service 3159 passed, 344 deselected, SDK 128 passed and both gate Ruff checks passed. Repository-wide Ruff retains only the HEAD-baseline SIM102; coordination F811 fixture findings were fixed by module-alias rebinding. Not exercised: autonomous slow heartbeat beyond the tests' accelerated cadence, killed-process recovery outside the tests, real Redis server/network outage (outage cases are synthetic), real Nova/Octavia, guest mTLS, paid inference, mixed-version, deployment. Production Redis/Sentinel failover or async-replication lease/journal loss and promoted-node TIME skew are also unqualified. Existing managed-runtime prerequisites and cloud authorization remain required.
+
+Controllers sharing a `deployment_id` must use the same Redis primary/logical DB/namespace and authoritative SQL schema. Each process has its own owner identity. Redis keys use `lumen:infrastructure:{sha256(deployment_id)}` with `participants`, `eligibility` and `registry` suffixes. Atomic Redis `TIME` determines participation deadlines, not host clocks. Nominal heartbeat is 5 seconds (or the smaller configured reconcile interval), participation is 30 seconds, and the registry persists beyond member expiry. Do not treat that persistent registry as an active controller or SQL lease, and do not flush shared Redis to trigger failover.
+
+The lexical live leader alone synchronizes the configured SQL registry and conditionally publishes enabled pool IDs/digests. SQL sync checks leadership before discovery, after lock acquisition and before commit, rolling back when a check fails. A Redis leadership change cannot atomically invalidate a SQL commit already crossing that boundary; do not describe this as a cross-store fencing transaction. Startup configured-provider preflight remains per process. Followers reconcile only assigned exact-name/digest-compatible pools; incompatible or unconfigured members must not become a fallback owner. Equal eligibility yields pool counts differing by at most one; deterministic scarce-first/least-load assignment can relocate a flexible incumbent's other pool for a constrained late join. It is neither minimum-movement nor CPU/resource-cost balancing.
+
+Heartbeat/dispatcher, leader SQL registry work and per-pool reconciliation have separate owned tasks. A blocked cloud SDK call or registry row lock must not delay membership refresh or unrelated assigned pools. Per-pool launch deadlines preserve `reconcile_interval_seconds`. Each pool still needs a SQL owner/fence/expiry lease (30-second duration, 10-second renewal), and locked cloud writes remain ordered with takeover. Redis assignment is a scheduling hint and a new-I/O gate, not replacement cloud authority.
+
+| Event | Required behavior and operator boundary |
+| --- | --- |
+| Late join / rebalance | Recompute deterministic eligible assignments. New owner waits for old SQL work to drain/release or safely expire; assignment is not permission to preempt a submitted effect. |
+| Graceful stop / role loss | Stop new submissions; join SDK threads, sibling async effects and durable outcome recording. Release only matching SQL owner+fence after drain; controller stop joins registry/pool tasks before Redis leave/executor shutdown. Do not force-release a fence to make a delayed stop appear complete. |
+| Process crash | Surviving members observe Redis-TIME expiry and redistribute. SQL leases, row locks, generation/operation journals still govern takeover. Unknown cloud creates need exact ownership observation/adoption or confirmed absence, never blind resubmission. No fixed failover-time SLA follows from the 30-second participation window. |
+| Redis outage / failed assignment read | No new controller cloud submissions or outbound guest drain requests, and no fallback to every process discovering/claiming all pools. In-flight effects drain/settle under SQL authority. A recovered heartbeat may rejoin/recompute assignments; `current()` alone cannot resurrect expired membership. |
+| Leader loss while waiting for SQL lock | Post-lock/pre-commit checks fail and roll back when loss is observed; Redis registry publish rejects a nonleader. An already-started transaction can settle across a later loss, so compare SQL registry/desired revision and current published digest before cloud diagnosis. |
+
+The general Redis wakeup outage note above still applies to durable run workers: SQL workload-class/pool assignment, competing consumers and DB polling are unchanged. Node-local request meters, guest API handlers, controller bootstrap/identity request handling and accepted run lifetime are not elected roles. The additional fail-closed rule here concerns outbound controller work only.
+
+Coordinate a stop/drain and compatible controller restart using existing approved rollout procedures; mixed old/all-pool and new/assigned controllers are not qualified by these documents. Preserve SQL/cloud journals, encryption/CA/dispatch keys, Redis/DB endpoints, and unrelated WIP. Execute the [local real-Redis/SQL recipe](testing.md#balanced-infrastructure-controller-acceptance-test-passed) only in disposable fixtures. The linked parent receipt records source scope, commands, counts and real/synthetic boundaries; the architecture stamp is in the parent receipt (isolated clone, shared marker untouched). Local test evidence does not authorize promotion, production failover, live provider/cloud, release publication or deployment.
+
+Existing guest supervisor limitation: `lumen/services/infrastructure/guest_api.py` sends the service child SIGTERM, waits at most ten seconds, then sends SIGKILL during supervisor shutdown. Outer Docker/systemd stop timeouts alone do not guarantee active-call drain during stop/reboot. Complete and acknowledge service/run drain before stopping the guest supervisor; do not infer graceful provider completion from outer timeout configuration. This integration does not change that supervisor behavior.
+
+## Manually updating the native model catalog
+
+`lumen/data/native_model_catalog.json` is bundled package data, not a live price feed.
+It applies only to the official OpenAI, Anthropic, Gemini and Perplexity endpoints.
+OpenAI/Anthropic subscription authentication retains its separate transport limits.
+Third-party compatible endpoints receive no bundled models, prices or capabilities;
+administrators register their IDs and required rates explicitly.
+
+1. Re-read each affected provider's official pricing, model specification and lifecycle pages.
+   Record the exact official HTTPS URLs in `source_urls` and the provider's
+   `pricing_sources`. Never use aggregator estimates or infer a newer model's rates
+   from its family. Keep unknown published fields null or omitted where the schema permits.
+2. Edit the matching entry, preserving exact decimal-string USD prices per one million
+   tokens. Set `verified_at` to the review date and bump `catalog_version` for the reviewed
+   cohort. Keep deprecated products explicitly marked; do not alias a retired product to
+   a different paid product. Agent `perplexity/<id>` and legacy Sonar IDs are distinct.
+3. Preserve each model's exact `long_context.threshold_tokens`: billing selects its tier
+   only when total input tokens are greater than that integer. A published inclusive
+   threshold can be represented by the preceding integer, with the source condition
+   explained in `notes`. Never substitute a global 200K boundary.
+4. Use the existing media-pricing shape only when the published tariff fits it exactly.
+   Published rates never define a funding hold. Direct OpenAI Images derives
+   a hold per request (below); transports without a derived policy require a
+   positive operator `reservation_usd`. Leave unsupported published rates null
+   and explain the missing evidence in `notes`; never approximate a unit tariff.
+   Additional provider search, storage, grounding or tool charges documented in notes are
+   not silently included in token prices.
+   Unit-priced image entries must include exact `image_variants` for every supported
+   size:quality request, including `auto:auto`; `image_per_unit` alone does not make
+   a route executable. The 2026-11-18 review of [Gemini pricing](https://aistudio.google.com/docs/pricing#gemini-2.5-flash-image)
+   and the [model specification](https://aistudio.google.com/docs/models/gemini-2.5-flash-image)
+   confirms Gemini 2.5 Flash Image output costs 1,290 tokens × $30/1M = $0.039/image.
+   Its four Lumen aspect-ratio size presets with quality auto share that rate.
+   Stored administrator media prices retain precedence over bundled prices.
+5. Run `pytest tests/test_provider_catalog.py tests/test_chat_native_catalog_admin.py`
+   in the service development environment, then the focused capability/pricing suites
+   for affected models. The loader rejects unknown fields, bad kinds, duplicate IDs or
+   aliases, missing/unofficial sources and negative/non-finite/non-string prices.
+6. Build a wheel and inspect that it contains `lumen/data/native_model_catalog.json`.
+   Review a secret-free before/after projection of registered routes, including manual
+   prices, capabilities, cache rates and media availability. Record intentional changes
+   and gaps in the change evidence. Source/local tests do not establish provider or
+   production acceptance, and a catalog edit does not authorize a deployment.
+
+GPT-6.2 Sol and Astra use exact Standard and over-272,000 whole-request tariffs
+from [OpenAI pricing](https://developers.openai.com/api/docs/pricing). Keep
+`max_input_tokens` (922,000) distinct from the 1,050,000-token context window
+and the 128,000-token output limit. Explicit administrator rates still win.
+Clear a manual base rate to activate its catalog long-context tier; matching
+the catalog's short-context number does not turn a manual price into a tier.
+Published Cyber/Rosalind prices do not grant access. Unpublished long-context
+cache-write rates remain unavailable, not copies of the short-context rate.
+
+### OpenAI text credit envelope
+
+The online hold uses UTF-8 bytes of compact JSON for prompt messages, tool
+definitions and output schemas, plus 4,096 tokens of framing, 16 per message
+or tool definition, and the published per-image token cap when available.
+This framing allowance is Lumen policy, not a provider guarantee. Encrypted
+reasoning replay contributes its encoded UTF-8 bytes, assuming ciphertext bytes
+are at least the replayed token count. Computer-use screenshots follow image
+rules at the requested detail, with automatic detail when omitted. For media
+without a published cap (including GPT-6.2 images), files/audio, or tools that
+add server-side context, use the published input limit, or the context window
+if no separate input limit exists.
+The output reserve is independent: use the explicit caller cap or the published
+output maximum. An omitted cap stays omitted when sent to official OpenAI.
+
+Choose the maximum frozen applicable input rate, including cache writes.
+Default 30m writes count; reserve the 12h rate if the request or an input
+breakpoint asks for 12h. Include long-context rates only if the input bound
+can exceed the model threshold. Add the hosted fee ceiling, then apply credit
+conversion and margin. A provider report beyond the reserved token or charge
+ceiling does not settle. Examples before margin, credit conversion and rounding:
+
+| Request | Reservation |
+| --- | ---: |
+| Sol, prompt of 1,000 UTF-8 bytes, one user message, compact Chat envelope of 73 bytes, 128 output tokens | 5,185 × $2.50/M + 128 × $10/M = $0.0142425 |
+| Same Sol request, no output cap | 5,185 × $2.50/M + 128,000 × $10/M = $1.2929625 |
+| Astra with Web Search, default 10 calls, default cache TTL and no output cap | 922,000 × $20/M + 128,000 × $60/M + 10 × $0.01 = $26.22 |
+
+For official OpenAI text, use Standard processing. Online routes with known
+catalog limits reserve worst-case token cost before dispatch. Metered Responses
+tools add a bound based on `max_tool_calls` (default 10, maximum 20). Web Search
+is $0.01 per output call. Auto Code Interpreter/Shell containers are billed
+one full 20-minute block per distinct reported container at the request's
+memory tier. This may exceed OpenAI's per-minute invoice. Only GPT-6.2 Sol/Astra
+have the metered hosted tool policy here; no explicit container or provider file
+reuse is permitted. Missing usage, missing container IDs, a nonstandard tier
+or tracking beyond the held bound leaves a content-free `unknown` reservation
+for operator disposition; do not retry the original request to settle it.
+After a held Chat or Responses client disconnect, the SSE owner stops client
+delivery and waits up to 15 seconds for terminal usage. Once the atomic
+settlement starts, it may complete beyond the drain deadline. If the terminal
+evidence does not arrive in time, the hold stays `unknown`. The owner closes
+upstream before releasing the SSE slot. Each held settlement attempt with valid
+token counts logs only the reservation ID and reported counts versus their bounds.
+
+### OpenAI Images funding policy
+
+The [OpenAI Images guide](https://developers.openai.com/api/docs/guides/image-generation.md)
+and [pricing](https://developers.openai.com/api/docs/pricing) govern the direct
+token tariffs. An active native API-key route with a ready asset pipeline can
+use bundled rates without a manual price. `billing_basis: "tokens"` is explicit;
+an operator may still set a positive whole-request `reservation_usd` to replace
+the computed hold. GPT Image 2/2.5 cached rates are for the Responses image tool,
+not direct Images. GPT Image 2.6 direct cache billing is not documented; Lumen
+rejects unexpected modern Images cache usage rather than guessing.
+
+The default hold is **not** a tariff or hard provider limit. Lumen computes:
+
+- For each GPT Image 2+ output, choose the [official calculator](https://developers.openai.com/api/docs/guides/image-generation)
+  grid `L`: GPT Image 2 uses 16/48/96 for low/medium/high; 2.5/2.6 use
+  16/24/48/64/96 for low/medium/high/xhigh/max. Round `q = L × short / long`
+  half-to-even; `base = ceil(L × q × (2,000,000 + W×H) / 4,000,000)`.
+  For 2.6 round `base × 4.2` (low) or `base × 3.3` (medium) to nearest,
+  with halves up. Use 2880×2880 for `size:auto`, and high (2) or max
+  (2.5/2.6) for `quality:auto`. These maximize modeled cost independently.
+- Older preset models use their published image output estimates (per
+  size/quality, worst legal when auto), plus $0.001 to cover price rounding,
+  converted to tokens using the published image output rate.
+- Reserve `ceil(1.5 × estimate)` tokens per image, or per GIF frame. The 50%
+  headroom allows estimator variance; only actual aggregate provider usage
+  bills. Multiply by `n` and for GIF by `frame_count` (default 9).
+- Reserve one text input token per UTF-8 prompt byte plus 256 for hidden
+  request framing. For edits add `8192 + 512 × ceil(Wsrc/256) × ceil(Hsrc/256)`
+  input-image tokens per scanned source or overlay, using the scanner's
+  validated dimensions. OpenAI does not publish GPT Image edit-input token counts. This Lumen policy budgets
+  more than its historical tile/fidelity overhead without treating that old
+  tariff as the current model's formula.
+- For SVG, add an authoring envelope for `prompt_bytes + 65,536` input
+  tokens and 32,768 output tokens. This covers space for the prompt, reference
+  image and hidden input, plus a vector document and reasoning. Admission
+  freezes exact native text model IDs and published rates (including context
+  tiers). When the caller omits `svg_model`, reserve at the highest combined
+  candidate cost. When the caller selects one, require an exact nonrestricted
+  native catalog ID registered on the image provider and authorized by the
+  image route's fixed account and credential; reserve at its resolved rates
+  and require either the selected ID or a frozen exact alias of the same
+  native catalog entry in `svg_usage`. Both use the selected route's frozen
+  rates; an independently configured model route is not consulted. Reasoning
+  is already included in output.
+- Sum each quantity × its matching USD/token rate; round the derived USD
+  envelope up to 10 decimal places. Apply frozen margin and credit conversion.
+  Admission checks available headroom without charging; the worker atomically
+  rechecks and records the actual reservation before the one provider call.
+
+With a four-byte prompt `Draw`, before margin/credit conversion: 2.5
+high 1024×1024 (`n=1`) holds 2,634 output tokens → **$0.080320**;
+2.6 `auto:auto`, `n=2`, holds 71,158 output tokens → **$2.136040**;
+the first request as an edit with a 1024×1024 source additionally holds
+16,384 image-input tokens → **$0.211392** total.
+
+Settlement multiplies observed token categories by frozen rates, never debits
+the hold itself, and fails closed on missing, inconsistent, unpriced or
+over-hold usage. Keep an unknown hold for reconciliation; never retry a paid
+operation automatically. Project-level SVG/GIF preview access, actual
+estimator variance, and invoice parity require separate provider acceptance.
+`svg_usage` carries no cache split, so authoring tokens settle at the frozen
+author input rate. If OpenAI applies a GPT-6.x/5.6 cache-write premium to
+authoring input (unverified), that premium is not billed.
+
+### Gemini Decisions catalog
+
+For Gemini Decisions, review the [model card](https://aistudio.google.com/docs/models/gemini-decision-1),
+[API contract](https://aistudio.google.com/docs/decisions-api) and
+[paid price](https://aistudio.google.com/docs/pricing#gemini-decision) together. The
+exact catalog entry `gemini/gemini-decision-1` has kind `decision`,
+`capabilities.decisions=true`, a 262,144-token context, a published output limit of
+0, and input token price `"0.10"` per million USD. Keep output/cache rates and media
+tariffs unset. The output limit is not an output tariff; do not turn a live
+`outputTokenLimit` hint into a billed output allowance. Preserve the distinction
+between provider-published modalities and Lumen's text/image-only execution scope.
+Re-read sources and advance `catalog_version` when updating this entry. Do not
+copy Gemini 4/3 image token counts or defaults into the Decision 1 entry.
+
+### Catalog precedence, cache slots and overrides
+
+Runtime prices use stored administrator rates first, then exact native catalog rates,
+then no rate. Stored historical `price_source` strings remain provenance only. Runtime
+capabilities use explicit administrator overrides, then catalog fields. On official native
+routes only, missing `reasoning_options` and `context_limit` may fall back to imported metadata;
+compatible endpoints remain explicit-override-or-defaults for those fields too.
+Other imported flags never override catalog/default detection. Remaining unknowns use
+conservative defaults. A missing PDF declaration is unknown, not a provider denial.
+Catalog prices are never copied into model columns. To follow the catalog, PATCH the
+native model's input/output/cache prices and `media_pricing` to null; compatible models
+must retain administrator prices. Read responses distinguish stored `media_pricing`
+from `effective_media_pricing`, expose `price_origin`, `catalog_version` and entry provenance.
+
+The existing cache slots are stable ledger vocabulary, not literal provider TTL claims.
+OpenAI's 30-minute write maps to `cache_write_price_per_million` / `cache_creation_5m`;
+its 12-hour write maps to `cache_write_1h_price_per_million` / `cache_creation_1h`.
+Anthropic retains its published 5-minute/1-hour mapping. The catalog records actual TTLs.
+Likewise `_above_200k` remains the legacy frozen tier-slot suffix; the admission snapshot's
+`long_context_threshold_tokens` controls the real boundary. Old snapshots without that
+field retain their historical 200000 boundary. New admissions freeze effective rates,
+threshold and capabilities; settlement never consults a later catalog revision.
+
+The removed models.dev import endpoints return 404. Historical nullable import-identity
+columns remain in SQL/schema snapshots for compatibility, but the ORM no longer maps
+them. `LICENSE.litellm` remains necessary for the existing search-transport mapping
+attribution; removal of the old catalog does not remove that independent attribution.
+
+Embedding entries may additionally carry `embedding` with `default_dimensions`,
+`supports_dimensions`, `min_dimensions`, `max_dimensions` and `allowed_dimensions`.
+Use null for unpublished bounds or a non-exhaustive recommendation list; recommendations
+must not become an exhaustive allowlist. Native requests enforce the exact published
+range/list. Unknown metadata permits the provider default but refuses an explicit
+dimension request. Compatible endpoints use only an administrator `capabilities.embedding`
+override; they never borrow native dimensions from a matching public model ID.
+
+An explicit capability override may remove catalog uncertainty only where Lumen implements
+that protocol feature. Published native-search support remains visible as metadata, but
+the native execution gate is unavailable and unpriced until provider per-search/request
+fees can be billed. Text token rates alone never activate a paid native search tool.
+Separately priced managed search providers remain supported for CRUD and search routing;
+the inference-only provider allowlist does not remove search adapters.
+OpenAI Decisions can be enabled only for OpenAI-protocol API-key text routes, including
+compatible endpoints. Gemini Decisions requires a dedicated `decision` row on the
+official Gemini API-key route. An override alone cannot enable Decisions on another
+kind or transport; Anthropic, Perplexity, and subscription routes are not eligible.
+Perplexity Sonar's built-in search remains a separate, pre-existing behavior: its
+`web_search_required` authorization floor still requires `native:tools:execute`, even
+when the optional native-search gate is unavailable or an override disables that gate.
+Sonar remains admitted as before; its unbilled provider search fees are a documented
+known gap, not permission to drop the tools scope or claim complete fee accounting.
+The exact native Sonar product list controls this floor even when a variant is absent
+from the bundled catalog and is enabled through administrator-supplied prices.
+
+ChatGPT subscriptions use OpenAI catalog specifications for discovery, capabilities and
+context only, followed by the existing subscription transport limits. They never borrow
+API token/cache/media rates or price tiers; administrator subscription rates are required.
+
+For tiered models, catalog modality rates identical to effective text categories retain
+their required provider observations but settle in the text residual, using that call's
+context tier, only when both the modality and compared text rates are catalog-sourced.
+The frozen `token_rates_follow_text` provenance excludes manual media prices and manual
+text prices, even when their numbers happen to equal the published catalog rates.
+Distinct catalog modality rates require corresponding explicit
+`token_pricing.long_context.token_rates` entries; a future mixed bucket freezes every
+effective tier field. Existing native tiered Gemini audio fields all equal their base
+text categories; no differing native modality tier was silently assumed.
+
+An absent or empty administrator `reasoning_options` list is unspecified, like a null
+context limit: saving another capability toggle retains the detected catalog options.
+Use explicit capability controls rather than an empty list to disable reasoning.
+Live model-discovery display names are retained, including uncatalogued IDs and compatible
+endpoints; compatible IDs still receive no bundled kind, price or capability annotations.

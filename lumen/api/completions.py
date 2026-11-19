@@ -15,11 +15,11 @@ import logging
 from time import monotonic
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 
-from lumen.auth import Principal, require_scopes
+from lumen.auth import Principal, credential_authority_snapshot, ensure_scopes, get_principal, require_scopes
 from lumen.config import get_settings
 from lumen.models.chat_contracts import (
     AgentBudget,
@@ -31,6 +31,7 @@ from lumen.models.chat_contracts import (
     ContextPreviewRequest,
     ContextState,
     RegenerateRequest,
+    RetryRequest,
     RunInteractionResponseRequest,
     TempCompletionRequest,
     ToolApprovalDecisionRequest,
@@ -44,8 +45,10 @@ from lumen.services.chat_admission import (
     _load_owned_conv,
     prepare_context_input,
 )
+from lumen.services.domain_scope import history_domain_id
 from lumen.services.durable_runs import admission, common, interactions, lifecycle, queries
 from lumen.services.durable_runs import errors as durable_errors
+from lumen.services.infrastructure.api_load import admit_sse
 from lumen.services.run_store import NONTERMINAL
 
 logger = logging.getLogger(__name__)
@@ -131,14 +134,15 @@ async def create_completion(
     """Persist intent and return a descriptor; the worker owns all provider I/O."""
     user_id = token_info["user_id"]
     project_id = token_info["project_id"]
+    domain_id = history_domain_id(token_info)
     try:
         message_text = text_projection_from_user_input_parts(payload.parts)
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    await _load_owned_conv(conversation_id, user_id, project_id)
+    await _load_owned_conv(conversation_id, user_id, project_id, domain_id=domain_id)
     try:
-        path = await cs.get_active_path(conversation_id, user_id=user_id, project_id=project_id)
+        path = await cs.get_active_path(conversation_id, user_id=user_id, project_id=project_id, domain_id=domain_id)
         expected_active_leaf_id = _active_leaf_fence(path["active_leaf_id"])
         features = _features_payload(payload.features)
         intent = {
@@ -157,7 +161,10 @@ async def create_completion(
             "plugin_skill_ids": payload.plugin_skill_ids,
             "client_timezone": payload.client_timezone,
         }
+        if payload.model_row_id is not None:
+            intent.update(model_row_id=payload.model_row_id, model_id=payload.model_id)
         intent.update(_api_key_id=token_info["api_key_id"], _source=token_info["source"])
+        intent = admission._intent_with_credential_authority(intent, credential_authority_snapshot(token_info))
         existing = await admission.existing_run_for_intent(
             project_id=project_id,
             user_id=user_id,
@@ -172,7 +179,7 @@ async def create_completion(
     except cs.ChatStorageUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     try:
-        await credit.precheck(user_id, project_id, api_key_id=token_info["api_key_id"])
+        await credit.precheck(user_id, project_id, api_key_id=token_info["api_key_id"], payer=token_info.get("payer"))
     except credit.QuotaExceeded as exc:
         raise HTTPException(status_code=402, detail=str(exc)) from exc
     except credit.ChatStorageUnavailable as exc:
@@ -185,6 +192,7 @@ async def create_completion(
         conversation_id=conversation_id,
         temp_thread_id=None,
         model_id=payload.model_id,
+        model_row_id=payload.model_row_id,
         parts=payload.parts,
         features=payload.features,
         agent_id=int(payload.agent_id) if payload.agent_id else None,
@@ -225,10 +233,11 @@ async def create_completion(
         return await admission.create_persistent_run(
             project_id=project_id,
             user_id=user_id,
+            domain_id=domain_id,
             client_request_id=str(idempotency_key),
             intent=intent,
             conversation_id=conversation_id,
-            model_name=payload.model_id,
+            model_name=planned["resolved"]["model_name"],
             agent_id=agent.get("id") if agent else None,
             user_content=message_text,
             user_parts=[part.model_dump(mode="json", by_alias=True) for part in payload.parts],
@@ -264,6 +273,7 @@ async def create_completion(
             execution_protocol_version=execution_protocol_version,
             source=token_info["source"],
             api_key_id=token_info["api_key_id"],
+            payer=token_info.get("payer"),
             expected_parent_id=expected_active_leaf_id,
             agent_budget=planned["agent_budget"],
             execution_mode=payload.execution_mode,
@@ -286,10 +296,11 @@ async def regenerate_message(
 ):
     project_id = token_info["project_id"]
     user_id = token_info["user_id"]
-    await _load_owned_conv(conversation_id, user_id, project_id)
+    domain_id = history_domain_id(token_info)
+    await _load_owned_conv(conversation_id, user_id, project_id, domain_id=domain_id)
     try:
         turn_user = await cs.find_turn_start_user(
-            conversation_id, user_id=user_id, project_id=project_id, message_id=message_id
+            conversation_id, user_id=user_id, project_id=project_id, message_id=message_id, domain_id=domain_id,
         )
     except (cs.ConversationNotFound, cs.ConversationForbidden) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -309,7 +320,10 @@ async def regenerate_message(
         "client_timezone": payload.client_timezone,
         "reasoning_effort": payload.reasoning_effort,
     }
+    if payload.model_row_id is not None:
+        intent["model_row_id"] = payload.model_row_id
     intent.update(_api_key_id=token_info["api_key_id"], _source=token_info["source"])
+    intent = admission._intent_with_credential_authority(intent, credential_authority_snapshot(token_info))
     try:
         existing = await admission.existing_run_for_intent(
             project_id=project_id,
@@ -325,13 +339,15 @@ async def regenerate_message(
     try:
         # Regeneration reads the selected user ancestor, but the mutation must
         # fence the active branch that was visible when this request started.
-        active_path = await cs.get_active_path(conversation_id, user_id=user_id, project_id=project_id)
+        active_path = await cs.get_active_path(
+            conversation_id, user_id=user_id, project_id=project_id, domain_id=domain_id,
+        )
         expected_active_leaf_id = _active_leaf_fence(active_path.get("active_leaf_id"))
     except cs.ChatStorageUnavailable as exc:
         raise HTTPException(status_code=503, detail="chat storage is unavailable") from exc
 
     try:
-        await credit.precheck(user_id, project_id, api_key_id=token_info["api_key_id"])
+        await credit.precheck(user_id, project_id, api_key_id=token_info["api_key_id"], payer=token_info.get("payer"))
     except credit.QuotaExceeded as exc:
         raise HTTPException(status_code=402, detail=str(exc)) from exc
     except credit.ChatStorageUnavailable as exc:
@@ -344,6 +360,7 @@ async def regenerate_message(
         temp_thread_id=None,
         leaf_id=turn_user["id"],
         model_id=payload.model_id,
+        model_row_id=payload.model_row_id,
         parts=source_parts,
         features=payload.features,
         agent_id=None,
@@ -364,11 +381,12 @@ async def regenerate_message(
         return await admission.create_run(
             project_id=project_id,
             user_id=user_id,
+            domain_id=domain_id,
             client_request_id=str(idempotency_key),
             intent=intent,
             conversation_id=conversation_id,
             temp_thread_id=None,
-            model_name=payload.model_id,
+            model_name=planned["resolved"]["model_name"],
             agent_id=None,
             user_message_id=turn_user["id"],
             request_payload={
@@ -387,52 +405,14 @@ async def regenerate_message(
             execution_protocol_version=execution_protocol_version,
             source=token_info["source"],
             api_key_id=token_info["api_key_id"],
+            payer=token_info.get("payer"),
             expected_parent_id=expected_active_leaf_id,
         )
     except durable_errors.DurableRunError as exc:
         raise _run_error(exc) from exc
 
 
-@router.post(
-    "/conversations/{conversation_id}/runs/{run_id}/retry",
-    response_model=ChatRunDescriptor,
-    status_code=status.HTTP_202_ACCEPTED,
-)
-async def retry_failed_run(
-    conversation_id: str,
-    run_id: str,
-    idempotency_key: UUID = Header(alias="Idempotency-Key"),
-    token_info: Principal = Depends(require_scopes("native:conversations:write", "native:runs:write")),
-):
-    project_id = token_info["project_id"]
-    user_id = token_info["user_id"]
-    await _load_owned_conv(conversation_id, user_id, project_id)
-
-    intent = {
-        "endpoint": "retry",
-        "conversation_id": conversation_id,
-        "source_run_id": run_id,
-    }
-    intent.update(_api_key_id=token_info["api_key_id"], _source=token_info["source"])
-    try:
-        existing = await admission.existing_run_for_intent(
-            project_id=project_id,
-            user_id=user_id,
-            client_request_id=str(idempotency_key),
-            intent=intent,
-            conversation_id=conversation_id,
-        )
-        if existing is not None:
-            return existing
-    except durable_errors.DurableRunError as exc:
-        raise _run_error(exc) from exc
-    try:
-        await credit.precheck(user_id, project_id, api_key_id=token_info["api_key_id"])
-    except credit.QuotaExceeded as exc:
-        raise HTTPException(status_code=402, detail=str(exc)) from exc
-    except credit.ChatStorageUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
-
+async def _load_retry_source(run_id: str, conversation_id: str, user_id: str, project_id: str) -> ChatRun:
     factory = common._factory()
     async with factory() as session:
         source_run = (
@@ -452,6 +432,59 @@ async def retry_failed_run(
 
     if source_run is None:
         raise HTTPException(status_code=404, detail="재시도할 실행 기록을 찾을 수 없습니다")
+    return source_run
+
+
+@router.post(
+    "/conversations/{conversation_id}/runs/{run_id}/retry",
+    response_model=ChatRunDescriptor,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def retry_failed_run(
+    conversation_id: str,
+    run_id: str,
+    idempotency_key: UUID = Header(alias="Idempotency-Key"),
+    token_info: Principal = Depends(require_scopes("native:conversations:write", "native:runs:write")),
+    payload: RetryRequest | None = None,
+):
+    project_id = token_info["project_id"]
+    user_id = token_info["user_id"]
+    domain_id = history_domain_id(token_info)
+    await _load_owned_conv(conversation_id, user_id, project_id, domain_id=domain_id)
+    source_run = None
+    if payload is not None and payload.model_row_id is not None:
+        source_run = await _load_retry_source(run_id, conversation_id, user_id, project_id)
+        if (source_run.capability_snapshot or {}).get("model_id") != payload.model_row_id:
+            raise HTTPException(status_code=422, detail="model_selection_mismatch")
+
+    intent = {
+        "endpoint": "retry",
+        "conversation_id": conversation_id,
+        "source_run_id": run_id,
+    }
+    intent.update(_api_key_id=token_info["api_key_id"], _source=token_info["source"])
+    intent = admission._intent_with_credential_authority(intent, credential_authority_snapshot(token_info))
+    try:
+        existing = await admission.existing_run_for_intent(
+            project_id=project_id,
+            user_id=user_id,
+            client_request_id=str(idempotency_key),
+            intent=intent,
+            conversation_id=conversation_id,
+        )
+        if existing is not None:
+            return existing
+    except durable_errors.DurableRunError as exc:
+        raise _run_error(exc) from exc
+    try:
+        await credit.precheck(user_id, project_id, api_key_id=token_info["api_key_id"], payer=token_info.get("payer"))
+    except credit.QuotaExceeded as exc:
+        raise HTTPException(status_code=402, detail=str(exc)) from exc
+    except credit.ChatStorageUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    if source_run is None:
+        source_run = await _load_retry_source(run_id, conversation_id, user_id, project_id)
 
     if source_run.status not in {"failed", "canceled"}:
         raise HTTPException(status_code=400, detail="실패하거나 취소된 실행만 재시도할 수 있습니다")
@@ -464,7 +497,9 @@ async def retry_failed_run(
         # Retry projects the failed run's saved user turn, but fences the
         # active leaf observed before planning so a branch switch cannot be
         # overwritten by a late retry.
-        active_path = await cs.get_active_path(conversation_id, user_id=user_id, project_id=project_id)
+        active_path = await cs.get_active_path(
+            conversation_id, user_id=user_id, project_id=project_id, domain_id=domain_id,
+        )
         expected_active_leaf_id = _active_leaf_fence(active_path.get("active_leaf_id"))
     except cs.ChatStorageUnavailable as exc:
         raise HTTPException(status_code=503, detail="chat storage is unavailable") from exc
@@ -475,7 +510,8 @@ async def retry_failed_run(
     except Exception as exc:
         raise HTTPException(status_code=500, detail="실행 정보를 복원할 수 없습니다") from exc
 
-    model_name = source_run.model_name
+    source_snapshot = source_run.capability_snapshot or {}
+    model_row_id = source_snapshot.get("model_id")
     agent_id = source_run.agent_id
     raw_features = payload_dict.get("features")
     features_obj = (
@@ -501,7 +537,7 @@ async def retry_failed_run(
     )
     raw_parts = payload_dict.get("input_parts")
     path_messages = await cs.path_ending_at(
-        conversation_id, user_id=user_id, project_id=project_id, message_id=message_id
+        conversation_id, user_id=user_id, project_id=project_id, message_id=message_id, domain_id=domain_id,
     )
     if isinstance(raw_parts, list) and raw_parts:
         try:
@@ -524,7 +560,9 @@ async def retry_failed_run(
         conversation_id=conversation_id,
         temp_thread_id=None,
         leaf_id=message_id,
-        model_id=model_name,
+        model_id=source_run.model_name if model_row_id is None else None,
+        model_row_id=model_row_id,
+        use_agent_model=False,
         parts=typed_parts,
         features=features_obj,
         agent_id=agent_id,
@@ -540,6 +578,9 @@ async def retry_failed_run(
         append_draft=False,
         agent_budget=source_budget,
     )
+    source_provider_id = source_snapshot.get("provider_id")
+    if source_provider_id is not None and planned["resolved"]["provider_id"] != source_provider_id:
+        raise HTTPException(status_code=422, detail="model_selection_mismatch")
 
     agent = planned["agent"]
     try:
@@ -559,11 +600,12 @@ async def retry_failed_run(
         return await admission.create_run(
             project_id=project_id,
             user_id=user_id,
+            domain_id=domain_id,
             client_request_id=str(idempotency_key),
             intent=intent,
             conversation_id=conversation_id,
             temp_thread_id=None,
-            model_name=model_name,
+            model_name=planned["resolved"]["model_name"],
             agent_id=agent.get("id") if agent else None,
             user_message_id=message_id,
             request_payload={
@@ -596,6 +638,7 @@ async def retry_failed_run(
             execution_protocol_version=execution_protocol_version,
             source=token_info["source"],
             api_key_id=token_info["api_key_id"],
+            payer=token_info.get("payer"),
             expected_parent_id=expected_active_leaf_id,
             agent_budget=planned["agent_budget"],
             execution_mode=source_run.execution_mode,
@@ -630,7 +673,10 @@ async def temp_completion(
         "execution_mode": payload.execution_mode,
         "code_workspace_id": payload.code_workspace_id,
     }
+    if payload.model_row_id is not None:
+        intent["model_row_id"] = payload.model_row_id
     intent.update(_api_key_id=token_info["api_key_id"], _source=token_info["source"])
+    intent = admission._intent_with_credential_authority(intent, credential_authority_snapshot(token_info))
     try:
         existing = await admission.existing_run_for_intent(
             project_id=project_id,
@@ -641,7 +687,7 @@ async def temp_completion(
         )
         if existing is not None:
             return existing
-        await credit.precheck(user_id, project_id, api_key_id=token_info["api_key_id"])
+        await credit.precheck(user_id, project_id, api_key_id=token_info["api_key_id"], payer=token_info.get("payer"))
     except durable_errors.DurableRunError as exc:
         raise _run_error(exc) from exc
     except credit.QuotaExceeded as exc:
@@ -655,6 +701,7 @@ async def temp_completion(
         conversation_id=None,
         temp_thread_id=payload.temp_thread_id,
         model_id=payload.model_id,
+        model_row_id=payload.model_row_id,
         parts=payload.parts,
         features=payload.features,
         agent_id=None,
@@ -681,7 +728,7 @@ async def temp_completion(
             client_request_id=str(idempotency_key),
             intent=intent,
             temp_thread_id=payload.temp_thread_id,
-            model_name=payload.model_id,
+            model_name=planned["resolved"]["model_name"],
             request_payload={
                 "input_messages": planned["input_messages"],
                 "input_parts": [part.model_dump(mode="json", by_alias=True) for part in payload.parts],
@@ -704,13 +751,14 @@ async def temp_completion(
             execution_protocol_version=execution_protocol_version,
             source=token_info["source"],
             api_key_id=token_info["api_key_id"],
+            payer=token_info.get("payer"),
         )
     except durable_errors.DurableRunError as exc:
         raise _run_error(exc) from exc
 
 
 async def _active_context_compaction_run_id(
-    *, conversation_id: str | None = None, temp_thread_id: str | None = None
+    *, user_id: str, project_id: str, conversation_id: str | None = None, temp_thread_id: str | None = None,
 ) -> str | None:
     if (conversation_id is None) == (temp_thread_id is None):
         raise ValueError("exactly one context parent is required")
@@ -718,6 +766,8 @@ async def _active_context_compaction_run_id(
         factory = common._factory()
         async with factory() as session:
             query = select(ChatRun.id).where(
+                ChatRun.user_id == user_id,
+                ChatRun.project_id == project_id,
                 ChatRun.status.in_(NONTERMINAL),
                 ChatRun.run_kind == "compaction",
                 ChatRun.conversation_id == conversation_id
@@ -748,6 +798,7 @@ async def preview_conversation_context(
         conversation_id=conversation_id,
         temp_thread_id=None,
         model_id=payload.model_id,
+        model_row_id=payload.model_row_id,
         parts=payload.parts,
         features=payload.features,
         agent_id=int(payload.agent_id) if payload.agent_id else None,
@@ -767,15 +818,18 @@ async def preview_conversation_context(
     resolved = planned["resolved"]
     capabilities = resolved.get("capabilities") or {}
     context_limit = capabilities.get("context_limit")
-    output_reserve = min(planned["max_tokens"], capabilities.get("max_output_tokens", 4096))
+    output_reserve = min(planned["max_tokens"], capabilities.get("max_output_tokens") or 4096)
     source = planned["source"]
-    active_compaction_run_id = await _active_context_compaction_run_id(conversation_id=conversation_id)
+    active_compaction_run_id = await _active_context_compaction_run_id(
+        conversation_id=conversation_id, user_id=user_id, project_id=project_id,
+    )
 
     return context_manager.context_state(
         planned["input_messages"],
         planned["tool_schemas"],
         model_name=resolved["model_name"],
         context_limit=context_limit,
+        max_input_tokens=capabilities.get("max_input_tokens"),
         output_reserve=output_reserve,
         revision=source["revision"],
         checkpoint_id=source.get("checkpoint_id"),
@@ -803,6 +857,7 @@ async def preview_temp_context(
         conversation_id=None,
         temp_thread_id=temp_thread_id,
         model_id=payload.model_id,
+        model_row_id=payload.model_row_id,
         parts=payload.parts,
         features=payload.features,
         agent_id=None,
@@ -822,15 +877,18 @@ async def preview_temp_context(
     resolved = planned["resolved"]
     capabilities = resolved.get("capabilities") or {}
     context_limit = capabilities.get("context_limit")
-    output_reserve = min(planned["max_tokens"], capabilities.get("max_output_tokens", 4096))
+    output_reserve = min(planned["max_tokens"], capabilities.get("max_output_tokens") or 4096)
     source = planned["source"]
-    active_compaction_run_id = await _active_context_compaction_run_id(temp_thread_id=temp_thread_id)
+    active_compaction_run_id = await _active_context_compaction_run_id(
+        temp_thread_id=temp_thread_id, user_id=user_id, project_id=project_id,
+    )
 
     return context_manager.context_state(
         planned["input_messages"],
         planned["tool_schemas"],
         model_name=resolved["model_name"],
         context_limit=context_limit,
+        max_input_tokens=capabilities.get("max_input_tokens"),
         output_reserve=output_reserve,
         revision=source["revision"],
         checkpoint_id=source.get("checkpoint_id"),
@@ -853,6 +911,8 @@ async def compact_conversation(
 ):
     user_id = token_info["user_id"]
     project_id = token_info["project_id"]
+    domain_id = history_domain_id(token_info)
+    await _load_owned_conv(conversation_id, user_id, project_id, domain_id=domain_id)
     features = _features_payload(payload.features)
     intent = {
         "endpoint": "compaction",
@@ -867,7 +927,10 @@ async def compact_conversation(
         "client_timezone": payload.client_timezone,
         "expected_context_revision": payload.expected_context_revision,
     }
+    if payload.model_row_id is not None:
+        intent["model_row_id"] = payload.model_row_id
     intent.update(_api_key_id=token_info["api_key_id"], _source=token_info["source"])
+    intent = admission._intent_with_credential_authority(intent, credential_authority_snapshot(token_info))
     try:
         existing = await admission.existing_run_for_intent(
             project_id=project_id,
@@ -884,7 +947,7 @@ async def compact_conversation(
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     try:
-        await credit.precheck(user_id, project_id, api_key_id=token_info["api_key_id"])
+        await credit.precheck(user_id, project_id, api_key_id=token_info["api_key_id"], payer=token_info.get("payer"))
     except credit.QuotaExceeded as exc:
         raise HTTPException(status_code=402, detail=str(exc)) from exc
     except credit.ChatStorageUnavailable as exc:
@@ -896,6 +959,7 @@ async def compact_conversation(
         conversation_id=conversation_id,
         temp_thread_id=None,
         model_id=payload.model_id,
+        model_row_id=payload.model_row_id,
         parts=None,
         features=payload.features,
         agent_id=int(payload.agent_id) if payload.agent_id else None,
@@ -916,7 +980,7 @@ async def compact_conversation(
     resolved = planned["resolved"]
     capabilities = resolved.get("capabilities") or {}
     context_limit = capabilities.get("context_limit")
-    output_reserve = min(planned["max_tokens"], capabilities.get("max_output_tokens", 4096))
+    output_reserve = min(planned["max_tokens"], capabilities.get("max_output_tokens") or 4096)
     source = planned["source"]
 
     if source.get("revision") != payload.expected_context_revision:
@@ -927,6 +991,7 @@ async def compact_conversation(
         planned["tool_schemas"],
         model_name=resolved["model_name"],
         context_limit=context_limit,
+        max_input_tokens=capabilities.get("max_input_tokens"),
         output_reserve=output_reserve,
         revision=source["revision"],
         checkpoint_id=source.get("checkpoint_id"),
@@ -939,7 +1004,7 @@ async def compact_conversation(
     if not state.can_compact:
         raise HTTPException(status_code=422, detail="nothing_to_compact")
 
-    from lumen.services.litellm_client import count_context_tokens
+    from lumen.services.provider_metadata import count_context_tokens
 
     retained, _older = context_manager._required_messages(planned["input_messages"])
     retained_count = count_context_tokens(resolved["model_name"], retained, planned["tool_schemas"]).tokens
@@ -951,12 +1016,13 @@ async def compact_conversation(
         return await admission.create_compaction_run(
             project_id=project_id,
             user_id=user_id,
+            domain_id=domain_id,
             client_request_id=str(idempotency_key),
             intent=intent,
             conversation_id=conversation_id,
             temp_thread_id=None,
             expected_context_revision=payload.expected_context_revision,
-            model_name=payload.model_id,
+            model_name=resolved["model_name"],
             request_payload={
                 "input_messages": planned["input_messages"],
                 "features": features,
@@ -976,6 +1042,7 @@ async def compact_conversation(
             execution_protocol_version=execution_protocol_version,
             source=token_info["source"],
             api_key_id=token_info["api_key_id"],
+            payer=token_info.get("payer"),
         )
     except durable_errors.DurableRunError as exc:
         raise _run_error(exc) from exc
@@ -1007,7 +1074,10 @@ async def compact_temp_thread(
         "client_timezone": payload.client_timezone,
         "expected_context_revision": payload.expected_context_revision,
     }
+    if payload.model_row_id is not None:
+        intent["model_row_id"] = payload.model_row_id
     intent.update(_api_key_id=token_info["api_key_id"], _source=token_info["source"])
+    intent = admission._intent_with_credential_authority(intent, credential_authority_snapshot(token_info))
     try:
         existing = await admission.existing_run_for_intent(
             project_id=project_id,
@@ -1024,7 +1094,7 @@ async def compact_temp_thread(
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     try:
-        await credit.precheck(user_id, project_id, api_key_id=token_info["api_key_id"])
+        await credit.precheck(user_id, project_id, api_key_id=token_info["api_key_id"], payer=token_info.get("payer"))
     except credit.QuotaExceeded as exc:
         raise HTTPException(status_code=402, detail=str(exc)) from exc
     except credit.ChatStorageUnavailable as exc:
@@ -1036,6 +1106,7 @@ async def compact_temp_thread(
         conversation_id=None,
         temp_thread_id=temp_thread_id,
         model_id=payload.model_id,
+        model_row_id=payload.model_row_id,
         parts=None,
         features=payload.features,
         agent_id=None,
@@ -1056,7 +1127,7 @@ async def compact_temp_thread(
     resolved = planned["resolved"]
     capabilities = resolved.get("capabilities") or {}
     context_limit = capabilities.get("context_limit")
-    output_reserve = min(planned["max_tokens"], capabilities.get("max_output_tokens", 4096))
+    output_reserve = min(planned["max_tokens"], capabilities.get("max_output_tokens") or 4096)
     source = planned["source"]
 
     if source.get("revision") != payload.expected_context_revision:
@@ -1067,6 +1138,7 @@ async def compact_temp_thread(
         planned["tool_schemas"],
         model_name=resolved["model_name"],
         context_limit=context_limit,
+        max_input_tokens=capabilities.get("max_input_tokens"),
         output_reserve=output_reserve,
         revision=source["revision"],
         checkpoint_id=source.get("checkpoint_id"),
@@ -1079,7 +1151,7 @@ async def compact_temp_thread(
     if not state.can_compact:
         raise HTTPException(status_code=422, detail="nothing_to_compact")
 
-    from lumen.services.litellm_client import count_context_tokens
+    from lumen.services.provider_metadata import count_context_tokens
 
     retained, _older = context_manager._required_messages(planned["input_messages"])
     retained_count = count_context_tokens(resolved["model_name"], retained, planned["tool_schemas"]).tokens
@@ -1096,7 +1168,7 @@ async def compact_temp_thread(
             conversation_id=None,
             temp_thread_id=temp_thread_id,
             expected_context_revision=payload.expected_context_revision,
-            model_name=payload.model_id,
+            model_name=resolved["model_name"],
             request_payload={
                 "input_messages": planned["input_messages"],
                 "features": features,
@@ -1116,6 +1188,7 @@ async def compact_temp_thread(
             execution_protocol_version=execution_protocol_version,
             source=token_info["source"],
             api_key_id=token_info["api_key_id"],
+            payer=token_info.get("payer"),
         )
     except durable_errors.DurableRunError as exc:
         raise _run_error(exc) from exc
@@ -1141,8 +1214,10 @@ def _cursor(last_event_id: str | None, after_seq: int | None, run_id: str) -> in
 
 
 @router.get("/runs/{run_id}/events")
+@admit_sse
 async def run_events(
     run_id: str,
+    request: Request,
     after_seq: int | None = Query(default=None, ge=0),
     last_event_id: str | None = Header(default=None),
     token_info: Principal = Depends(require_scopes("native:runs:read")),
@@ -1196,7 +1271,9 @@ async def list_conversation_runs(
     active: bool = Query(default=False),
     token_info: Principal = Depends(require_scopes("native:runs:read")),
 ):
-    await _load_owned_conv(conversation_id, token_info["user_id"], token_info["project_id"])
+    await _load_owned_conv(
+        conversation_id, token_info["user_id"], token_info["project_id"], domain_id=history_domain_id(token_info),
+    )
     descriptors = await queries.active_run_descriptors(
         conversation_id=conversation_id,
         project_id=token_info["project_id"],
@@ -1281,8 +1358,12 @@ async def resolve_run_interaction(
 
 
 @router.post("/runs/{run_id}/cancel")
-async def cancel_run(run_id: str, token_info: Principal = Depends(require_scopes("native:runs:write"))):
+async def cancel_run(run_id: str, token_info: Principal = Depends(get_principal)):
     try:
+        scopes = await queries.owned_run_cancel_scopes(
+            run_id=run_id, project_id=token_info["project_id"], user_id=token_info["user_id"]
+        )
+        ensure_scopes(token_info, *scopes)
         return await lifecycle.request_cancelled(
             run_id=run_id, project_id=token_info["project_id"], user_id=token_info["user_id"]
         )

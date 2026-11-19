@@ -15,7 +15,9 @@ from urllib.parse import urlsplit
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, TypeAdapter, field_validator, model_validator
+
+from lumen.models.api_requests import ModelRowId
 
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
 MAX_PROVIDER_OUTPUT_BYTES = 4 * 1024 * 1024
@@ -446,6 +448,10 @@ class ToolPolicy(_StrictModel):
     approval_mode: Literal["required_for_mutations", "always"] = "required_for_mutations"
     enabled_tool_ids: list[int] | None = Field(default=None, max_length=100)
     enabled_mcp_ids: list[int] | None = Field(default=None, max_length=100)
+    enabled_sandbox_tools: list[
+        Annotated[str, StringConstraints(strict=True, strip_whitespace=False, min_length=1, max_length=128,
+                                        pattern=r"^[A-Za-z][A-Za-z0-9_]{0,127}$")]
+    ] = Field(default_factory=list, max_length=100)
     workspace_write_mode: Literal["ask", "auto_edit"] = "ask"
 
     @field_validator("enabled_tool_ids", "enabled_mcp_ids")
@@ -456,6 +462,19 @@ class ToolPolicy(_StrictModel):
         if len(set(value)) != len(value) or any(item < 1 for item in value):
             raise ValueError("enabled extension IDs must be unique positive ids")
         return value
+
+    @field_validator("enabled_sandbox_tools")
+    @classmethod
+    def validate_sandbox_names(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("enabled sandbox tool names must be unique")
+        return value
+
+    @model_validator(mode="after")
+    def validate_sandbox_mode(self) -> ToolPolicy:
+        if self.mode == "none" and self.enabled_sandbox_tools:
+            raise ValueError("sandbox tools require tool execution")
+        return self
 
 
 class ImageOutputOptions(_StrictModel):
@@ -537,10 +556,14 @@ class AgentBudget(_StrictModel):
         return format(Decimal(value), "f")
 
 
-class _CompletionSelectionRequest(_ReasoningEffortRequest):
+class _ChatModelSelectionRequest(_ReasoningEffortRequest):
+    model_id: str | None = Field(default=None, min_length=1, max_length=190)
+    model_row_id: ModelRowId | None = None
+
+
+class _CompletionSelectionRequest(_ChatModelSelectionRequest):
     """Selection fields shared by completion, preview, and compaction requests."""
 
-    model_id: str = Field(min_length=1, max_length=190)
     features: ChatFeatureOptions = Field(default_factory=ChatFeatureOptions)
     agent_id: str | None = Field(default=None, max_length=36)
     execution_mode: Literal["chat", "plan", "code"] = "chat"
@@ -564,6 +587,8 @@ class _CompletionSelectionRequest(_ReasoningEffortRequest):
 
     @model_validator(mode="after")
     def validate_execution_mode(self) -> _CompletionSelectionRequest:
+        if self.model_id is None and self.model_row_id is None and self.agent_id is None:
+            raise ValueError("model_id, model_row_id or agent_id is required")
         if self.execution_mode == "chat" and (
             self.code_workspace_id is not None or self.features.tool_policy.workspace_write_mode != "ask"
         ):
@@ -602,16 +627,25 @@ class CompactionRequest(_CompletionSelectionRequest):
     expected_context_revision: str = Field(min_length=1, max_length=190)
 
 
-class RegenerateRequest(_ReasoningEffortRequest):
-    model_id: str = Field(min_length=1, max_length=190)
+class RegenerateRequest(_ChatModelSelectionRequest):
     features: ChatFeatureOptions = Field(default_factory=ChatFeatureOptions)
+
+    @model_validator(mode="after")
+    def require_model(self):
+        if self.model_id is None and self.model_row_id is None:
+            raise ValueError("model_id or model_row_id is required")
+        return self
+
+
+class RetryRequest(_StrictModel):
+    model_row_id: ModelRowId | None = None
 
 
 class ChatRunDescriptor(_StrictModel):
     run_id: str = Field(min_length=1, max_length=36)
     conversation_id: str | None = Field(default=None, max_length=36)
     temp_thread_id: str | None = Field(default=None, max_length=36)
-    run_kind: Literal["completion", "compaction", "image", "tts", "stt", "realtime"] = "completion"
+    run_kind: Literal["completion", "compaction", "image", "tts", "stt", "realtime", "api_completion"] = "completion"
     status: Literal[
         "queued",
         "running",
@@ -644,7 +678,7 @@ class ChatRunResponse(_StrictModel):
     ]
     conversation_id: str | None = Field(default=None, max_length=36)
     temp_thread_id: str | None = Field(default=None, max_length=36)
-    run_kind: Literal["completion", "compaction", "image", "tts", "stt", "realtime"] = "completion"
+    run_kind: Literal["completion", "compaction", "image", "tts", "stt", "realtime", "api_completion"] = "completion"
     effective_features: dict[str, Any] = Field(default_factory=dict)
     public_history: list[dict[str, Any]] | None = None
     output_assets: list[dict[str, Any]] = Field(default_factory=list)
@@ -859,7 +893,7 @@ class RunStartedPayload(_StrictModel):
     temp_thread_id: str | None = None
     model_name: str = Field(min_length=1, max_length=190)
     effective_features: dict[str, Any]
-    run_kind: Literal["completion", "compaction", "image", "tts", "stt", "realtime"] = "completion"
+    run_kind: Literal["completion", "compaction", "image", "tts", "stt", "realtime", "api_completion"] = "completion"
 
 
 class ContextUpdatedPayload(_StrictModel):
@@ -925,6 +959,16 @@ class ToolCallStartedPayload(_StrictModel):
     arguments: dict[str, Any]
     source: Literal["builtin", "managed", "custom_http", "mcp", "workspace", "agent", "plugin"] = "builtin"
     category: str = Field(default="기본 도구", min_length=1, max_length=100)
+
+
+class ToolCallProgressPayload(_StrictModel):
+    """Already-public progress text, never provider-private execution state."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=False, protected_namespaces=())
+
+    call_id: str = Field(min_length=1, max_length=190)
+    name: str = Field(min_length=1, max_length=190)
+    text: str = Field(min_length=1, max_length=4_000)
 
 
 class ToolCallCompletedPayload(_StrictModel):
@@ -1086,6 +1130,11 @@ class ToolCallStartedEvent(_RunEvent):
     payload: ToolCallStartedPayload
 
 
+class ToolCallProgressEvent(_RunEvent):
+    type: Literal["tool.call.progress"]
+    payload: ToolCallProgressPayload
+
+
 class ToolCallCompletedEvent(_RunEvent):
     type: Literal["tool.call.completed"]
     payload: ToolCallCompletedPayload
@@ -1145,6 +1194,7 @@ ChatRunEvent = Annotated[
     | PartDeltaEvent
     | PartCompletedEvent
     | ToolCallStartedEvent
+    | ToolCallProgressEvent
     | ToolCallCompletedEvent
     | ToolApprovalRequiredEvent
     | ToolApprovalResolvedEvent
@@ -1178,6 +1228,8 @@ class UsageRecord(_StrictModel):
     cache_creation_1h_input_tokens: int = Field(ge=0)
     credited_cost: str
     source: Literal["web", "api"]
+    # Who paid: the user's wallet (including pre-domain-billing history) or the Keystone domain pool.
+    billing_scope: Literal["user", "domain"] = "user"
     api_key_id: int | None = None
     conversation_id: str | None = None
     run_id: str | None = None
@@ -1195,7 +1247,8 @@ class TempCompletionRequest(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
 
     parts: list[UserInputPart] = Field(min_length=1, max_length=32)
-    model_id: str = Field(min_length=1, max_length=190)
+    model_id: str | None = Field(default=None, min_length=1, max_length=190)
+    model_row_id: ModelRowId | None = None
     features: ChatFeatureOptions = Field(default_factory=ChatFeatureOptions)
     reasoning_effort: ReasoningEffort = "auto"
     execution_mode: str = Field(default="chat", pattern="^(chat|plan|code)$")
@@ -1219,6 +1272,8 @@ class TempCompletionRequest(BaseModel):
 
     @model_validator(mode="after")
     def validate_execution_mode(self) -> TempCompletionRequest:
+        if self.model_id is None and self.model_row_id is None:
+            raise ValueError("model_id or model_row_id is required")
         if self.execution_mode == "chat" and (
             self.code_workspace_id is not None or self.features.tool_policy.workspace_write_mode != "ask"
         ):

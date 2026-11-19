@@ -1,0 +1,25 @@
+Local provider metadata and tokenization assets
+
+native_model_catalog.json records manually verified official-provider specifications
+and prices. Every entry carries source URLs and a verification date; the catalog
+version identifies the reviewed source cohort. Administrator overrides take
+precedence. Compatible API endpoints never borrow native catalog metadata.
+
+Local BPE ranks (unmodified):
+https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken
+SHA256: 223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7
+https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken
+SHA256: 446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d
+Patterns in provider_metadata.py reproduced from tiktoken 0.13.0 openai_public.py.
+Project: https://github.com/openai/tiktoken, MIT, Copyright (c) 2022 OpenAI,
+Shantanu Jain. Full text in LICENSE.tiktoken. Download each exact URL to reproduce;
+the hashes are also pinned by upstream tiktoken 0.13.0. Lumen builds encodings
+from these installed assets and never downloads ranks during request admission.
+Text BPE tokenization does not measure provider message/tool framing; context
+counts explicitly report estimated provenance. Images retain the previous fixed
+250-token offline estimate per image (LiteLLM 1.93.0 default), never provider
+observations or billing modality usage. Audio/video/file context remains unknown.
+
+search_transport.py provider field mappings were adapted with the LiteLLM 1.93.0
+MIT-licensed provider API mapping behavior as reference (LICENSE.litellm); no
+LiteLLM runtime code is imported or required.

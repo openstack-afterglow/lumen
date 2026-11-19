@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
 from pydantic import BaseModel, Field, field_validator
 
-from lumen.auth import get_token_info
+from lumen.auth import require_scopes
 from lumen.config import get_settings
 from lumen.services.agent_workspace_runtime import configured_workspace_policy
 from lumen.services.code_workspace_service import (
@@ -23,6 +23,7 @@ from lumen.services.code_workspace_service import (
     update_git_credential,
 )
 from lumen.services.code_workspace_store import CodeWorkspaceValidationError
+from lumen.services.domain_scope import history_domain_id
 
 router = APIRouter()
 
@@ -73,7 +74,7 @@ def _error(exc: Exception) -> HTTPException:
 
 
 @router.get("/git-credentials")
-async def get_git_credentials(token_info: dict = Depends(get_token_info)):
+async def get_git_credentials(token_info: dict = Depends(require_scopes("native:agents:write"))):
     try:
         return await list_git_credentials(user_id=token_info["user_id"], project_id=_project(token_info))
     except CodeWorkspaceUnavailable as exc:
@@ -81,7 +82,7 @@ async def get_git_credentials(token_info: dict = Depends(get_token_info)):
 
 
 @router.post("/git-credentials", status_code=status.HTTP_201_CREATED)
-async def post_git_credential(payload: GitCredentialCreate, token_info: dict = Depends(get_token_info)):
+async def post_git_credential(payload: GitCredentialCreate, token_info: dict = Depends(require_scopes("native:agents:write"))):
     try:
         return await create_git_credential(
             user_id=token_info["user_id"], project_id=_project(token_info), **payload.model_dump()
@@ -92,7 +93,7 @@ async def post_git_credential(payload: GitCredentialCreate, token_info: dict = D
 
 @router.put("/git-credentials/{credential_id}")
 async def put_git_credential(
-    credential_id: int, payload: GitCredentialUpdate, token_info: dict = Depends(get_token_info)
+    credential_id: int, payload: GitCredentialUpdate, token_info: dict = Depends(require_scopes("native:agents:write"))
 ):
     try:
         return await update_git_credential(
@@ -106,7 +107,7 @@ async def put_git_credential(
 
 
 @router.delete("/git-credentials/{credential_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_git_credential(credential_id: int, token_info: dict = Depends(get_token_info)):
+async def delete_git_credential(credential_id: int, token_info: dict = Depends(require_scopes("native:agents:delete"))):
     try:
         await revoke_git_credential(credential_id, user_id=token_info["user_id"], project_id=_project(token_info))
         return Response(status_code=status.HTTP_204_NO_CONTENT)
@@ -118,7 +119,7 @@ async def delete_git_credential(credential_id: int, token_info: dict = Depends(g
 async def post_code_workspace(
     payload: CodeWorkspaceCreate,
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
-    token_info: dict = Depends(get_token_info),
+    token_info: dict = Depends(require_scopes("native:agents:write")),
 ):
     policy = configured_workspace_policy(get_settings())
     if policy is None:
@@ -136,7 +137,7 @@ async def post_code_workspace(
 
 
 @router.get("/code-workspaces")
-async def get_code_workspaces(token_info: dict = Depends(get_token_info)):
+async def get_code_workspaces(token_info: dict = Depends(require_scopes("native:agents:read"))):
     try:
         return await list_workspaces(user_id=token_info["user_id"], project_id=_project(token_info))
     except CodeWorkspaceUnavailable as exc:
@@ -144,7 +145,7 @@ async def get_code_workspaces(token_info: dict = Depends(get_token_info)):
 
 
 @router.get("/code-workspaces/{workspace_id}")
-async def get_code_workspace(workspace_id: str, token_info: dict = Depends(get_token_info)):
+async def get_code_workspace(workspace_id: str, token_info: dict = Depends(require_scopes("native:agents:read"))):
     try:
         return await get_workspace(workspace_id, user_id=token_info["user_id"], project_id=_project(token_info))
     except (CodeWorkspaceNotFound, CodeWorkspaceUnavailable) as exc:
@@ -152,7 +153,7 @@ async def get_code_workspace(workspace_id: str, token_info: dict = Depends(get_t
 
 
 @router.delete("/code-workspaces/{workspace_id}", status_code=status.HTTP_202_ACCEPTED)
-async def delete_code_workspace(workspace_id: str, token_info: dict = Depends(get_token_info)):
+async def delete_code_workspace(workspace_id: str, token_info: dict = Depends(require_scopes("native:agents:delete"))):
     try:
         return await request_delete_workspace(
             workspace_id, user_id=token_info["user_id"], project_id=_project(token_info)
@@ -163,7 +164,8 @@ async def delete_code_workspace(workspace_id: str, token_info: dict = Depends(ge
 
 @router.put("/conversations/{conversation_id}/code-workspace")
 async def put_conversation_code_workspace(
-    conversation_id: str, payload: ConversationWorkspaceAssignment, token_info: dict = Depends(get_token_info)
+    conversation_id: str, payload: ConversationWorkspaceAssignment,
+    token_info: dict = Depends(require_scopes("native:conversations:write", "native:agents:use"))
 ):
     try:
         return await assign_conversation_workspace(
@@ -171,6 +173,7 @@ async def put_conversation_code_workspace(
             workspace_id=payload.code_workspace_id,
             user_id=token_info["user_id"],
             project_id=_project(token_info),
+            domain_id=history_domain_id(token_info),
         )
     except (CodeWorkspaceNotFound, CodeWorkspaceConflict, CodeWorkspaceUnavailable) as exc:
         raise _error(exc) from exc

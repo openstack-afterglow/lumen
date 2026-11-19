@@ -9,14 +9,14 @@ import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from lumen.models.chat_db import LlmModel, LlmProvider
+from lumen.models.chat_db import LlmModel, LlmProvider, LlmProviderAccount, LlmProviderCredential
 from lumen.scripts import seed_providers as seeder
 from lumen.services.providers import repository
 from lumen.services.providers.errors import ProviderValidationError
 
 _TEXT = {"provider": "openai", "model_name": "gpt-4.1-mini", "model_kind": "text",
          "input_price_per_million": "1", "output_price_per_million": "3"}
-_IMAGE = {"provider": "openai", "model_name": "gpt-image-1", "model_kind": "image",
+_IMAGE = {"provider": "openai", "model_name": "gpt-image-2", "model_kind": "image",
           "media_pricing": {"image_variants": {"1024x1024:high": "0.05"}}}
 
 
@@ -72,11 +72,13 @@ def db(monkeypatch: pytest.MonkeyPatch):
     engine = create_engine("sqlite:///:memory:")
     LlmProvider.__table__.create(engine)
     LlmModel.__table__.create(engine)
+    LlmProviderAccount.__table__.create(engine)
+    LlmProviderCredential.__table__.create(engine)
     with engine.begin() as connection:
         connection.exec_driver_sql("CREATE TABLE chat_runs (id TEXT PRIMARY KEY, status TEXT)")
         connection.exec_driver_sql("CREATE TABLE chat_run_providers (run_id TEXT, provider_id INTEGER, model_id INTEGER)")
     sync_factory = sessionmaker(engine, expire_on_commit=False)
-    ids = {LlmProvider: 1, LlmModel: 100}
+    ids = {LlmProvider: 1, LlmModel: 100, LlmProviderAccount: 1000, LlmProviderCredential: 1000}
     monkeypatch.setattr(repository, "_require_db", lambda: lambda: _AsyncSession(sync_factory(), ids))
     monkeypatch.setattr("lumen.services.assets.asset_pipeline_available", lambda: True)
     yield sync_factory, ids
@@ -85,7 +87,14 @@ def db(monkeypatch: pytest.MonkeyPatch):
 
 def _add_provider(db, **fields):
     sync_factory, ids = db
-    row = LlmProvider(id=ids[LlmProvider], auth_mode="api_key", margin_multiplier=1, is_active=True, **fields)
+    key = fields.pop("encrypted_api_key", None)
+    env = fields.pop("api_key_env", None)
+    identity = ids[LlmProvider]
+    row = LlmProvider(id=identity, auth_mode="api_key", margin_multiplier=1, is_active=True,
+        accounts=[LlmProviderAccount(id=identity, provider_id=identity, name="default",
+            credentials=[LlmProviderCredential(id=identity, account_id=identity, name="default", auth_mode="api_key",
+                encrypted_api_key=key, api_key_env=env, subscription_status="disconnected", generation=0,
+                is_active=True, priority=0, weight=1)], is_active=True, priority=0, weight=1)], **fields)
     ids[LlmProvider] += 1
     with sync_factory.begin() as session:
         session.add(row)
@@ -94,7 +103,8 @@ def _add_provider(db, **fields):
 
 def _snapshot(db):
     with db[0]() as session:
-        providers = [(p.name, p.provider_type, p.api_base, p.api_key_env, p.encrypted_api_key)
+        providers = [(p.name, p.provider_type, p.api_base,
+                      p.accounts[0].credentials[0].api_key_env, p.accounts[0].credentials[0].encrypted_api_key)
                      for p in session.scalars(select(LlmProvider).order_by(LlmProvider.id))]
         models = [(m.provider_id, m.model_name, m.model_kind, m.input_price, m.media_pricing)
                   for m in session.scalars(select(LlmModel).order_by(LlmModel.id))]
@@ -257,6 +267,24 @@ async def test_valid_media_model_is_active_and_available(monkeypatch, db, entry,
         entry["model_name"], entry["model_kind"], True)
     assert model["effective_capabilities"]["feature_gates"][gate]["available"] is True
 
+
+
+@pytest.mark.asyncio
+async def test_valid_embedding_model_bootstraps_with_input_price_only(monkeypatch, db):
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
+    entry = {
+        "provider": "openai", "model_name": "text-embedding-3-small",
+        "model_kind": "embedding", "input_price_per_million": "0.02",
+    }
+    _models(monkeypatch, entry)
+    await seeder.seed_environment_providers()
+    (model,) = await repository.list_models()
+    assert (model["model_name"], model["model_kind"], model["is_active"]) == (
+        entry["model_name"], "embedding", True)
+    gate = model["effective_capabilities"]["feature_gates"]["embeddings"]
+    assert gate["available"] is True
+    assert gate["pricing_available"] is True
+    assert str(model["effective_output_price_per_million"]) == "0"
 
 @pytest.mark.asyncio
 async def test_cli_closes_db_on_failure_and_prints_no_secret(monkeypatch, capsys):

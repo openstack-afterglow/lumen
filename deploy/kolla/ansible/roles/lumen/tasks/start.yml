@@ -1,4 +1,10 @@
 ---
+- name: Start | Require managed scanner readiness before API and worker
+  ansible.builtin.include_tasks: clamav.yml
+  when:
+    - inventory_hostname in groups['lumen']
+    - enable_lumen_clamav | bool
+
 - name: Start | Stat Lumen config file
   become: true
   ansible.builtin.stat:
@@ -12,7 +18,7 @@
     name: "{{ item.value.container_name }}"
     image: "{{ item.value.image }}"
     user: "{{ item.value.user | default(omit) }}"
-    pull: "{{ 'never' if (lumen_source_mode | default(false) | bool) else 'always' }}"
+    pull: never
     state: started
     restart_policy: "{{ item.value.restart_policy | default('unless-stopped') }}"
     volumes: "{{ item.value.volumes | default([]) }}"

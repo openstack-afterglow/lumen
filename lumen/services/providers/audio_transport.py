@@ -18,6 +18,7 @@ import httpx
 
 from lumen.services.usage_breakdown import UsageBreakdown
 
+from .credentials import api_key_route_configured
 from .errors import ProviderValidationError
 from .pricing import (
     exact_duration_price,
@@ -41,7 +42,10 @@ _MAX_SEGMENT_TEXT_CHARS = 65536
 _MAX_SEGMENT_SECONDS = 30 * 60
 _MAX_INLINE_JSON_BYTES = (_MAX_OUTPUT_BYTES * 4 // 3) + 65536
 _TIMEOUT = httpx.Timeout(120.0, connect=10.0, read=120.0, write=30.0, pool=10.0)
-_OPENAI_STT_MODELS = frozenset({"whisper-1", "gpt-4o-transcribe", "gpt-4o-mini-transcribe"})
+_OPENAI_STT_MODELS = frozenset({"whisper-1", "gpt-transcribe", "gpt-4o-transcribe", "gpt-4o-mini-transcribe"})
+# These file-transcription models report ``usage: {"type": "duration"}`` only, never tokens (live-verified
+# 2026-11-10), so a token billing basis can never be settled for them.
+_OPENAI_DURATION_ONLY_STT_MODELS = frozenset({"whisper-1", "gpt-transcribe"})
 # Only whisper-1 offers verbose_json with timestamp_granularities on the
 # direct OpenAI transcription endpoint; no other route advertises timing.
 _OPENAI_TIMED_STT_MODELS = frozenset({"whisper-1"})
@@ -71,6 +75,11 @@ _OUTPUT_FORMATS = {"mp3": "audio/mpeg", "wav": "audio/wav"}
 class AudioTransportError(RuntimeError):
     """The direct provider failed or produced an invalid bounded result."""
 
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(message)
+        # Only the integer upstream status survives; provider bodies are never retained.
+        self.status_code = status_code
+
 
 @dataclass(frozen=True)
 class SpeechResult:
@@ -98,7 +107,7 @@ class TranscriptionResult:
 
 
 def _model(route: dict, kind: str) -> tuple[str, str]:
-    if not isinstance(route, dict) or route.get("model_kind") != kind or route.get("provider_auth") is not None:
+    if not isinstance(route, dict) or route.get("model_kind") != kind or not api_key_route_configured(route):
         raise ProviderValidationError("audio route is not directly executable")
     provider, model = route.get("provider_type"), route.get("api_model_name")
     if not isinstance(model, str):
@@ -112,8 +121,6 @@ def _model(route: dict, kind: str) -> tuple[str, str]:
     base = route.get("api_base")
     if base is not None and (not isinstance(base, str) or base.rstrip("/") not in bases):
         raise ProviderValidationError("unsupported audio provider endpoint")
-    if not isinstance(route.get("api_key"), str) or not route["api_key"].strip():
-        raise ProviderValidationError("audio provider credential is unavailable")
     return provider, model
 
 
@@ -154,7 +161,7 @@ def validate_audio_request(route: dict, *, kind: str, format: str | None = None,
     pricing = route.get("media_pricing")
     basis = media_billing_basis(kind, pricing)
     if basis == "tokens":
-        if provider == "openai" and (kind == "tts" or model == "whisper-1"):
+        if provider == "openai" and (kind == "tts" or model in _OPENAI_DURATION_ONLY_STT_MODELS):
             raise ProviderValidationError("audio provider cannot report token usage for this model")
         envelope = media_reservation_usd(pricing)
         if envelope is None or not envelope.is_finite() or envelope <= 0:
@@ -319,15 +326,19 @@ def _decode_audio(encoded: object, format: str, mime: object = None) -> tuple[by
 
 
 async def _post(url: str, *, headers: dict, max_bytes: int, json_body: dict | None = None,
-                form: dict | None = None, files: dict | None = None) -> bytes:
+                form: dict | None = None, files: dict | None = None, relay_ref=None, relay_model=None, relay_operation=None) -> bytes:
     # Never interpolate credentials, URLs from a response, or provider bodies into errors.
     try:
         async with (
-            httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False, trust_env=False) as client,
+            httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=False, trust_env=False,
+                              transport=httpx.AsyncHTTPTransport(retries=0, trust_env=False)) as client,
             client.stream("POST", url, headers=headers, json=json_body, data=form, files=files) as response,
         ):
+            from .relay_history import record_dispatch
+            record_dispatch(relay_ref, endpoint=url, model=relay_model, operation=relay_operation, status_code=response.status_code)
             if response.status_code != 200:
-                raise AudioTransportError(f"audio provider returned HTTP {response.status_code}")
+                raise AudioTransportError(f"audio provider returned HTTP {response.status_code}",
+                                          status_code=response.status_code)
             size = response.headers.get("content-length", "")
             if size.isdecimal() and int(size) > max_bytes:
                 raise AudioTransportError("audio provider response exceeds size limit")
@@ -382,17 +393,22 @@ async def generate_speech(route: dict, *, text: str, voice: str, format: str = "
         raise ProviderValidationError("speech text is empty or too long")
     if not isinstance(voice, str) or voice not in (_OPENAI_VOICES if provider == "openai" else _GEMINI_VOICES):
         raise ProviderValidationError("unsupported speech voice")
+    from .credentials import resolve_route_api_key
+
+    api_key = await resolve_route_api_key(route)
     if provider == "openai":
         result = await _post(
             "https://api.openai.com/v1/audio/speech",
-            headers={"Authorization": f"Bearer {route['api_key']}"}, max_bytes=_MAX_OUTPUT_BYTES,
+            relay_ref=route.get("provider_auth"), relay_model=model, relay_operation="tts",
+            headers={"Authorization": f"Bearer {api_key}"}, max_bytes=_MAX_OUTPUT_BYTES,
             json_body={"model": model, "input": text, "voice": voice, "response_format": format},
         )
         data, mime = _output_audio(result, format)
         return SpeechResult(data, mime)
     result = _json(await _post(
         "https://generativelanguage.googleapis.com/v1beta/interactions",
-        headers={"x-goog-api-key": route["api_key"]}, max_bytes=_MAX_INLINE_JSON_BYTES,
+        relay_ref=route.get("provider_auth"), relay_model=model, relay_operation="tts",
+        headers={"x-goog-api-key": api_key}, max_bytes=_MAX_INLINE_JSON_BYTES,
         json_body={
             "model": model, "input": [{"type": "user_input", "content": [{"type": "text", "text": text}]}],
             "response_format": {"type": "audio"},
@@ -452,6 +468,9 @@ async def transcribe_audio(route: dict, *, data: bytes, mime_type: str,
     if prompt is not None and (not isinstance(prompt, str) or len(prompt) > _MAX_TEXT_CHARS):
         raise ProviderValidationError("invalid transcription prompt")
     segments = None
+    from .credentials import resolve_route_api_key
+
+    api_key = await resolve_route_api_key(route)
     if provider == "openai":
         form: dict = {"model": model, "response_format": "verbose_json" if granularities else "json"}
         if granularities:
@@ -462,7 +481,8 @@ async def transcribe_audio(route: dict, *, data: bytes, mime_type: str,
             form["prompt"] = prompt
         result = _json(await _post(
             "https://api.openai.com/v1/audio/transcriptions",
-            headers={"Authorization": f"Bearer {route['api_key']}"},
+            relay_ref=route.get("provider_auth"), relay_model=model, relay_operation="stt",
+            headers={"Authorization": f"Bearer {api_key}"},
             max_bytes=_MAX_VERBOSE_TRANSCRIPT_BYTES if granularities else _MAX_TRANSCRIPT_BYTES,
             form=form, files={"file": (f"audio.{extension}", data, mime_type)},
         ))
@@ -478,7 +498,8 @@ async def transcribe_audio(route: dict, *, data: bytes, mime_type: str,
             instruction += f" Context: {prompt}"
         result = _json(await _post(
             "https://generativelanguage.googleapis.com/v1beta/interactions",
-            headers={"x-goog-api-key": route["api_key"]}, max_bytes=_MAX_TRANSCRIPT_BYTES,
+            relay_ref=route.get("provider_auth"), relay_model=model, relay_operation="stt",
+            headers={"x-goog-api-key": api_key}, max_bytes=_MAX_TRANSCRIPT_BYTES,
             json_body={"model": model, "input": [
                 {"type": "text", "text": instruction},
                 {"type": "audio", "mime_type": mime_type, "data": base64.b64encode(data).decode("ascii")},

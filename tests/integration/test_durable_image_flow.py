@@ -11,25 +11,35 @@ from contextlib import suppress
 from decimal import Decimal
 
 import pytest
+from provider_fixtures import configured_provider
 from sqlalchemy import delete, event, func, select, text
 
 from lumen.db import close_db, get_session_factory, init_db
 from lumen.models.chat_assets import ChatAsset, ChatRunAsset
-from lumen.models.chat_db import ChatUsageLog, LlmModel, LlmProvider
+from lumen.models.chat_db import ChatUsageLog, LlmModel
 from lumen.models.chat_runs import ChatModelCallReservation, ChatRun, ChatRunSegment
 from lumen.services import assets, credit
 from lumen.services.durable_runs import budgets, images, queries
 from lumen.services.durable_runs.errors import DurableRunConflict, DurableRunInputError
+from lumen.services.infrastructure.store import register_worker
 from lumen.services.providers import routing
 from lumen.services.run_store import claim_queued_run
 from lumen.services.usage_breakdown import ModalityTokens, UsageBreakdown
+from lumen.services.worker_routing import use_read_committed
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("current_project_authority")]
 
 # Tiny valid PNG. The scanner/object-store boundary is replaced, not the owned asset ledger.
 _PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScL/nwAAAABJRU5ErkJggg=="
 )
+
+
+async def _media_worker(owner: str) -> str:
+    """A fresh fixed online_media registration; claims require a real worker identity."""
+    return await register_worker(worker_identity=owner, boot_id=str(uuid.uuid4()), capacity=4,
+                                 protocol_versions=[1, 2], plugin_digest="0" * 64, schema_version=1,
+                                 workload_classes=["online_media"])
 
 
 async def test_durable_image_settlement_and_unknown_recovery(monkeypatch):
@@ -38,18 +48,18 @@ async def test_durable_image_settlement_and_unknown_recovery(monkeypatch):
     init_db(os.environ["DATABASE_URL"], pool_size=1, max_overflow=0)
     factory = get_session_factory()
     assert factory is not None
-    monkeypatch.setattr(routing, "resolve_api_key", lambda _provider: "fixture-provider-key")
+    
     monkeypatch.setattr(assets, "asset_pipeline_available", lambda: True)
     async def no_wake(_run_id):
         return None
     monkeypatch.setattr(images, "wake_run", no_wake)
     try:
         async with factory() as session, session.begin():
-            provider = LlmProvider(name=f"image-provider-{nonce}", provider_type="openai",
+            provider = configured_provider(name=f"image-provider-{nonce}", provider_type="openai",
                                    is_active=True, margin_multiplier=Decimal("2"))
             session.add(provider)
             await session.flush()
-            model = LlmModel(provider_id=provider.id, model_name="gpt-image-1", model_kind="image",
+            model = LlmModel(provider_id=provider.id, model_name="gpt-image-2", model_kind="image",
                              media_pricing={"image_variants": {"1024x1024:high": "0.04"}},
                              is_active=True)
             session.add(model)
@@ -81,6 +91,23 @@ async def test_durable_image_settlement_and_unknown_recovery(monkeypatch):
             return images.image_transport.ImageResult([(_PNG, "image/png")])
         monkeypatch.setattr(images.image_transport, "generate_images", provider_call)
         request = {"model_id": str(model_id), "prompt": "A cobalt cube", "size": "1024x1024", "quality": "high", "n": 1}
+        prepared = await images.prepare_image_run(request, project_id=project_id, user_id=user_id)
+        rolled_back_id = None
+        with pytest.raises(RuntimeError, match="caller rollback"):
+            async with factory() as session, session.begin():
+                staged = await images.persist_image_run_in_transaction(
+                    session, prepared, project_id=project_id, user_id=user_id,
+                    client_request_id=str(uuid.uuid4()))
+                rolled_back_id = staged.id
+                assert staged.workload_class == "online_media" and staged.worker_pool_id is None
+                assert Decimal(staged.pricing_snapshot["bound_credits"]) > 0
+                await session.flush()
+                assert await session.scalar(select(func.count()).select_from(ChatModelCallReservation).where(
+                    ChatModelCallReservation.run_id == staged.id)) == 0
+                raise RuntimeError("caller rollback")
+        async with factory() as session:
+            assert await session.get(ChatRun, rolled_back_id) is None
+        assert invoked == []
         key = str(uuid.uuid4())
         first = await images.admit_image_run(request, project_id=project_id, user_id=user_id, client_request_id=key)
         repeated = await images.admit_image_run({key: value for key, value in request.items() if key != "n"},
@@ -93,7 +120,9 @@ async def test_durable_image_settlement_and_unknown_recovery(monkeypatch):
             await images.admit_image_run({**request, "provider_id": provider_id + 1},
                         project_id=project_id, user_id=user_id, client_request_id=str(uuid.uuid4()))
         async with factory() as session, session.begin():
-            claimed = await claim_queued_run(session, first.run_id, owner="image-worker")
+            registration_id = await _media_worker("image-worker")
+            await use_read_committed(session)
+            claimed = await claim_queued_run(session, first.run_id, owner="image-worker", registration_id=registration_id)
             assert claimed is not None
             owner = claimed.lease_owner
             capability = dict(claimed.capability_snapshot)
@@ -126,7 +155,9 @@ async def test_durable_image_settlement_and_unknown_recovery(monkeypatch):
         second = await images.admit_image_run({**request, "prompt": "A teal tree"}, project_id=project_id,
                                              user_id=user_id, client_request_id=str(uuid.uuid4()))
         async with factory() as session, session.begin():
-            claimed = await claim_queued_run(session, second.run_id, owner="image-worker")
+            registration_id = await _media_worker("image-worker")
+            await use_read_committed(session)
+            claimed = await claim_queued_run(session, second.run_id, owner="image-worker", registration_id=registration_id)
             assert claimed is not None
             owner = claimed.lease_owner
             capability = dict(claimed.capability_snapshot)
@@ -200,7 +231,7 @@ async def test_concurrent_media_holds_observe_committed_reservations(monkeypatch
                 # The run was read before the competing reservation commits.
                 await session.execute(select(ChatRun.id).where(ChatRun.id == second_id))
                 snapshot_seen.set()
-                await credit.reserve_media_credit_in_transaction(
+                await credit.reserve_call_credit_in_transaction(
                     session, user_id=user_id, project_id=project_id, api_key_id=None, bound=bound,
                 )
                 session.add(ChatModelCallReservation(
@@ -220,7 +251,7 @@ async def test_concurrent_media_holds_observe_committed_reservations(monkeypatch
                 ))
         async with factory() as session, session.begin():
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
-            await credit.reserve_media_credit_in_transaction(
+            await credit.reserve_call_credit_in_transaction(
                 session, user_id=user_id, project_id=project_id, api_key_id=None, bound=bound,
             )
             session.add(ChatModelCallReservation(
@@ -299,7 +330,7 @@ async def test_media_start_does_not_block_another_users_text_start(monkeypatch, 
                 ))
         async with factory() as session, session.begin():
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
-            await credit.reserve_media_credit_in_transaction(
+            await credit.reserve_call_credit_in_transaction(
                 session, user_id=media_user, project_id=media_project,
                 api_key_id=None, bound=Decimal("1"),
             )
@@ -328,13 +359,25 @@ async def test_media_start_does_not_block_another_users_text_start(monkeypatch, 
         await close_db()
 
 
-@pytest.mark.parametrize("outcome", ["observed", "missing", "over_envelope", "invalid", "storage_failure"])
+@pytest.mark.parametrize("outcome", [
+    "observed", "missing", "over_envelope", "invalid", "storage_failure",
+    "catalog_edited", "catalog_missing", "catalog_over_hold", "catalog_low_credit", "svg_known", "svg_unknown",
+    "svg_selected", "svg_alias", "svg_mismatch", "catalog_multi_edit", "catalog_leaf_edited",
+])
 async def test_image_token_usage_frozen_settlement_or_unknown_hold(monkeypatch, outcome):
     nonce = uuid.uuid4().hex
     user_id, project_id = f"image-token-user-{nonce}", f"image-token-project-{nonce}"
     init_db(os.environ["DATABASE_URL"], pool_size=1, max_overflow=0)
+    catalog = outcome.startswith(("catalog_", "svg_"))
+    svg = outcome.startswith("svg_")
+    leaf = outcome == "catalog_leaf_edited"
+    edit = outcome in {"catalog_edited", "catalog_multi_edit", "catalog_leaf_edited"}
+    multi = outcome == "catalog_multi_edit"
+    selected = outcome in {"svg_selected", "svg_alias", "svg_mismatch"}
+    count = 2 if edit else 1
+    expected_svg = b'<svg xmlns="http://www.w3.org/2000/svg"><rect width="1" height="1"/></svg>'
     factory = get_session_factory()
-    monkeypatch.setattr(routing, "resolve_api_key", lambda _provider: "fixture-provider-key")
+    
     monkeypatch.setattr(assets, "asset_pipeline_available", lambda: True)
 
     async def no_wake(_run_id):
@@ -343,24 +386,52 @@ async def test_image_token_usage_frozen_settlement_or_unknown_hold(monkeypatch, 
     monkeypatch.setattr(images, "wake_run", no_wake)
     try:
         async with factory() as session, session.begin():
-            provider = LlmProvider(name=f"image-token-provider-{nonce}", provider_type="openai",
+            provider = configured_provider(name=f"image-token-provider-{nonce}", provider_type="openai",
                                    is_active=True, margin_multiplier=Decimal("2"))
             session.add(provider)
             await session.flush()
-            model = LlmModel(provider_id=provider.id, model_name="gpt-image-1.5", model_kind="image",
+            model = (LlmModel(provider_id=provider.id,
+                model_name="gpt-image-2.6-flare" if svg else "gpt-image-2.5-flare",
+                model_kind="image", is_active=True) if catalog else
+                LlmModel(provider_id=provider.id, model_name="gpt-image-1.5", model_kind="image",
                 input_price=Decimal("0.000001"), output_price=Decimal("0.000002"),
                 cache_read_price=Decimal("0.0000005"), is_active=True,
                 media_pricing={"billing_basis": "tokens", "reservation_usd": "0.01",
                     "image_variants": {"1024x1024:high": "0.99"},
                     "token_rates": {"image": {"input_per_million": "10", "cache_read_per_million": "2",
-                                               "output_per_million": "20"}}})
+                                               "output_per_million": "20"}}}))
+            if leaf:
+                model.media_pricing = {"override_mode": "leaf", "token_rates": {"image": {"output_per_million": "40"}}}
             session.add(model)
             await session.flush()
             model_id = model.id
+            if selected:
+                session.add(LlmModel(provider_id=provider.id, model_kind="text", model_name="gpt-4.1-mini",
+                    is_active=True, input_price=Decimal("0.000001"), output_price=Decimal("0.000002")))
+            source_id = str(uuid.uuid4())
+            if edit:
+                session.add(ChatAsset(id=source_id, project_id=project_id, user_id=user_id,
+                    object_key=f"image-token/{nonce}/source", bucket_name="image-test", original_name="source.png",
+                    mime_type="image/png", size_bytes=len(_PNG), sha256="a" * 64, status="clean",
+                    media_metadata={"width": 1, "height": 1}))
+            extra_ids = [str(uuid.uuid4()), str(uuid.uuid4())] if multi else []
+            for idx, asset_id in enumerate(extra_ids):
+                session.add(ChatAsset(id=asset_id, project_id=project_id, user_id=user_id,
+                    object_key=f"image-token/{nonce}/source-{idx}", bucket_name="image-test",
+                    original_name="source.png", mime_type="image/png", size_bytes=len(_PNG), sha256="a" * 64,
+                    status="clean", media_metadata={"width": 1, "height": 1, "has_transparency": 1}))
+
+        async def open_owned(*, asset_id, user_id, project_id):
+            row = await assets.get_asset(asset_id=asset_id, user_id=user_id, project_id=project_id)
+            return assets.AssetDownload(body=io.BytesIO(expected_svg if svg else _PNG), name=row["name"],
+                                        mime_type=row["mime_type"], size_bytes=row["size_bytes"])
+
+        monkeypatch.setattr(assets, "open_download", open_owned)
 
         async def store_generated(*, data, original_name, media_type, user_id, project_id, run_id):
             if outcome == "storage_failure":
                 raise assets.AssetError("object storage unavailable")
+            assert (data, media_type) == ((expected_svg, "image/svg+xml") if svg else (_PNG, "image/png"))
             asset_id = str(uuid.uuid4())
             async with factory() as session, session.begin():
                 session.add(ChatAsset(id=asset_id, project_id=project_id, user_id=user_id,
@@ -377,19 +448,79 @@ async def test_image_token_usage_frozen_settlement_or_unknown_hold(monkeypatch, 
             modality_tokens={"image": ModalityTokens(input_tokens=50,
                 output_tokens=200 if outcome != "over_envelope" else 2000,
                 cache_read_input_tokens=30)}, modality_usage_invalid=outcome == "invalid")
+        if catalog:
+            image_output = 100_000 if outcome == "catalog_over_hold" else 200
+            observed = UsageBreakdown(100, image_output, modality_tokens={"image": ModalityTokens(
+                input_tokens=50 if edit else 0, output_tokens=image_output,
+            )})
+        author = {"model": {"svg_known": "gpt-4.1-mini", "svg_selected": "gpt-4.1-mini",
+                            "svg_alias": "gpt-4.1-mini-2025-04-14", "svg_mismatch": "gpt-4.1"}.get(outcome, "unlisted-author"),
+                  "input_tokens": 500, "output_tokens": 200, "reasoning_tokens": 100, "total_tokens": 700}
 
         async def provider_call(route, **kwargs):
             calls.append(kwargs["prompt"])
-            return images.image_transport.ImageResult([(_PNG, "image/png")],
-                observed if outcome != "missing" else None)
+            if edit:
+                assert kwargs["source_dimensions"] == [1, 1] and kwargs["source_image"] == _PNG
+            if multi:
+                assert kwargs["additional_sources"] == [(_PNG, "image/png")]
+                assert kwargs["overlay_data"] == ("markup", _PNG, "image/png")
+            if svg:
+                assert kwargs["output_format"] == "svg"
+                if selected:
+                    assert kwargs["svg_model"] == "gpt-4.1-mini"
+            return images.image_transport.ImageResult(
+                [(expected_svg, "image/svg+xml") if svg else (_PNG, "image/png")] * count,
+                observed if outcome not in {"missing", "catalog_missing"} else None, author if svg else None)
 
         monkeypatch.setattr(images.image_transport, "generate_images", provider_call)
         request = {"model_id": str(model_id), "prompt": "A cached cobalt cube", "size": "1024x1024", "quality": "high"}
+        if edit:
+            request.update(source_asset_id=source_id, n=count, background="opaque", output_format="png")
+        if multi:
+            del request["source_asset_id"]
+            request.update(input_asset_ids=[source_id, extra_ids[0]], markup_asset_id=extra_ids[1])
+        if svg:
+            request["output_format"] = "svg"
+        if selected:
+            request["svg_model"] = "gpt-4.1-mini"
+        if outcome == "catalog_low_credit":
+            async def quota(_session, _user_id):
+                return type("Quota", (), {"monthly": Decimal("0.001"), "weekly": Decimal(0)})()
+
+            monkeypatch.setattr(credit.quota_policy, "get_system_quota", quota)
+            with pytest.raises(credit.QuotaExceeded, match="월"):
+                await images.admit_image_run(request, project_id=project_id, user_id=user_id,
+                                             client_request_id=str(uuid.uuid4()))
+            async with factory() as session:
+                assert not await session.scalar(select(ChatRun.id).where(ChatRun.user_id == user_id))
+            assert calls == []
+            return
         admitted = await images.admit_image_run(request, project_id=project_id, user_id=user_id,
                                                client_request_id=str(uuid.uuid4()))
         async with factory() as session, session.begin():
-            claimed = await claim_queued_run(session, admitted.run_id, owner="image-token-worker")
+            registration_id = await _media_worker("image-token-worker")
+            await use_read_committed(session)
+            claimed = await claim_queued_run(session, admitted.run_id, owner="image-token-worker",
+                                             registration_id=registration_id)
             owner, capability, frozen = claimed.lease_owner, dict(claimed.capability_snapshot), dict(claimed.pricing_snapshot)
+        if catalog:
+            assert frozen["price_source"] == ("manual" if leaf else "native_catalog")
+            assert "reservation_usd" not in frozen["media_pricing"]
+            if edit:
+                # Two 2,634-output-token images, 8,704 image-input tokens, and 276 prompt/frame tokens.
+                expected_hold = "0.281732" if leaf else "0.368316" if multi else "0.229052"
+                assert Decimal(frozen["reservation_usd"]) == Decimal(expected_hold)
+            if leaf:
+                assert frozen["billing_basis"] == "tokens"
+                assert frozen["media_pricing"] == {
+                    "billing_basis": "tokens",
+                    "token_rates": {"image": {"input_per_million": "8.00", "output_per_million": "40"}},
+                }
+                assert frozen["token_rates"] == {"image": {"input_per_million": "8", "output_per_million": "40"}}
+            if selected:
+                assert set(frozen["svg_author_pricing"]) == {"gpt-4.1-mini"}
+                assert Decimal(frozen["reservation_usd"]) == Decimal("0.211492")
+                assert capability["svg_author_route"]["model_name"] == "gpt-4.1-mini"
         # The transport revalidation sees a changed current rate; settlement must still use admission's prices.
         resolve = routing.resolve_model_snapshot
 
@@ -401,7 +532,7 @@ async def test_image_token_usage_frozen_settlement_or_unknown_hold(monkeypatch, 
 
         monkeypatch.setattr(routing, "resolve_model_snapshot", changed_prices)
         await images.execute_image_run(admitted.run_id, owner=owner,
-            payload={**request, "user_id": user_id, "project_id": project_id},
+            payload={**images._intent(request), "user_id": user_id, "project_id": project_id},
             capability_snapshot=capability, pricing_snapshot=frozen)
         async with factory() as session:
             run = await session.get(ChatRun, admitted.run_id)
@@ -409,7 +540,25 @@ async def test_image_token_usage_frozen_settlement_or_unknown_hold(monkeypatch, 
                 ChatModelCallReservation.run_id == run.id))).scalar_one()
             ledger = (await session.execute(select(ChatUsageLog).where(ChatUsageLog.run_id == run.id))).scalars().all()
             segment = (await session.execute(select(ChatRunSegment).where(ChatRunSegment.run_id == run.id))).scalar_one()
-            assert hold.bound_credits == credit.credits_for_cost(Decimal("0.01"), Decimal("2"), Decimal(frozen["credit_per_usd"]))
+            assert hold.bound_credits == credit.credits_for_cost(
+                Decimal(frozen["reservation_usd"]), Decimal("2"), Decimal(frozen["credit_per_usd"]))
+            success = edit or outcome in {"svg_known", "svg_selected", "svg_alias"}
+            if multi:
+                input_ids = (await session.scalars(select(ChatRunAsset.asset_id).where(
+                    ChatRunAsset.run_id == run.id, ChatRunAsset.purpose == "input"))).all()
+                assert set(input_ids) == {source_id, *extra_ids}
+            if success:
+                assert run.status == "completed" and hold.status == "settled"
+                expected_cost = Decimal("0.00865" if leaf else "0.00665" if edit else "0.0074" if selected else "0.00702")
+                assert len(ledger) == 1 and ledger[0].raw_cost == expected_cost
+                assert hold.actual_credits < hold.bound_credits
+                assert ledger[0].prompt_tokens == (600 if svg else 100)
+                assert ledger[0].completion_tokens == (400 if svg else 200)
+                if svg:
+                    assert images.load_segment_payload(segment.usage_payload)["svg_usage"] == author
+                    assert any(c["model_name"] == author["model"] for c in ledger[0].usage_components)
+            elif not catalog:
+                assert Decimal(frozen["reservation_usd"]) == Decimal("0.01")
             if outcome == "observed":
                 assert run.status == "completed" and hold.status == "settled"
                 assert len(ledger) == 1
@@ -418,7 +567,7 @@ async def test_image_token_usage_frozen_settlement_or_unknown_hold(monkeypatch, 
                 assert hold.actual_credits == credit.credits_for_cost(Decimal("0.004305"), Decimal("2"), Decimal(frozen["credit_per_usd"]))
                 checkpoint = images.load_segment_payload(segment.usage_payload)
                 assert checkpoint["token_usage"]["modality_tokens"]["image"]["cache_read_input_tokens"] == 30
-            else:
+            elif not success:
                 assert run.status == "failed" and hold.status == "unknown" and ledger == []
                 assert run.reserved_credits == hold.bound_credits
                 if outcome in {"invalid", "storage_failure"}:
@@ -431,5 +580,8 @@ async def test_image_token_usage_frozen_settlement_or_unknown_hold(monkeypatch, 
                     assert (await session.execute(select(ChatRunAsset).where(
                         ChatRunAsset.run_id == run.id, ChatRunAsset.purpose == "output"))).scalars().all() == []
         assert calls == ["A cached cobalt cube"]
+        if outcome == "svg_known":
+            result = await images.image_result(run_id=admitted.run_id, project_id=project_id, user_id=user_id)
+            assert base64.b64decode(result["data"][0]["b64_json"]) == expected_svg
     finally:
         await close_db()

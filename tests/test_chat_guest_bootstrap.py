@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import json as json_module
+import os
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -68,7 +70,8 @@ def test_worker_exchanges_csr_persists_private_identity_and_scrubs_token(tmp_pat
                     .not_valid_before(datetime.now(UTC) - timedelta(minutes=1))
                     .not_valid_after(datetime.now(UTC) + timedelta(minutes=30))
                     .add_extension(x509.SubjectAlternativeName([x509.UniformResourceIdentifier(identity)]), False)
-                    .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH]), False)
+                    .add_extension(x509.BasicConstraints(ca=False, path_length=None), True)
+                    .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.CLIENT_AUTH, ExtendedKeyUsageOID.SERVER_AUTH]), False)
                     .sign(ca_key, hashes.SHA256()))
             response = Response()
             response.data = json_module.dumps({"role": "worker", "resource_id": resource_id,
@@ -80,16 +83,25 @@ def test_worker_exchanges_csr_persists_private_identity_and_scrubs_token(tmp_pat
     # The production entrypoint runs as root. In an unprivileged test process,
     # still exercise the same permission modes and the real cert/key verifier.
     monkeypatch.setattr(guest_bootstrap, "_require_root", lambda: None)
-    monkeypatch.setattr(guest_bootstrap, "_private_file", lambda path: path.read_bytes())
+    monkeypatch.setattr(guest_bootstrap, "_bootstrap_file", lambda path: path.read_bytes())
+    monkeypatch.setattr(guest_bootstrap, "_identity_file", lambda path: path.read_bytes())
+    monkeypatch.setattr(guest_bootstrap, "service_account", lambda: SimpleNamespace(pw_uid=os.getuid(), pw_gid=os.getgid()))
+    monkeypatch.setattr(guest_bootstrap.os, "chown", lambda *args: None)
+    def atomic_file(path, content, *, shared=False):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.chmod(0o750 if shared else 0o700)
+        path.write_bytes(content)
+        path.chmod(0o440 if shared else 0o600)
+    monkeypatch.setattr(guest_bootstrap, "_atomic_file", atomic_file)
     result = guest_bootstrap.bootstrap(role="worker", controller_url="https://controller.example",
                                        ca_file=ca_file, token_file=token_file, identity_dir=identity_dir)
     assert {key: result[key] for key in ("role", "resource_id", "generation")} == {
         "role": "worker", "resource_id": resource_id, "generation": generation}
     assert result["certificate_fingerprint"] == x509.load_pem_x509_certificate(
-        (identity_dir / "cert.pem").read_bytes()).fingerprint(hashes.SHA256()).hex()
+        (identity_dir / "current" / "cert.pem").read_bytes()).fingerprint(hashes.SHA256()).hex()
     assert received and not token_file.exists()
     for name in ("key.pem", "cert.pem", "ca.pem", "identity.json"):
-        assert (identity_dir / name).stat().st_mode & 0o777 == 0o600
+        assert (identity_dir / "current" / name).stat().st_mode & 0o777 == 0o440
     assert guest_bootstrap.load_identity(identity_dir, role="worker", resource_id=resource_id,
                                          generation=generation) == result
     with pytest.raises(RuntimeError, match="identity mismatch"):
@@ -99,11 +111,11 @@ def test_worker_exchanges_csr_persists_private_identity_and_scrubs_token(tmp_pat
     monkeypatch.setenv("LUMEN_GUEST_IDENTITY_DIR", str(identity_dir))
     monkeypatch.setenv("LUMEN_RESOURCE_ID", resource_id)
     monkeypatch.setenv("LUMEN_RESOURCE_GENERATION", str(generation))
+    monkeypatch.delenv("LUMEN_GUEST_ROLE", raising=False)
     transport = InternalTransport(RuntimeConfig(managed_networks=("10.0.0.0/24",)))
     assert transport.context.check_hostname is False
     assert transport.controller_context.check_hostname is True
     import asyncio
-    from types import SimpleNamespace
 
     from lumen import worker
     from lumen.services.infrastructure import store
@@ -113,15 +125,21 @@ def test_worker_exchanges_csr_persists_private_identity_and_scrubs_token(tmp_pat
         recorded.append(kwargs)
         return "registered"
     monkeypatch.setattr(store, "register_worker", register_worker)
+    async def registration_pool_id(registration_id):
+        assert registration_id == "registered"
+        return str(uuid4())
+    monkeypatch.setattr(store, "registration_pool_id", registration_pool_id)
     monkeypatch.setattr(worker, "get_registry", lambda: SimpleNamespace(digest="test-digest"))
-    loop = worker.WorkerLoop(owner="test", capacity=1, heartbeat_seconds=5, drain_seconds=30)
+    loop = worker.WorkerLoop(owner="test", capacity=1, heartbeat_seconds=5, drain_seconds=30,
+                             workload_classes=("batch",))
     asyncio.run(loop.register())
     assert recorded[0]["resource_id"] == resource_id
     assert recorded[0]["resource_generation"] == generation
     assert recorded[0]["certificate_fingerprint"] == result["certificate_fingerprint"]
+    assert recorded[0]["workload_classes"] == ["batch"]
     monkeypatch.setenv("LUMEN_RESOURCE_GENERATION", "8")
     with pytest.raises(RuntimeError, match="identity mismatch"):
-        InternalTransport(RuntimeConfig(managed_networks=("10.0.0.0/24",)))
+        InternalTransport(RuntimeConfig(managed_networks=("10.0.0.0/24",))).context
 
 
 def test_unissued_worker_resource_cannot_register(monkeypatch):
@@ -134,7 +152,8 @@ def test_unissued_worker_resource_cannot_register(monkeypatch):
     monkeypatch.setattr(store, "register_worker", register_worker)
     monkeypatch.setenv("LUMEN_RESOURCE_ID", str(uuid4()))
     monkeypatch.delenv("LUMEN_GUEST_IDENTITY_DIR", raising=False)
-    loop = WorkerLoop(owner="test", capacity=1, heartbeat_seconds=5, drain_seconds=30)
+    loop = WorkerLoop(owner="test", capacity=1, heartbeat_seconds=5, drain_seconds=30,
+                      workload_classes=("online_text",))
     import asyncio
     with pytest.raises(RuntimeError, match="identity missing"):
         asyncio.run(loop.register())

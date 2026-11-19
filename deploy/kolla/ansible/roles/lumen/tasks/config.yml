@@ -9,6 +9,16 @@
     group: root
   when: inventory_hostname in groups['lumen']
 
+- name: Config | Ensure operator policy directory exists without replacing rules
+  become: true
+  ansible.builtin.file:
+    path: "{{ lumen_policy_directory }}"
+    state: directory
+    mode: "0755"
+    owner: root
+    group: root
+  when: inventory_hostname in groups['lumen']
+
 - name: Config | Render lumen.conf
   become: true
   ansible.builtin.template:
@@ -18,12 +28,14 @@
     owner: root
     group: root
   when: inventory_hostname in groups['lumen']
+  no_log: true
 
 - name: Config | Ensure Lumen log directory is writable by appuser
   become: true
   community.docker.docker_container:
     name: lumen_log_dir_setup
     image: "{{ lumen_api_image_ref }}"
+    pull: never
     user: "root"
     command:
       - sh

@@ -5,7 +5,7 @@ on:
     branches: [main, dev]
   push:
     branches: [main, dev]
-    tags: ['v*']
+    tags: ['[0-9]*.[0-9]*.[0-9]*', 'v*']
   workflow_dispatch:
 env:
   REGISTRY: ghcr.io
@@ -80,6 +80,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Verify Tag/Version Lockstep
+        shell: bash
+        run: |
+          PYTHON_VER=$(python3 -c "import lumen; print(lumen.__version__)")
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG_VER="${GITHUB_REF#refs/tags/}"
+            TAG_VER="${TAG_VER#v}"
+            if [[ ! "${TAG_VER}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || [ "${PYTHON_VER}" != "${TAG_VER}" ]; then
+              echo "ERROR: Git tag version (${TAG_VER}) does not match package version (${PYTHON_VER})"
+              exit 1
+            fi
+          fi
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
 
@@ -120,3 +133,4 @@ jobs:
           # ref are readable only from that ref, so exporting them costs ~100s
           # per job and evicts the dev cache within the quota.
           cache-to: ${{ (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') && format('type=gha,mode=max,scope={0}', matrix.target) || '' }}
+

@@ -23,6 +23,13 @@ class ChatRun(Base):
     id: Mapped[str] = mapped_column(CHAR(36), primary_key=True)
     run_scope: Mapped[str] = mapped_column(VARCHAR(20), nullable=False)
     run_kind: Mapped[str] = mapped_column(VARCHAR(20), nullable=False, default="completion")
+    workload_class: Mapped[str] = mapped_column(
+        VARCHAR(20), nullable=False, default="online_text", server_default="online_text"
+    )
+    # Worker routing is separate from runtime_pool_id's sandbox allocation; no routing FKs.
+    worker_pool_id: Mapped[str | None] = mapped_column(CHAR(36))
+    worker_registration_id: Mapped[str | None] = mapped_column(CHAR(36))
+    batch_id: Mapped[str | None] = mapped_column(CHAR(36))
     conversation_id: Mapped[str | None] = mapped_column(
         CHAR(36), ForeignKey("chat_conversations.id", ondelete="SET NULL")
     )
@@ -33,6 +40,7 @@ class ChatRun(Base):
     )
     project_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
     user_id: Mapped[str] = mapped_column(VARCHAR(64), nullable=False)
+    payer_domain_id: Mapped[str | None] = mapped_column(VARCHAR(64))
     model_name: Mapped[str] = mapped_column(VARCHAR(190), nullable=False)
     source: Mapped[str] = mapped_column(VARCHAR(10), nullable=False, default="web")
     # No FK: API-key revocation must not delete accepted run provenance.
@@ -92,6 +100,12 @@ class ChatRun(Base):
         Index("idx_chat_runs_status_pool", "status", "runtime_pool_id"),
         Index("idx_chat_runs_status_plugin_digest", "status", "required_plugin_digest"),
         Index("idx_chat_runs_assigned_resource", "assigned_resource_id"),
+        Index("idx_chat_runs_worker_pool_workload_status", "worker_pool_id", "workload_class", "status", "created_at", "id"),
+        Index("idx_chat_runs_worker_registration_lease", "worker_registration_id", "status", "lease_expires_at"),
+        Index("idx_chat_runs_batch_status", "batch_id", "status"),
+        CheckConstraint(
+            "workload_class IN ('online_text','online_media','batch','realtime')", name="ck_chat_runs_workload_class"
+        ),
     )
 
 
@@ -106,6 +120,11 @@ class ChatRunProvider(Base):
     purpose: Mapped[str] = mapped_column(VARCHAR(30), primary_key=True)
     provider_id: Mapped[int | None] = mapped_column(BIGINT, ForeignKey("llm_providers.id", ondelete="SET NULL"))
     model_id: Mapped[int | None] = mapped_column(BIGINT, ForeignKey("llm_models.id", ondelete="SET NULL"))
+    provider_account_id: Mapped[int | None] = mapped_column(BIGINT)
+    provider_credential_id: Mapped[int | None] = mapped_column(BIGINT)
+    provider_credential_generation: Mapped[int | None] = mapped_column(BIGINT)
+    provider_backend: Mapped[str | None] = mapped_column(VARCHAR(40))
+    provider_backend_version: Mapped[str | None] = mapped_column(VARCHAR(100))
     provider_label: Mapped[str] = mapped_column(VARCHAR(190), nullable=False)
     model_label: Mapped[str] = mapped_column(VARCHAR(190), nullable=False)
     config_version_hash: Mapped[str] = mapped_column(VARCHAR(128), nullable=False)
@@ -215,6 +234,8 @@ class ChatModelCallReservation(Base):
 
     run_id: Mapped[str] = mapped_column(CHAR(36), ForeignKey("chat_runs.id", ondelete="RESTRICT"), primary_key=True)
     segment_id: Mapped[str] = mapped_column(VARCHAR(190), primary_key=True)
+    payer_user_id: Mapped[str | None] = mapped_column(VARCHAR(64))
+    payer_domain_id: Mapped[str | None] = mapped_column(VARCHAR(64))
     bound_credits: Mapped[Decimal] = mapped_column(Numeric(18, 8), nullable=False)
     actual_credits: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
     status: Mapped[str] = mapped_column(VARCHAR(20), nullable=False, default="reserved")
@@ -224,6 +245,7 @@ class ChatModelCallReservation(Base):
     __table_args__ = (
         CheckConstraint("bound_credits >= 0", name="ck_model_call_bound"),
         CheckConstraint("actual_credits IS NULL OR actual_credits >= 0", name="ck_model_call_actual"),
+        Index("idx_model_call_payer_domain", "payer_domain_id", "status"),
     )
 
 

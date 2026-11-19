@@ -10,6 +10,7 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
+from provider_fixtures import configured_provider
 from sqlalchemy import select, update
 
 from lumen.db import close_db, get_session_factory, init_db
@@ -21,12 +22,13 @@ from lumen.services.durable_runs.common import _now
 from lumen.services.durable_runs.errors import DurableRunProviderResultUnknown
 from lumen.services.durable_runs.execution import _finish
 from lumen.services.durable_runs.lifecycle import recover_stale_runs, request_cancelled
+from lumen.services.infrastructure.store import register_worker
 from lumen.services.providers import routing
 from lumen.services.providers.realtime_protocol import AudioMeter
 from lumen.services.run_store import load_segment_payload
 from lumen.services.usage_breakdown import UsageBreakdown
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.usefixtures("current_project_authority")]
 
 
 @pytest.mark.parametrize("legacy_snapshot", [False, True])
@@ -36,10 +38,10 @@ async def test_realtime_durable_exact_pcm_usage_and_crash_unknown(monkeypatch, l
     init_db(os.environ["DATABASE_URL"], pool_size=1, max_overflow=0)
     factory = get_session_factory()
     assert factory is not None
-    monkeypatch.setattr(routing, "resolve_api_key", lambda _provider: "fixture-provider-key")
+    
     try:
         async with factory() as session, session.begin():
-            provider = LlmProvider(name=f"realtime-provider-{nonce}", provider_type="openai",
+            provider = configured_provider(name=f"realtime-provider-{nonce}", provider_type="openai",
                                    is_active=True, margin_multiplier=Decimal("2"))
             session.add(provider)
             await session.flush()
@@ -122,7 +124,11 @@ async def test_realtime_durable_exact_pcm_usage_and_crash_unknown(monkeypatch, l
                  .with_for_update())).scalar_one()
             assert run.lease_owner == owner
             run.lease_expires_at = _now() - timedelta(seconds=1)
-        await recover_stale_runs(owner="voice-recovery")
+        # Recovery reconciles any stale run; a real recovering worker identity is required.
+        recovery_registration = await register_worker(
+            worker_identity="voice-recovery", boot_id=str(uuid.uuid4()), capacity=1, protocol_versions=[1, 2],
+            plugin_digest="0" * 64, schema_version=1, workload_classes=["online_text"])
+        await recover_stale_runs(owner="voice-recovery", registration_id=recovery_registration)
         async with factory() as session:
             run = (await session.execute(select(ChatRun).where(ChatRun.id == unknown["session_id"]))).scalar_one()
             hold = (await session.execute(select(ChatModelCallReservation).where(
@@ -148,19 +154,20 @@ async def test_realtime_token_usage_settles_once_or_keeps_checkpointed_unknown_h
     init_db(os.environ["DATABASE_URL"], pool_size=1, max_overflow=0)
     factory = get_session_factory()
     assert factory is not None
-    monkeypatch.setattr(routing, "resolve_api_key", lambda _provider: "fixture-provider-key")
+    
     usage = (_realtime_usage(text_in=200, audio_in=800, cached_text=100, cached_audio=300, text_out=100, audio_out=400)
              + _realtime_usage(text_in=100, audio_in=500, cached_text=0, cached_audio=0, text_out=50, audio_out=250))
     meter = AudioMeter(input_bytes=4800, output_bytes=4800, input_sample_rate_hz=24000,
                        output_sample_rate_hz=24000, usage=usage, usage_state="complete")
     try:
         async with factory() as session, session.begin():
-            provider = LlmProvider(name=f"realtime-token-provider-{nonce}", provider_type="openai",
+            provider = configured_provider(name=f"realtime-token-provider-{nonce}", provider_type="openai",
                                    is_active=True, margin_multiplier=Decimal("1"))
             session.add(provider)
             await session.flush()
             model_ids = {}
-            for name, envelope in (("gpt-realtime", "0.5"), ("gpt-realtime-mini", "0.05")):
+            # Configured envelopes must cover two pinned worst-case responses ($1.839104 here).
+            for name, envelope in (("gpt-realtime", "5"), ("gpt-realtime-mini", "1.84")):
                 model = LlmModel(provider_id=provider.id, model_name=name, model_kind="realtime",
                                  input_price=Decimal("0.000004"), output_price=Decimal("0.000016"),
                                  cache_read_price=Decimal("0.0000004"), is_active=True, media_pricing={
@@ -180,10 +187,10 @@ async def test_realtime_token_usage_settles_once_or_keeps_checkpointed_unknown_h
             assert prices["billing_basis"] == "tokens" and prices["reservation_usd"] == envelope
             return admitted["session_id"], owner
 
-        run_id, owner = await started("0.5")
+        run_id, owner = await started("5")
         # Later administrator price edits never reach an admitted session's settlement.
         async with factory() as session, session.begin():
-            model = (await session.execute(select(LlmModel).where(LlmModel.id == model_ids["0.5"]))).scalar_one()
+            model = (await session.execute(select(LlmModel).where(LlmModel.id == model_ids["5"]))).scalar_one()
             model.input_price, model.output_price, model.cache_read_price = (
                 Decimal("0.001"), Decimal("0.001"), Decimal("0.001"))
             model.media_pricing = {**model.media_pricing, "token_rates": {"audio": {
@@ -201,13 +208,15 @@ async def test_realtime_token_usage_settles_once_or_keeps_checkpointed_unknown_h
                 ChatModelCallReservation.run_id == run_id))).scalar_one()
             assert hold.status == "settled" and hold.actual_credits == rows[0].credited_cost
 
+        # 40,000 output audio tokens alone cost $2.56, above the $1.84 envelope.
+        over = _realtime_usage(text_in=10, audio_in=10, cached_text=0, cached_audio=0, text_out=0, audio_out=40000)
         unknown_cases = (
-            (meter, "exceeds"),
+            (AudioMeter(4800, 4800, 24000, 24000, usage=over, usage_state="complete"), "exceeds"),
             (AudioMeter(4800, 4800, 24000, 24000, usage=None, usage_state="complete"), "missing"),
             (AudioMeter(4800, 4800, 24000, 24000, usage=usage, usage_state="incomplete"), "incomplete"),
         )
         for uncertain_meter, reason in unknown_cases:
-            unknown_id, unknown_owner = await started("0.05")
+            unknown_id, unknown_owner = await started("1.84")
             with pytest.raises(DurableRunProviderResultUnknown, match=reason):
                 await realtime._settle(unknown_id, owner=unknown_owner, meter=uncertain_meter)
             await _finish(unknown_id, status="failed", message_id=None, owner=unknown_owner,
@@ -231,6 +240,51 @@ async def test_realtime_token_usage_settles_once_or_keeps_checkpointed_unknown_h
         await close_db()
 
 
+async def test_catalog_token_hold_is_reserved_in_full_and_refused_on_low_credit(monkeypatch):
+    """An unpriced-reservation OpenAI catalog row funds duration plus two worst-case responses."""
+    nonce = uuid.uuid4().hex
+    user_id, project_id = f"realtime-hold-user-{nonce}", f"realtime-hold-project-{nonce}"
+    init_db(os.environ["DATABASE_URL"], pool_size=1, max_overflow=0)
+    factory = get_session_factory()
+    assert factory is not None
+    try:
+        async with factory() as session, session.begin():
+            provider = configured_provider(name=f"realtime-hold-provider-{nonce}", provider_type="openai",
+                                           is_active=True, margin_multiplier=Decimal("1"))
+            session.add(provider)
+            await session.flush()
+            # No manual prices: the 2026-11-18 catalog token tariff and the derived hold apply.
+            model = LlmModel(provider_id=provider.id, model_name="gpt-realtime-2.1", model_kind="realtime",
+                             is_active=True)
+            session.add(model)
+            await session.flush()
+            model_id = model.id
+        request = {"model_id": str(model_id), "max_duration_seconds": 10}
+        admitted = await realtime.admit_realtime_session(request, project_id=project_id, user_id=user_id,
+                                                          client_request_id=str(uuid.uuid4()))
+        assert admitted["realtime_image_input"] is True and admitted["max_client_frame_bytes"] == 2 * 1024 * 1024
+        async with factory() as session:
+            run = (await session.execute(select(ChatRun).where(ChatRun.id == admitted["session_id"]))).scalar_one()
+            prices = run.pricing_snapshot
+        # 10 s * ($32/M * 100 + $64/M * 30) + 2 * $0.919552.
+        assert (prices["reservation_source"], Decimal(prices["reservation_usd"])) == (
+            "duration_policy", Decimal("1.890304"))
+        bound = Decimal(prices["bound_credits"])
+
+        async def limited_quota(_session, _user_id):
+            return SimpleNamespace(monthly=bound - Decimal("0.01"), weekly=Decimal(0))
+
+        monkeypatch.setattr(credit.quota_policy, "get_system_quota", limited_quota)
+        with pytest.raises(credit.QuotaExceeded):
+            await realtime._start(admitted["session_id"], owner="low-credit-voice", user_id=user_id,
+                                  project_id=project_id)
+        async with factory() as session:
+            assert (await session.execute(select(ChatModelCallReservation).where(
+                ChatModelCallReservation.run_id == admitted["session_id"]))).scalar_one_or_none() is None
+    finally:
+        await close_db()
+
+
 async def test_session_deadline_closes_and_settles_connected_time_once(monkeypatch):
     from lumen.services.providers import realtime_protocol
 
@@ -239,7 +293,7 @@ async def test_session_deadline_closes_and_settles_connected_time_once(monkeypat
     init_db(os.environ["DATABASE_URL"], pool_size=1, max_overflow=0)
     factory = get_session_factory()
     assert factory is not None
-    monkeypatch.setattr(routing, "resolve_api_key", lambda _provider: "fixture-provider-key")
+    
 
     class Upstream:
         def __init__(self):
@@ -285,7 +339,7 @@ async def test_session_deadline_closes_and_settles_connected_time_once(monkeypat
     monkeypatch.setattr(realtime_protocol.websockets, "connect", lambda *_args, **_kwargs: connection)
     try:
         async with factory() as session, session.begin():
-            provider = LlmProvider(name=f"session-provider-{nonce}", provider_type="openai",
+            provider = configured_provider(name=f"session-provider-{nonce}", provider_type="openai",
                                    is_active=True, margin_multiplier=Decimal("1"))
             session.add(provider)
             await session.flush()
@@ -336,12 +390,14 @@ async def test_compat_gateways_route_by_wire_transport_not_renamed_selector(monk
     init_db(os.environ["DATABASE_URL"], pool_size=1, max_overflow=0)
     factory = get_session_factory()
     assert factory is not None
-    monkeypatch.setattr(routing, "resolve_api_key", lambda _provider: "fixture-provider-key")
+    
     monkeypatch.setattr(compat, "get_settings", lambda: SimpleNamespace(chat_api_hosts=""))
 
     async def verify_key(_key):
         return {"user_id": user_id, "project_id": project_id, "api_key_id": None,
-                "scopes": ["compat:realtime:write"]}
+                "auth_type": "api_key", "credential_class": "claude_gateway",
+                "scopes": ["compat:realtime:write"], "roles": ["member", "lumen-audio_user"],
+                "is_system_admin": False}
 
     connected = []
 
@@ -355,6 +411,7 @@ async def test_compat_gateways_route_by_wire_transport_not_renamed_selector(monk
         headers = {"x-api-key": "fixture-lumen-key"}
 
         def __init__(self, *, query=None, setup_model=None):
+            self.scope = {"type": "websocket"}
             self.query_params = query or {}
             self.setup_model = setup_model
             self.code = None
@@ -372,9 +429,9 @@ async def test_compat_gateways_route_by_wire_transport_not_renamed_selector(monk
     created: list[int] = []
     try:
         async with factory() as session, session.begin():
-            google = LlmProvider(name=f"realtime-google-{nonce}", provider_type="gemini", api_provider="google",
+            google = configured_provider(name=f"realtime-google-{nonce}", provider_type="gemini", api_provider="google",
                                  is_active=True, margin_multiplier=Decimal("1"))
-            openai = LlmProvider(name=f"realtime-openai-{nonce}", provider_type="openai",
+            openai = configured_provider(name=f"realtime-openai-{nonce}", provider_type="openai",
                                  is_active=True, margin_multiplier=Decimal("1"))
             session.add_all([google, openai])
             await session.flush()

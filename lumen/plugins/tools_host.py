@@ -22,18 +22,36 @@ from lumen.services.usage_breakdown import UsageBreakdown
 _MAX_MANAGED_RESULT_BYTES = 48 * 1024
 
 
+async def _history_domain_for_run(context: ExecutionContext) -> str | None:
+    """Read only admission's verified domain from the current-project run."""
+    if context.run_id is None:
+        return None
+    from lumen.services.durable_runs.errors import DurableRunNotFound
+    from lumen.services.durable_runs.queries import owned_run_history_domain
+
+    try:
+        return await owned_run_history_domain(
+            run_id=context.run_id, user_id=context.user_id, project_id=context.project_id,
+        )
+    except DurableRunNotFound as exc:
+        raise conversations.ConversationForbidden("conversation tool run is not owned") from exc
+
+
 class ToolsConversationAccess:
     async def list(self, context: ExecutionContext, *, limit: int = 20) -> list[dict[str, Any]]:
+        domain_id = await _history_domain_for_run(context)
         return await conversations.list_conversations(
-            user_id=context.user_id, project_id=context.project_id, limit=min(max(limit, 1), 20)
+            user_id=context.user_id, project_id=context.project_id,
+            limit=min(max(limit, 1), 20), domain_id=domain_id,
         )
 
     async def read(self, conversation_id: str, context: ExecutionContext) -> dict[str, Any]:
+        domain_id = await _history_domain_for_run(context)
         item = await conversations.get_conversation(
-            conversation_id, user_id=context.user_id, project_id=context.project_id
+            conversation_id, user_id=context.user_id, project_id=context.project_id, domain_id=domain_id,
         )
         messages = await conversations.list_messages(
-            conversation_id, user_id=context.user_id, project_id=context.project_id
+            conversation_id, user_id=context.user_id, project_id=context.project_id, domain_id=domain_id,
         )
         return {
             "id": item["id"],
@@ -61,7 +79,8 @@ class ToolsExtensionAccess:
         self._require_tool(kind)
         try:
             return await extensions.list_for_user(
-                "tool", user_id=namespace.user_id, project_id=self._project(namespace), active_only=True
+                "tool", user_id=namespace.user_id, project_id=self._project(namespace), active_only=True,
+                include_domain=False, runtime=True,
             )
         except extensions.ChatStorageUnavailable as exc:
             raise PluginError("plugin_unavailable", "extension storage is unavailable") from exc
@@ -72,7 +91,14 @@ class ToolsExtensionAccess:
         self._require_tool(kind)
         if not isinstance(identifier, int) or isinstance(identifier, bool) or identifier < 1:
             raise PluginError("plugin_unavailable", "invalid custom HTTP tool reference")
-        item = next((item for item in await self.list("tool", namespace) if item.get("id") == identifier), None)
+        try:
+            rows = await extensions.list_for_user(
+                "tool", user_id=namespace.user_id, project_id=self._project(namespace), active_only=True,
+                include_domain=(identifier,), selected_ids=(identifier,), runtime=True,
+            )
+        except extensions.ChatStorageUnavailable as exc:
+            raise PluginError("plugin_unavailable", "extension storage is unavailable") from exc
+        item = next((row for row in rows if row["id"] == identifier), None)
         if item is None:
             raise PluginError("plugin_authority_revoked", "custom HTTP tool is unavailable")
         return item
@@ -211,7 +237,7 @@ class ToolsAdvisorAccess:
             usage_components={"components": [
                 _usage(kind, price_key, "token", "advisor", model_name=model_name) | {
                     "quantity": str(quantity),
-                    **({"prompt_tokens": breakdown.input_tokens} if kind.startswith("advisor_cache_") else {}),
+                    "prompt_tokens": breakdown.input_tokens,
                 }
                 for kind, price_key, quantity in tokens
                 if quantity > 0 or not kind.startswith("advisor_cache_")

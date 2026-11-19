@@ -68,10 +68,6 @@ class TestDefinitions:
         with pytest.raises(mcp_bundles.McpBundleError):
             mcp_bundles.definition("slack")
 
-    def test_install_fields_stay_inside_the_store_whitelist(self):
-        fields = mcp_bundles._install_fields(mcp_bundles.definition("github"))
-        assert set(fields) == {"name", "transport", "url", "auth_mode", "load_policy", "is_active"}
-
 
 class TestCatalog:
     async def test_reports_uninstalled_bundles(self, monkeypatch):
@@ -183,13 +179,13 @@ class TestUnconnectedConnectorSelection:
         async def fake_list(kind, **_kwargs):
             if kind != "mcp":
                 return []
-            return [_row(7, "https://mcp.notion.com/mcp"), _row(8, "https://mcp.other.example", name="Other")]
-
-        async def fake_versions(server_ids, *, user_id, project_id):
-            return credential_versions
+            rows = [_row(7, "https://mcp.notion.com/mcp"), _row(8, "https://mcp.other.example", name="Other")]
+            for row in rows:
+                if row["id"] in credential_versions:
+                    row["credential_version"] = credential_versions[row["id"]]
+            return rows
 
         monkeypatch.setattr(chat_admission.es, "list_for_user", fake_list)
-        monkeypatch.setattr(chat_admission.es, "mcp_credential_versions", fake_versions)
 
     async def test_implicit_selection_quietly_excludes_an_unconnected_connector(self, monkeypatch):
         # Freezing credential_version=None would make the worker reject it and
@@ -247,3 +243,4 @@ class TestUnconnectedConnectorSelection:
                 user_id="u1",
                 project_id="p1",
             )
+

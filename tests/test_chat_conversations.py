@@ -68,12 +68,17 @@ class TestCreateAndList:
             return [_public_conv(title="오래된 OpenStack 대화")]
 
         monkeypatch.setattr(cs, "search_conversations", fake_search)
-        resp = await client.get(f"{_URL}/search", params={"q": "OpenStack", "limit": 20})
+        # Domain authority comes only from the verified principal, never caller input.
+        resp = await client.get(
+            f"{_URL}/search", params={"q": "OpenStack", "limit": 20, "domain_id": "caller-domain"},
+            headers={"X-Domain-Id": "caller-domain"},
+        )
         assert resp.status_code == 200
         assert resp.json()[0]["title"] == "오래된 OpenStack 대화"
         assert captured == {
             "user_id": "test-user-123",
             "project_id": "test-project-123",
+            "domain_id": "test-domain-123",
             "query": "OpenStack",
             "limit": 20,
         }
@@ -157,6 +162,11 @@ class TestAvailableModels:
                     "is_active": True,
                     "input_price": 0.0000025,
                     "output_price": 0.00001,
+                    "provider_family": "native",
+                    "price_origin": "native_catalog",
+                    "catalog_version": "2026-11-17",
+                    "catalog_entry": {"id": "gpt-4o", "status": "active",
+                                      "verified_at": "2026-11-17", "source_urls": ["https://openai.com/api/pricing/"]},
                     "effective_capabilities": {"vision": True, "reasoning": False, "context_limit": 128000},
                     "created_at": None,
                     "updated_at": None,
@@ -181,6 +191,10 @@ class TestAvailableModels:
         assert body[0]["context_limit"] == 128000
         assert body[0]["provider_api_key_configured"] is False
         assert body[0]["reasoning_none_supported"] is False
+        assert body[0]["provider_family"] == "native"
+        assert body[0]["price_origin"] == "native_catalog"
+        assert body[0]["catalog_version"] == "2026-11-17"
+        assert body[0]["catalog_entry"]["id"] == "gpt-4o"
         assert "input_price" not in body[0]
         assert "api_key" not in body[0]
         assert body[0]["id"] == 1
@@ -338,13 +352,17 @@ async def test_messages_uses_anchor_and_returns_signed_page_cursors(client, monk
     monkeypatch.setattr(conversations.cs, "get_conversation", fake_get)
     monkeypatch.setattr(conversations.cs, "list_message_page", fake_page)
 
-    response = await client.get(f"{_URL}/conv-1/messages?anchor=first&limit=40")
+    response = await client.get(
+        f"{_URL}/conv-1/messages?anchor=first&limit=40&domain_id=caller-domain",
+        headers={"X-Domain-Id": "caller-domain"},
+    )
 
     assert response.status_code == 200
     assert captured == {
         "conv_id": "conv-1",
         "user_id": "test-user-123",
         "project_id": "test-project-123",
+        "domain_id": "test-domain-123",
         "anchor": "first",
         "cursor_direction": None,
         "cursor_position": None,
@@ -376,3 +394,72 @@ async def test_messages_rejects_tampered_cursor_after_owner_check(client, monkey
     assert owner_checked is True
     assert response.status_code == 422
     assert response.json()["detail"] == "invalid_history_cursor"
+
+
+async def test_text_capability_response_includes_endpoint_capabilities(monkeypatch):
+    from lumen.api import conversations
+
+    async def resolve(_model_id):
+        return {"model_name": "gpt-6-luna", "capabilities": {"decisions": True}}
+
+    monkeypatch.setattr(conversations.routing, "resolve_model_by_id", resolve)
+    result = await conversations.get_chat_capabilities(model_id=1, model_kind="text", token_info={})
+    assert result["model_kind"] == "text"
+    assert result["model_capabilities"] == {"decisions": True}
+
+
+@pytest.mark.parametrize("api_base", [None, "https://compatible.invalid/v1"])
+async def test_embedding_capabilities_http_uses_resolved_override_without_catalog(client, monkeypatch, api_base):
+    from lumen.api import conversations
+    from lumen.services import provider_metadata
+
+    embedding = {
+        "default_dimensions": 512, "supports_dimensions": True,
+        "min_dimensions": 256, "max_dimensions": 1024, "allowed_dimensions": [256, 512, 1024],
+    }
+    caps = {"embedding": embedding, "context_limit": 4096}
+
+    async def resolve(model_id, *, model_kind):
+        assert (model_id, model_kind) == (7, "embedding")
+        return {"model_name": "text-embedding-3-large", "provider_type": "openai",
+                "api_base": api_base, "capabilities": caps}
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("capabilities HTTP must use the resolved embedding override, not the native catalog")
+
+    monkeypatch.setattr(conversations.routing, "resolve_model_by_id", resolve)
+    monkeypatch.setattr(provider_metadata, "catalog_model_metadata", forbidden)
+    response = await client.get("/v1/capabilities", params={"model_id": 7, "model_kind": "embedding"})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["model_capabilities"] == caps
+    assert {key: body[key] for key in embedding} == embedding
+    assert body["max_input_tokens"] == 4096
+    assert body["max_inputs"] == 16
+
+
+async def test_available_embedding_models_preserve_effective_dimension_metadata(client, monkeypatch):
+    embedding = {
+        "default_dimensions": 3072, "supports_dimensions": True,
+        "min_dimensions": 128, "max_dimensions": 3072, "allowed_dimensions": None,
+    }
+    caps = {"embedding": embedding, "context_limit": 2048}
+
+    async def models(*, active_only):
+        assert active_only is True
+        return [{
+            "id": 7, "provider_id": 1, "model_name": "gemini-embedding-001",
+            "api_model_name": "gemini-embedding-001", "api_provider": "gemini",
+            "provider_type": "gemini", "model_kind": "embedding", "display_name": "Gemini Embedding",
+            "effective_capabilities": caps,
+        }]
+
+    async def providers():
+        return [{"id": 1, "name": "Gemini", "provider_type": "gemini", "has_api_key": True}]
+
+    monkeypatch.setattr(repository, "list_models", models)
+    monkeypatch.setattr(repository, "list_providers", providers)
+    response = await client.get("/v1/chat/models", params={"model_kind": "embedding"})
+    assert response.status_code == 200, response.text
+    assert response.json()[0]["capabilities"] == caps
+    assert response.json()[0]["context_limit"] == 2048

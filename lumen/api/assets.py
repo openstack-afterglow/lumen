@@ -42,14 +42,14 @@ def _map_error(exc: Exception) -> HTTPException:
     return HTTPException(status_code=502, detail="chat asset pipeline failed")
 
 
-async def _spool_upload(upload: UploadFile) -> Path:
+async def _spool_upload(upload: UploadFile, *, max_bytes: int = _MAX_UPLOAD_BYTES) -> Path:
     fd, name = tempfile.mkstemp(prefix="afterglow-chat-asset-", suffix=".upload")
     total = 0
     try:
         with os.fdopen(fd, "wb") as target:
             while chunk := await upload.read(64 * 1024):
                 total += len(chunk)
-                if total > _MAX_UPLOAD_BYTES:
+                if total > max_bytes:
                     raise HTTPException(status_code=413, detail="파일 크기가 제한을 초과했습니다")
                 target.write(chunk)
         return Path(name)
@@ -110,7 +110,7 @@ async def get_asset(asset_id: UUID, token_info: Principal = Depends(require_scop
 
 
 @router.delete("/assets/{asset_id}", status_code=202)
-async def delete_asset(asset_id: UUID, token_info: Principal = Depends(require_scopes("native:assets:write"))):
+async def delete_asset(asset_id: UUID, token_info: Principal = Depends(require_scopes("native:assets:delete"))):
     try:
         return await assets.delete_asset(
             asset_id=str(asset_id), user_id=token_info["user_id"], project_id=token_info["project_id"]

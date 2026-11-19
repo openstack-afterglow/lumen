@@ -1,4 +1,4 @@
-"""Real MariaDB/Redis coverage for the API-key durable-run path."""
+"""Real MariaDB/Redis coverage for native Keystone run and model-key boundaries."""
 
 from __future__ import annotations
 
@@ -10,11 +10,14 @@ from types import SimpleNamespace
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from provider_fixtures import configured_provider
 from redis.asyncio import Redis
 from sqlalchemy import delete, func, select
 
+from lumen.api import domain_pools
 from lumen.db import close_db, get_session_factory, init_db
 from lumen.main import app
+from lumen.models.billing import DomainCreditPool
 from lumen.models.chat_db import LlmModel, LlmProvider
 from lumen.models.chat_runs import ChatRun
 from lumen.services import api_key_store, graph
@@ -25,7 +28,27 @@ from lumen.services.providers.errors import ProviderValidationError
 pytestmark = pytest.mark.integration
 
 
-async def test_scoped_api_key_admits_executes_and_replays_a_native_run(monkeypatch):
+async def _fund_domain(domain_id: str) -> Decimal:
+    balance = Decimal("100000")
+    await domain_pools.top_up_domain_pool(
+        domain_id, domain_pools.TopUp(amount_credits=balance), "native-flow-fixture", {"user_id": "fixture-admin"},
+    )
+    return balance
+
+
+async def _fixed_text_worker(run_id: str, identity: str) -> str:
+    """A real fixed online_text registration compatible with the admitted run."""
+    from lumen.services.infrastructure import store
+
+    async with get_session_factory()() as session:
+        run = await session.get(ChatRun, run_id)
+    return await store.register_worker(
+        worker_identity=identity, boot_id=str(uuid.uuid4()), capacity=1, protocol_versions=[1, 2],
+        plugin_digest=run.required_plugin_digest or "0" * 64, schema_version=1, workload_classes=["online_text"],
+    )
+
+
+async def test_keystone_session_admits_executes_and_replays_a_native_run(monkeypatch):
     """Exercise HTTP admission, the durable journal, worker execution, and usage attribution."""
     database_url = os.environ["DATABASE_URL"]
     redis_url = os.environ["REDIS_URL"]
@@ -35,18 +58,29 @@ async def test_scoped_api_key_admits_executes_and_replays_a_native_run(monkeypat
     model_name = f"integration-model-{nonce}"
     run_owner = f"integration-worker-{nonce}"
 
+    async def current_authority(owner_user_id, owner_project_id):
+        assert (owner_user_id, owner_project_id) == (user_id, project_id)
+        return {"roles": ["member", "lumen-inventory_reader", "lumen-history_reader", "lumen-chat_user",
+                          "lumen-tools_user", "lumen-keys_editor"], "is_system_admin": False, "domain_id": project_id}
+
+    monkeypatch.setattr("lumen.auth.resolve_project_authority", current_authority)
+    def fake_validate_token(token: str, **_kwargs) -> dict:
+        assert token == "integration-owner-token"
+        return {"user_id": user_id, "project_id": project_id, "roles": ["member"], "is_system_admin": False}
+
+    monkeypatch.setattr("lumen.auth.validate_token", fake_validate_token)
+    owner_headers = {"X-Auth-Token": "integration-owner-token"}
     init_db(database_url, pool_size=1, max_overflow=0)
     factory = get_session_factory()
     assert factory is not None
 
     try:
+        await _fund_domain(project_id)
         async with factory() as session, session.begin():
-            provider = LlmProvider(
-                name=f"integration-provider-{nonce}",
-                provider_type="openai",
-                is_active=True,
-                margin_multiplier=Decimal("1"),
-            )
+            provider = configured_provider(name=f"integration-provider-{nonce}",
+            provider_type="openai",
+            is_active=True,
+            margin_multiplier=Decimal("1"),)
             session.add(provider)
             await session.flush()
             session.add(
@@ -57,6 +91,9 @@ async def test_scoped_api_key_admits_executes_and_replays_a_native_run(monkeypat
                     input_price=Decimal("0.000001"),
                     output_price=Decimal("0.000002"),
                     price_source="manual",
+                    # Domain-paid calls reserve a worst-case bound from the frozen context limit.
+                    capabilities={"context_limit": 8192, "tool_call": True},
+                    capability_source="override",
                 )
             )
 
@@ -66,13 +103,8 @@ async def test_scoped_api_key_admits_executes_and_replays_a_native_run(monkeypat
         finally:
             await redis.close()
 
-        key = await api_key_store.create_key(
-            user_id,
-            project_id,
-            "native integration",
-            ["models:read", "native:runs:read", "native:runs:write", "native:tools:execute", "usage:read"],
-            None,
-        )
+        key = await api_key_store.create_key(user_id, project_id, "integration", ["models:read"])
+        monkeypatch.setattr(api_key_store, "_verify_model_key_owner", lambda **kwargs: None)
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
             unknown = await client.post(
@@ -90,7 +122,7 @@ async def test_scoped_api_key_admits_executes_and_replays_a_native_run(monkeypat
             first_idem_key = str(uuid.uuid4())
             admitted = await client.post(
                 "/v1/temp-completions",
-                headers={"X-Api-Key": key["key"], "Idempotency-Key": first_idem_key},
+                headers={**owner_headers, "Idempotency-Key": first_idem_key},
                 json={
                     "parts": [{"type": "text", "text": "run the integration check"}],
                     "model_id": model_name,
@@ -152,11 +184,12 @@ async def test_scoped_api_key_admits_executes_and_replays_a_native_run(monkeypat
 
                 return stream()
 
-            monkeypatch.setattr(graph.litellm_client, "acompletion_stream", fake_litellm_stream)
-            monkeypatch.setattr(graph.litellm_client, "direct_openai_stream_completed", lambda _stream: True)
-            assert await execution.execute_queued_run(run_id, owner=run_owner) is True
+            monkeypatch.setattr(graph.provider_client, "acompletion_stream", fake_litellm_stream)
+            monkeypatch.setattr(graph.provider_client, "direct_openai_stream_completed", lambda _stream: True)
+            registration_id = await _fixed_text_worker(run_id, run_owner)
+            assert await execution.execute_queued_run(run_id, owner=run_owner, registration_id=registration_id) is True
 
-            events = await client.get(f"/v1/runs/{run_id}/events", headers={"X-Api-Key": key["key"]})
+            events = await client.get(f"/v1/runs/{run_id}/events", headers=owner_headers)
             assert events.status_code == 200, events.text
             event_types = [
                 line.removeprefix("event: ") for line in events.text.splitlines() if line.startswith("event: ")
@@ -165,42 +198,19 @@ async def test_scoped_api_key_admits_executes_and_replays_a_native_run(monkeypat
             event_ids = [line.removeprefix("id: ") for line in events.text.splitlines() if line.startswith("id: ")]
             assert event_ids == [f"{run_id}:{index}" for index in range(1, len(event_ids) + 1)]
 
-            usage = await client.get("/v1/usage/records", headers={"X-Api-Key": key["key"]})
+            usage = await client.get("/v1/usage/records", headers=owner_headers)
             assert usage.status_code == 200, usage.text
             record = next(item for item in usage.json()["records"] if item["run_id"] == run_id)
-            assert record["source"] == "api"
-            assert record["api_key_id"] == key["id"]
+            assert record["source"] == "web"
+            assert record["api_key_id"] is None
             assert {"raw_cost", "pricing_snapshot", "usage_components"}.isdisjoint(record)
 
-            owner_project_id = project_id
-
-            def fake_validate_token(token: str, project_id: str = "") -> dict:
-                assert token == "integration-owner-token"
-                return {
-                    "user_id": user_id,
-                    "username": "integration-user",
-                    "project_id": project_id or owner_project_id,
-                    "roles": ["member"],
-                    "is_system_admin": False,
-                }
-
-            monkeypatch.setattr("lumen.auth.validate_token", fake_validate_token)
-
-            owner_headers = {"X-Auth-Token": "integration-owner-token"}
-            api_keys_res = await client.get("/v1/api-keys", headers=owner_headers)
-            assert api_keys_res.status_code == 200, api_keys_res.text
-            found_key = next(item for item in api_keys_res.json() if item["id"] == key["id"])
-            assert found_key["month_credited_cost"] == record["credited_cost"]
-
-            patch_res = await client.patch(
-                f"/v1/api-keys/{key['id']}/limits",
-                headers=owner_headers,
+            limits = await client.patch(
+                f"/v1/api-keys/{key['id']}/limits", headers=owner_headers,
                 json={"monthly_credit_limit": record["credited_cost"]},
             )
-            assert patch_res.status_code == 200, patch_res.text
-            updated_key = patch_res.json()
-            assert updated_key["owner_monthly_credit_limit"] == record["credited_cost"]
-            assert updated_key["effective_monthly_credit_limit"] == record["credited_cost"]
+            assert limits.status_code == 200, limits.text
+            assert limits.json()["owner_monthly_credit_limit"] == record["credited_cost"]
 
             async with factory() as session:
                 runs_before = (await session.execute(select(func.count(ChatRun.id)))).scalar_one()
@@ -216,8 +226,7 @@ async def test_scoped_api_key_admits_executes_and_replays_a_native_run(monkeypat
                     "features": {"memory": False, "tool_policy": {"mode": "agent_default"}},
                 },
             )
-            assert blocked.status_code == 402, blocked.text
-            assert blocked.json()["detail"] == "API 키 월 사용 한도를 초과했습니다"
+            assert blocked.status_code == 403, blocked.text
 
             async with factory() as session:
                 runs_after = (await session.execute(select(func.count(ChatRun.id)))).scalar_one()
@@ -226,7 +235,7 @@ async def test_scoped_api_key_admits_executes_and_replays_a_native_run(monkeypat
 
             replayed = await client.post(
                 "/v1/temp-completions",
-                headers={"X-Api-Key": key["key"], "Idempotency-Key": first_idem_key},
+                headers={**owner_headers, "Idempotency-Key": first_idem_key},
                 json={
                     "parts": [{"type": "text", "text": "run the integration check"}],
                     "model_id": model_name,
@@ -244,8 +253,10 @@ async def test_title_recovery_skips_empty_and_unavailable_conversations_without_
 
     from lumen.crypto import encrypt_chat_content
     from lumen.models.chat_db import ChatConversation, ChatConversationMessage, ChatMessage, ChatMessageGraph
+    from lumen.models.chat_infrastructure import ChatWorkerRegistration
     from lumen.models.chat_jobs import ChatJob
     from lumen.services import title_jobs
+    from lumen.services.infrastructure import store
 
     init_db(os.environ["DATABASE_URL"], pool_size=1, max_overflow=0)
     factory = get_session_factory()
@@ -254,6 +265,11 @@ async def test_title_recovery_skips_empty_and_unavailable_conversations_without_
     empty_ids = [str(uuid.uuid4()) for _ in range(21)]
     unavailable_id, recoverable_id = str(uuid.uuid4()), str(uuid.uuid4())
     now = datetime.now(UTC)
+    registration_id = await store.register_worker(
+        worker_identity="recovery-" + nonce, boot_id=str(uuid.uuid4()), capacity=1,
+        protocol_versions=[2], plugin_digest="a" * 64, schema_version=1,
+        workload_classes=["online_text"],
+    )
     try:
         async with factory() as session, session.begin():
             for conv_id in empty_ids:
@@ -312,9 +328,9 @@ async def test_title_recovery_skips_empty_and_unavailable_conversations_without_
                     )
                 )
 
-        assert await title_jobs._recover_one() is True
-        assert await title_jobs._recover_one() is True
-        await title_jobs._recover_one()
+        assert await title_jobs._recover_one(owner=registration_id) is True
+        assert await title_jobs._recover_one(owner=registration_id) is True
+        await title_jobs._recover_one(owner=registration_id)
         async with factory() as session:
             unavailable = await session.get(ChatConversation, unavailable_id)
             recovered = await session.get(ChatConversation, recoverable_id)
@@ -335,6 +351,8 @@ async def test_title_recovery_skips_empty_and_unavailable_conversations_without_
             )
             assert set(empty_statuses) == {"idle"}
     finally:
+        async with factory() as session, session.begin():
+            await session.delete(await session.get(ChatWorkerRegistration, registration_id))
         await close_db()
 
 
@@ -350,13 +368,11 @@ async def test_subscription_model_namespace_is_unique_under_concurrent_registrat
     try:
         async with factory() as session, session.begin():
             providers = [
-                LlmProvider(
-                    name=f"subscription-provider-{index}-{nonce}",
-                    provider_type="chatgpt",
-                    auth_mode="chatgpt_device",
-                    is_active=True,
-                    margin_multiplier=Decimal("1"),
-                )
+                configured_provider(name=f"subscription-provider-{index}-{nonce}",
+                provider_type="chatgpt",
+                auth_mode="chatgpt_device",
+                is_active=True,
+                margin_multiplier=Decimal("1"),)
                 for index in range(2)
             ]
             session.add_all(providers)
@@ -391,13 +407,13 @@ async def test_subscription_model_namespace_is_unique_under_concurrent_registrat
 
 
 async def test_second_page_claude_requires_explicit_pricing_before_native_admission(monkeypatch):
-    """Discovery is read-only; explicit registration becomes routable and billable without a flush."""
+    """Compatible discovery is read-only; explicit kind and prices become routable without a flush."""
     import json
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from threading import Thread
     from urllib.parse import parse_qs, urlsplit
 
-    from lumen.models.chat_db import ChatUsageLog
+    from lumen.models.chat_db import ChatUsageLog, UserWallet
     from lumen.models.chat_runs import ChatRunProvider
 
     nonce = uuid.uuid4().hex
@@ -405,6 +421,12 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
     unpriced_name = f"claude-unpriced-{nonce}"
     project_id = f"onboarding-project-{nonce}"
     user_id = f"onboarding-user-{nonce}"
+    async def current_authority(owner_user_id, owner_project_id):
+        assert (owner_user_id, owner_project_id) == (user_id, project_id)
+        # Explicitly verified current system authority, not a raw admin label.
+        return {"roles": ["admin"], "is_system_admin": True, "domain_id": project_id}
+
+    monkeypatch.setattr("lumen.auth.resolve_project_authority", current_authority)
     init_db(os.environ["DATABASE_URL"], pool_size=1, max_overflow=0)
     factory = get_session_factory()
     assert factory is not None
@@ -412,6 +434,7 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
     fake_provider = None
     fake_thread = None
     try:
+        opening_balance = await _fund_domain(project_id)
         assert await redis.ping() is True
 
         def validate_admin(token: str, project_id: str = "") -> dict:
@@ -427,6 +450,13 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
         monkeypatch.setattr("lumen.auth.validate_token", validate_admin)
         admin_headers = {"X-Auth-Token": "onboarding-admin-token"}
         requested_pages: list[str | None] = []
+        provider_calls: list[str] = []
+
+        async def forbid_provider_io(**kwargs):
+            provider_calls.append(kwargs["model"])
+            raise AssertionError("Admission must not perform provider I/O")
+
+        monkeypatch.setattr(graph.provider_client, "acompletion_stream", forbid_provider_io)
 
         class FakeClaudeCatalog(BaseHTTPRequestHandler):
             def log_message(self, format: str, *args: object) -> None:
@@ -472,13 +502,8 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
         fake_provider = ThreadingHTTPServer(("127.0.0.1", 0), FakeClaudeCatalog)
         fake_thread = Thread(target=fake_provider.serve_forever, daemon=True)
         fake_thread.start()
-        key = await api_key_store.create_key(
-            user_id,
-            project_id,
-            "onboarding",
-            ["models:read", "native:runs:read", "native:runs:write", "native:tools:execute", "usage:read"],
-            None,
-        )
+        key = await api_key_store.create_key(user_id, project_id, "onboarding", ["models:read"])
+        monkeypatch.setattr(api_key_store, "_verify_model_key_owner", lambda **kwargs: None)
         key_headers = {"X-Api-Key": key["key"]}
 
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client:
@@ -502,8 +527,17 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
             assert catalog["source"] == "api" and catalog["live_status"] == "success"
             assert catalog["complete"] is True and catalog["error"] is None
             assert catalog["models"] == ["claude-sonnet-4-6", model_name, unpriced_name]
+            assert catalog["provider_family"] == "compatible"
+            assert catalog["requires_manual_pricing"] is True
+            assert catalog["catalog_version"] is None
             candidate = next(item for item in catalog["candidates"] if item["id"] == model_name)
-            assert candidate["display_name"] == "Unlisted Claude" and candidate["purpose"] == "chat"
+            assert candidate["display_name"] == "Unlisted Claude"
+            assert candidate["provider_family"] == "compatible"
+            assert candidate["purpose"] == "unknown" and candidate["model_kind"] is None
+            assert candidate["requires_manual_pricing"] is True
+            assert candidate["catalog_entry"] is None
+            assert candidate["token_pricing"] is None
+            assert candidate["capabilities"] is None
             assert requested_pages == [None, "claude-sonnet-4-6"]
             async with factory() as session:
                 count = await session.scalar(select(func.count(LlmModel.id)).where(LlmModel.provider_id == provider_id))
@@ -512,17 +546,27 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
             unpriced = await client.post(
                 "/v1/admin/models",
                 headers=admin_headers,
-                json={"provider_id": provider_id, "model_name": unpriced_name},
+                json={"provider_id": provider_id, "model_name": unpriced_name, "model_kind": "text"},
             )
-            assert unpriced.status_code == 201, unpriced.text
+            assert unpriced.status_code == 400, unpriced.text
+            assert unpriced.json()["detail"].startswith("compatible_model_prices_required:")
+            async with factory() as session:
+                unpriced_count = await session.scalar(
+                    select(func.count(LlmModel.id)).where(
+                        LlmModel.provider_id == provider_id, LlmModel.model_name == unpriced_name
+                    )
+                )
+            assert unpriced_count == 0, "Rejected compatible registration must not persist a model"
             registered = await client.post(
                 "/v1/admin/models",
                 headers=admin_headers,
                 json={
                     "provider_id": provider_id,
                     "model_name": model_name,
+                    "model_kind": "text",
                     "input_price_per_million": "2",
                     "output_price_per_million": "4",
+                    "capabilities": {"context_limit": 8192},
                 },
             )
             assert registered.status_code == 201, registered.text
@@ -530,18 +574,18 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
             assert model["provider_id"] == provider_id
             assert model["api_model_name"] == model_name and model["api_provider"] == "anthropic"
             assert model["price_source"] == "manual"
+            assert model["provider_family"] == "compatible"
+            assert model["model_kind"] == "text"
             assert model["effective_capabilities"]["feature_gates"]["text"]["pricing_available"] is True
 
             active = await client.get("/v1/admin/models?active_only=true", headers=admin_headers)
             assert active.status_code == 200, active.text
             assert any(item["id"] == model["id"] for item in active.json())
-            unpriced_projection = next(item for item in active.json() if item["id"] == unpriced.json()["id"])
-            assert unpriced_projection["effective_price_source"] == "unpriced", unpriced_projection
-            assert unpriced_projection["effective_input_price_per_million"] is None
-            assert unpriced_projection["effective_output_price_per_million"] is None
+            assert not any(item["model_name"] == unpriced_name for item in active.json())
             public = await client.get("/v1/models", headers=key_headers)
             assert public.status_code == 200, public.text
             assert "anthropic" in next(item for item in public.json()["data"] if item["id"] == model_name)["providers"]
+            assert not any(item["id"] == unpriced_name for item in public.json()["data"])
 
             def native_request(selected_model: str, text: str, *, search: bool = False) -> dict:
                 return {
@@ -558,15 +602,15 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
                 before_denial = await session.scalar(select(func.count(ChatRun.id)).where(ChatRun.user_id == user_id))
             denied = await client.post(
                 "/v1/temp-completions",
-                headers={**key_headers, "Idempotency-Key": str(uuid.uuid4())},
-                json=native_request(unpriced_name, "no price must deny"),
+                headers={**admin_headers, "Idempotency-Key": str(uuid.uuid4())},
+                json=native_request(unpriced_name, "unregistered model must deny"),
             )
-            assert denied.status_code == 422, denied.text
-            assert "text (pricing_unavailable)" in denied.json()["detail"]
+            assert denied.status_code == 400, denied.text
+            assert denied.json()["detail"] == f"허용되지 않은 모델입니다: {unpriced_name}"
 
             advanced = await client.post(
                 "/v1/temp-completions",
-                headers={**key_headers, "Idempotency-Key": str(uuid.uuid4())},
+                headers={**admin_headers, "Idempotency-Key": str(uuid.uuid4())},
                 json=native_request(model_name, "unsupported search", search=True),
             )
             async with factory() as session:
@@ -574,10 +618,11 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
             assert before_denial == after_denial == 0
             assert advanced.status_code == 422, advanced.text
             assert "web_search" in advanced.json()["detail"]
+            assert provider_calls == []
 
             admitted = await client.post(
                 "/v1/temp-completions",
-                headers={**key_headers, "Idempotency-Key": str(uuid.uuid4())},
+                headers={**admin_headers, "Idempotency-Key": str(uuid.uuid4())},
                 json=native_request(model_name, "priced text only"),
             )
             assert admitted.status_code == 202, admitted.text
@@ -592,10 +637,18 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
                 assert Decimal(run.pricing_snapshot["input_price_per_token"]) == Decimal("0.000002")
                 assert Decimal(run.pricing_snapshot["output_price_per_token"]) == Decimal("0.000004")
                 admitted_pricing = dict(run.pricing_snapshot)
+                expected_credited = (
+                    Decimal("0.0000400000")
+                    * Decimal(admitted_pricing["margin_multiplier"])
+                    * Decimal(admitted_pricing["chat_credit_per_usd"])
+                ).quantize(Decimal("0.00000001"))
+                assert expected_credited > 0
+            assert provider_calls == []
 
             async def fake_stream(**kwargs):
                 assert kwargs["model"] == model_name
                 assert kwargs["custom_llm_provider"] == "anthropic"
+                provider_calls.append(kwargs["model"])
 
                 async def chunks():
                     yield SimpleNamespace(
@@ -609,21 +662,43 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
 
                 return chunks()
 
-            monkeypatch.setattr(graph.litellm_client, "acompletion_stream", fake_stream)
-            assert await execution.execute_queued_run(run_id, owner=f"onboarding-worker-{nonce}") is True
+            monkeypatch.setattr(graph.provider_client, "acompletion_stream", fake_stream)
+            worker_identity = f"onboarding-worker-{nonce}"
+            registration_id = await _fixed_text_worker(run_id, worker_identity)
+            assert await execution.execute_queued_run(
+                run_id, owner=worker_identity, registration_id=registration_id
+            ) is True
+            assert provider_calls == [model_name]
             async with factory() as session:
                 stored = await session.get(ChatRun, run_id)
                 ledger = (await session.execute(select(ChatUsageLog).where(ChatUsageLog.run_id == run_id))).scalar_one()
+                wallet = await session.get(UserWallet, user_id)
+                pool = await session.get(DomainCreditPool, project_id)
                 assert stored.status == "completed"
+                assert stored.pricing_snapshot == admitted_pricing
                 assert ledger.provider == f"onboarding-provider-{nonce}"
                 assert (ledger.prompt_tokens, ledger.completion_tokens) == (10, 5)
                 assert ledger.raw_cost == Decimal("0.0000400000")
+                assert ledger.credited_cost == expected_credited
                 assert ledger.pricing_status == "priced"
-            usage = await client.get("/v1/usage/records", headers=key_headers)
+                assert ledger.model_name == model_name
+                assert ledger.provider_id == provider_id
+                assert ledger.source == "web" and ledger.api_key_id is None
+                for field in ("input_price_per_token", "output_price_per_token", "price_source"):
+                    assert ledger.pricing_snapshot[field] == admitted_pricing[field]
+                settled_pricing = dict(ledger.pricing_snapshot)
+                assert wallet is not None
+                assert wallet.used_quota_this_month == 0
+                assert wallet.balance_credits == wallet.reserved_credits == Decimal("0")
+                assert pool.balance_credits == opening_balance - expected_credited
+                assert pool.monthly_used_credits == expected_credited and pool.reserved_credits == 0
+                assert ledger.payer_domain_id == project_id and ledger.payer_user_id is None
+            usage = await client.get("/v1/usage/records", headers=admin_headers)
             assert usage.status_code == 200, usage.text
             record = next(item for item in usage.json()["records"] if item["run_id"] == run_id)
-            assert record["source"] == "api" and record["api_key_id"] == key["id"]
+            assert record["source"] == "web" and record["api_key_id"] is None
             assert record["total_tokens"] == 15
+            assert Decimal(str(record["credited_cost"])) == expected_credited
 
             repriced = await client.patch(
                 f"/v1/admin/models/{model['id']}",
@@ -631,13 +706,23 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
                 json={"input_price_per_million": "6", "output_price_per_million": "8"},
             )
             assert repriced.status_code == 200, repriced.text
+            assert Decimal(str(repriced.json()["effective_input_price_per_million"])) == Decimal("6")
+            assert Decimal(str(repriced.json()["effective_output_price_per_million"])) == Decimal("8")
             async with factory() as session:
                 unchanged_run = await session.get(ChatRun, run_id)
                 unchanged_ledger = (
                     await session.execute(select(ChatUsageLog).where(ChatUsageLog.run_id == run_id))
                 ).scalar_one()
+                unchanged_wallet = await session.get(UserWallet, user_id)
                 assert unchanged_run.pricing_snapshot == admitted_pricing
                 assert unchanged_ledger.raw_cost == Decimal("0.0000400000")
+                assert unchanged_ledger.credited_cost == expected_credited
+                assert unchanged_ledger.pricing_snapshot == settled_pricing
+                assert unchanged_wallet is not None
+                assert unchanged_wallet.used_quota_this_month == 0
+                assert unchanged_wallet.balance_credits == unchanged_wallet.reserved_credits == Decimal("0")
+                pool = await session.get(DomainCreditPool, project_id)
+                assert pool.balance_credits == opening_balance - expected_credited
     finally:
         if fake_provider is not None:
             fake_provider.shutdown()
@@ -645,4 +730,152 @@ async def test_second_page_claude_requires_explicit_pricing_before_native_admiss
         if fake_thread is not None:
             fake_thread.join()
         await redis.close()
+        await close_db()
+
+
+@pytest.mark.parametrize("hidden_failure", [False, True])
+async def test_persistent_tool_round_keeps_its_message_when_provider_advances(monkeypatch, hidden_failure):
+    """A queued tool result belongs to its emitted turn, not the producer's latest turn."""
+    from lumen.models.chat_runs import ChatRunTurn
+
+    nonce = uuid.uuid4().hex
+    user_id, project_id = f"turn-user-{nonce}", f"turn-project-{nonce}"
+    model_name = f"turn-model-{nonce}"
+
+    async def current_authority(owner_user_id, owner_project_id):
+        assert (owner_user_id, owner_project_id) == (user_id, project_id)
+        return {"roles": ["member", "lumen-chat_user", "lumen-tools_user", "lumen-history_reader",
+                          "lumen-inventory_reader", "lumen-keys_editor"], "is_system_admin": False, "domain_id": project_id}
+
+    monkeypatch.setattr("lumen.auth.resolve_project_authority", current_authority)
+    monkeypatch.setattr("lumen.auth.validate_token", lambda *args, **kwargs: {
+        "user_id": user_id, "project_id": project_id, "roles": ["member"], "is_system_admin": False,
+    })
+    init_db(os.environ["DATABASE_URL"], pool_size=2, max_overflow=0)
+    factory = get_session_factory()
+    second_turn_started = asyncio.Event()
+    start_provider = execution._DurableExecutionHooks.provider_started
+    stream_events = execution.engine.stream
+    complete_tool = execution._DurableExecutionHooks.tool_completed
+
+    async def tool_completed(self, **kwargs):
+        if hidden_failure:
+            kwargs["result_payload"] = {
+                **kwargs["result_payload"],
+                "content": "Cloud control-plane call was denied or is unavailable.",
+                "visible": False,
+                "status": "failed",
+                "error_code": "cloud_control_unavailable",
+                "display": [],
+                "artifacts": [],
+            }
+        return await complete_tool(self, **kwargs)
+
+    monkeypatch.setattr(execution._DurableExecutionHooks, "tool_completed", tool_completed)
+
+    async def provider_started(self, **kwargs):
+        result = await start_provider(self, **kwargs)
+        if kwargs["round_index"] == 1:
+            second_turn_started.set()
+        return result
+
+    async def buffered_events(**kwargs):
+        queue = asyncio.Queue()
+        finished = object()
+
+        async def produce():
+            try:
+                async for event in stream_events(**kwargs):
+                    await queue.put(event)
+            except Exception as error:
+                await queue.put(error)
+            finally:
+                await queue.put(finished)
+
+        producer = asyncio.create_task(produce())
+        try:
+            while True:
+                event = await queue.get()
+                if event is finished:
+                    return
+                if isinstance(event, Exception):
+                    raise event
+                if event.get("type") == "tool_result":
+                    await asyncio.wait_for(second_turn_started.wait(), timeout=10)
+                    if hidden_failure:
+                        event = {**event, "hidden": True, "status": "failed", "error_code": "cloud_control_unavailable"}
+                yield event
+        finally:
+            producer.cancel()
+            await asyncio.gather(producer, return_exceptions=True)
+
+    monkeypatch.setattr(execution._DurableExecutionHooks, "provider_started", provider_started)
+    monkeypatch.setattr(execution.engine, "stream", buffered_events)
+    provider_calls = 0
+
+    async def provider_stream(**kwargs):
+        nonlocal provider_calls
+        provider_calls += 1
+        first = provider_calls == 1
+
+        async def chunks():
+            call = SimpleNamespace(index=0, id="turn-owned-call", function=SimpleNamespace(
+                name="list_my_conversations", arguments="{}"))
+            yield SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(
+                content=None if first else "The owned conversation lookup completed.",
+                tool_calls=[call] if first else None))],
+                usage={"prompt_tokens": 5, "completion_tokens": 2})
+
+        return chunks()
+
+    monkeypatch.setattr(graph.provider_client, "acompletion_stream", provider_stream)
+    monkeypatch.setattr(graph.provider_client, "direct_openai_stream_completed", lambda _: True)
+    try:
+        await _fund_domain(project_id)
+        async with factory() as session, session.begin():
+            provider = configured_provider(name=f"turn-provider-{nonce}", provider_type="openai", is_active=True,
+                                   margin_multiplier=Decimal("1"))
+            session.add(provider)
+            await session.flush()
+            session.add(LlmModel(provider_id=provider.id, model_name=model_name, is_active=True,
+                                input_price=Decimal("0.000001"), output_price=Decimal("0.000002"),
+                                price_source="manual", capabilities={"context_limit": 8192, "tool_call": True},
+                                capability_source="override"))
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver",
+                               headers={"X-Auth-Token": "integration-turn-owner"}) as client:
+            created = await client.post("/v1/conversations", json={"title": "Owned turn fixture"})
+            assert created.status_code == 201, created.text
+            conversation_id = created.json()["id"]
+            admitted = await client.post(f"/v1/conversations/{conversation_id}/completions",
+                headers={"Idempotency-Key": str(uuid.uuid4())}, json={"model_id": model_name,
+                    "parts": [{"type": "text", "text": "Look up my conversations."}],
+                    "features": {"memory": False, "tool_policy": {"mode": "agent_default"}}})
+            assert admitted.status_code == 202, admitted.text
+            run_id = admitted.json()["run_id"]
+            identity = f"turn-worker-{nonce}"
+            registration_id = await _fixed_text_worker(run_id, identity)
+            await execution.execute_queued_run(run_id, owner=identity, registration_id=registration_id)
+            response = await client.get(f"/v1/runs/{run_id}")
+            assert response.status_code == 200 and response.json()["status"] == "completed"
+            async with factory() as session:
+                turns = (await session.scalars(select(ChatRunTurn).where(ChatRunTurn.run_id == run_id)
+                                               .order_by(ChatRunTurn.ordinal))).all()
+                assert [turn.ordinal for turn in turns] == [0, 1]
+                assistant_ids = [turn.assistant_message_id for turn in turns]
+            history = await client.get(f"/v1/conversations/{conversation_id}/messages")
+            assert history.status_code == 200, history.text
+            by_id = {message["id"]: message for message in history.json()["messages"]}
+            messages = [by_id[message_id] for message_id in assistant_ids]
+            assert all(message["status"] == "complete" for message in messages)
+            first_parts = messages[0]["parts"]
+            if hidden_failure:
+                assert [part["type"] for part in first_parts] == ["tool_call"]
+                assert first_parts[0]["status"] == "failed"
+            else:
+                assert [part["type"] for part in first_parts] == ["tool_call", "tool_result"]
+                assert first_parts[0]["call_id"] == first_parts[1]["call_id"] == "turn-owned-call"
+                assert "Owned turn fixture" in str(first_parts[1]["content"])
+            assert messages[1]["content"] == "The owned conversation lookup completed."
+            assert all(part["type"] not in {"tool_call", "tool_result"} for part in messages[1]["parts"])
+    finally:
         await close_db()

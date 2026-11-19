@@ -14,18 +14,20 @@ from typing import Any
 from fastapi import HTTPException
 
 from lumen.config import get_settings
+from lumen.models.billing import Payer
 from lumen.models.chat_contracts import ChatFeatureOptions, ToolPolicy
 from lumen.services import completion_api as core
 from lumen.services.chat_admission import (
     _capability_extension_snapshot,
     _run_snapshots,
     resolve_summary_route,
+    route_domain_billing,
 )
 from lumen.services.context_manager import ContextBudget
 from lumen.services.durable_runs import admission, lifecycle, queries
 from lumen.services.durable_runs.common import _require_supported_execution_protocol_version
 from lumen.services.durable_runs.errors import DurableRunError
-from lumen.services.litellm_client import count_context_tokens
+from lumen.services.provider_metadata import count_context_tokens
 from lumen.services.providers import repository
 
 logger = logging.getLogger(__name__)
@@ -188,6 +190,7 @@ async def create_lumen_temp_run(
     project_id: str,
     api_key_id: int | None,
     source: str,
+    payer: Payer | None = None,
     max_tokens: int | None = None,
     temperature: float | None = None,
 ) -> tuple[str, str]:
@@ -200,14 +203,22 @@ async def create_lumen_temp_run(
 
     try:
         resolved = await core.resolve(default_model)
-        await core.precheck(user_id, project_id, api_key_id=api_key_id)
+        await core.precheck(user_id, project_id, api_key_id=api_key_id, payer=payer)
     except core.CompletionError as exc:
-        raise OpenAICompatError(exc.status_code, exc.message) from exc
+        raise OpenAICompatError(exc.status_code, exc.message, code=exc.code) from exc
 
+    domain_paid = payer is not None and payer.domain_id is not None
+    if domain_paid:
+        readiness = route_domain_billing(resolved)
+        if not readiness["ready"]:
+            raise OpenAICompatError(
+                422, f"Model 'lumen' is not available for domain billing ({readiness['reason_code']})",
+                code="domain_billing_unavailable",
+            )
     features_obj = ChatFeatureOptions(memory=False, tool_policy=ToolPolicy(mode="none"))
     features = features_obj.model_dump(mode="json", by_alias=True)
     try:
-        summary_route = await resolve_summary_route(resolved)
+        summary_route = await resolve_summary_route(resolved, domain_paid=domain_paid)
     except HTTPException as exc:
         detail = exc.detail if isinstance(exc.detail, str) else "Summary model route is unavailable"
         raise OpenAICompatError(exc.status_code, detail) from exc
@@ -216,12 +227,16 @@ async def create_lumen_temp_run(
     )
     capability_snapshot["extensions"] = _capability_extension_snapshot({"tools": [], "mcp": []})
     capability_snapshot["execution_protocol_version"] = protocol_version
+    from lumen.services.inference_authority import model_required_scopes
+
+    capability_snapshot["required_scopes"] = ["compat:completions:write", *model_required_scopes(resolved)]
 
     effective_output_tokens = max_tokens if max_tokens is not None else _DEFAULT_MAX_TOKENS
     capabilities = resolved.get("capabilities") or {}
     context_limit = capabilities.get("context_limit")
     if context_limit is not None:
-        budget = ContextBudget(context_limit, effective_output_tokens)
+        budget = ContextBudget(context_limit, effective_output_tokens,
+                               max_input_tokens=capabilities.get("max_input_tokens"))
         token_count = count_context_tokens(resolved["model_name"], normalized_messages, None)
         if (
             token_count.tokens is not None
@@ -270,6 +285,7 @@ async def create_lumen_temp_run(
             execution_protocol_version=protocol_version,
             source=source,
             api_key_id=api_key_id,
+            payer=payer,
         )
     except DurableRunError:
         raise OpenAICompatError(503, "Service temporarily unavailable")

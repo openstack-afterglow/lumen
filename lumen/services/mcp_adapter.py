@@ -136,6 +136,25 @@ def frozen_snapshot(value: object) -> LumenSnapshot | None:
     )
 
 
+def frozen_snapshots(value: object) -> list[LumenSnapshot]:
+    """Parse a frozen list of grant snapshots. A legacy single-grant object is accepted as a list of one."""
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        single = frozen_snapshot(value)
+        return [single] if single is not None else []
+    if not isinstance(value, list):
+        raise McpLumenAuthorityError("Lumen delegated MCP snapshot is invalid")
+    snapshots = [frozen_snapshot(item) for item in value]
+    if any(snapshot is None for snapshot in snapshots):
+        raise McpLumenAuthorityError("Lumen delegated MCP snapshot is invalid")
+    return [snapshot for snapshot in snapshots if snapshot is not None]
+
+
+def snapshot_payloads(snapshots: list[LumenSnapshot]) -> list[dict[str, Any]] | None:
+    return [snapshot_payload(snapshot) for snapshot in snapshots] or None
+
+
 def _bridge_base_url() -> str:
     configured = get_settings().mcp_control_plane_url.strip().rstrip("/")
     token = get_settings().lumen_mcp_service_token
@@ -198,29 +217,52 @@ def _entry(value: object) -> RegistryEntry:
     return RegistryEntry(name=name, description=description, effect=effect, schema=schema)
 
 
+def _views(response: dict[str, Any]) -> list[dict[str, Any]]:
+    """Per-grant views from the bridge. A bridge that predates several grants sends only the top-level view."""
+    views = response.get("snapshots")
+    if isinstance(views, list):
+        return [view for view in views if isinstance(view, dict)]
+    if response.get("snapshot") is None:
+        return []
+    return [
+        {
+            "snapshot": response.get("snapshot"),
+            "entries": response.get("entries"),
+            "service_fingerprint": response.get("service_fingerprint"),
+        }
+    ]
+
+
 async def _resolve(snapshot: LumenSnapshot) -> Principal:
     response = await _bridge_post("/snapshot", {"user_id": snapshot.user_id, "project_id": snapshot.project_id})
-    current = frozen_snapshot(response.get("snapshot"))
-    if current != snapshot:
-        raise McpLumenAuthorityError("Lumen delegated MCP selection changed")
-    entries_value = response.get("entries")
-    fingerprint = response.get("service_fingerprint")
-    if not isinstance(entries_value, list) or not isinstance(fingerprint, str) or len(fingerprint) != 64:
-        raise McpLumenAuthorityError("Lumen MCP registry response is invalid")
-    return Principal(
-        user_id=snapshot.user_id,
-        project_id=snapshot.project_id,
-        snapshot=snapshot,
-        entries=tuple(_entry(value) for value in entries_value),
-        service_fingerprint=fingerprint,
-    )
+    for view in _views(response):
+        if frozen_snapshot(view.get("snapshot")) != snapshot:
+            continue
+        entries_value = view.get("entries")
+        fingerprint = view.get("service_fingerprint")
+        if not isinstance(entries_value, list) or not isinstance(fingerprint, str) or len(fingerprint) != 64:
+            raise McpLumenAuthorityError("Lumen MCP registry response is invalid")
+        return Principal(
+            user_id=snapshot.user_id,
+            project_id=snapshot.project_id,
+            snapshot=snapshot,
+            entries=tuple(_entry(value) for value in entries_value),
+            service_fingerprint=fingerprint,
+        )
+    raise McpLumenAuthorityError("Lumen delegated MCP selection changed")
 
 
-async def selected_lumen_snapshot(*, user_id: str, project_id: str) -> LumenSnapshot | None:
+async def selected_lumen_snapshots(*, user_id: str, project_id: str) -> list[LumenSnapshot]:
+    """Every enabled grant the bridge can dispatch for this owner/project, in the bridge's order."""
     if not user_id or not project_id:
-        return None
+        return []
     response = await _bridge_post("/snapshot", {"user_id": user_id, "project_id": project_id})
-    return frozen_snapshot(response.get("snapshot"))
+    snapshots: list[LumenSnapshot] = []
+    for view in _views(response):
+        snapshot = frozen_snapshot(view.get("snapshot"))
+        if snapshot is not None:
+            snapshots.append(snapshot)
+    return snapshots
 
 
 async def resolve_lumen_principal(snapshot: LumenSnapshot) -> Principal:
@@ -336,7 +378,9 @@ class _BridgeAuthority:
 
     async def registry(self, namespace: Namespace) -> dict[str, Any]:
         try:
-            return await _bridge_post("/snapshot", {"user_id": namespace.user_id, "project_id": namespace.project_id or ""})
+            return await _bridge_post(
+                "/snapshot", {"user_id": namespace.user_id, "project_id": namespace.project_id or ""}
+            )
         except McpLumenAuthorityError as exc:
             raise _plugin_error(exc) from exc
 
@@ -352,7 +396,9 @@ class _BridgeAuthority:
         except McpLumenAuthorityError as exc:
             raise _plugin_error(exc) from exc
 
-    async def claim(self, snapshot: dict[str, Any], name: str, arguments: dict[str, Any], idempotency_key: str) -> dict[str, Any]:
+    async def claim(
+        self, snapshot: dict[str, Any], name: str, arguments: dict[str, Any], idempotency_key: str
+    ) -> dict[str, Any]:
         try:
             return await _bridge_post(
                 "/execute",

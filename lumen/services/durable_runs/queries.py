@@ -9,10 +9,43 @@ from lumen.crypto import decrypt_chat_content
 from lumen.models.chat_assets import ChatAsset, ChatRunAsset
 from lumen.models.chat_contracts import ChatRunDescriptor, ChatRunEvent, ChatRunResponse
 from lumen.models.chat_runs import ChatRun, ChatTempThread
-from lumen.services.run_store import NONTERMINAL, RunStoreError, load_owned_run, replay_events
+from lumen.services.conversation_store import project_public_execution
+from lumen.services.run_store import (
+    NONTERMINAL,
+    RunStoreError,
+    load_owned_run,
+    read_public_activity_events,
+    replay_events,
+)
 
 from .common import _factory, _now, descriptor
 from .errors import DurableRunCursorExpired, DurableRunError, DurableRunNotFound
+
+
+async def owned_run_history_domain(*, run_id: str, project_id: str, user_id: str) -> str | None:
+    """Read admission's verified history domain without widening run ownership."""
+    async with _factory()() as session:
+        snapshot = await session.scalar(
+            select(ChatRun.capability_snapshot).where(
+                ChatRun.id == run_id, ChatRun.project_id == project_id, ChatRun.user_id == user_id,
+            )
+        )
+        if snapshot is None:
+            raise DurableRunNotFound("chat run was not found")
+        domain_id = snapshot.get("history_domain_id")
+        return domain_id if isinstance(domain_id, str) and domain_id else None
+
+
+async def owned_run_cancel_scopes(*, run_id: str, project_id: str, user_id: str) -> tuple[str, ...]:
+    from lumen.services.inference_authority import cancel_run_scopes
+
+    async with _factory()() as session:
+        try:
+            run = await load_owned_run(session, run_id, user_id=user_id, project_id=project_id)
+        except RunStoreError as exc:
+            raise DurableRunNotFound(str(exc)) from exc
+        payload = json.loads(decrypt_chat_content(run.request_payload)) if run.request_payload else {}
+        return cancel_run_scopes(run, payload)
 
 
 async def owned_run_response(*, run_id: str, project_id: str, user_id: str) -> ChatRunResponse:
@@ -124,6 +157,14 @@ async def owned_temp_thread(*, thread_id: str, project_id: str, user_id: str) ->
                 .limit(1)
             )
         ).scalar_one_or_none()
+        latest_execution = None
+        if latest is not None:
+            public_activity = await read_public_activity_events(session, [latest.id])
+            latest_execution = {
+                "run_id": latest.id, "run_kind": latest.run_kind or "completion",
+                "status": latest.status, "model_name": latest.model_name,
+                **project_public_execution(public_activity[latest.id], durations_ms={}, last_seq=latest.last_seq),
+            }
         return {
             "temp_thread_id": row.id,
             "public_history": history,
@@ -131,6 +172,7 @@ async def owned_temp_thread(*, thread_id: str, project_id: str, user_id: str) ->
             if latest and latest.status in NONTERMINAL
             else None,
             "latest_run": descriptor(latest).model_dump(mode="json") if latest else None,
+            "latest_run_execution": latest_execution,
         }
 
 

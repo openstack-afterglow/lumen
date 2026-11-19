@@ -18,9 +18,12 @@ import uuid
 from collections.abc import Mapping
 
 from lumen.services import conversation_store as cs
-from lumen.services import credit, litellm_client
+from lumen.services import credit, provider_client, provider_metadata
 from lumen.services import memory_store as ms
+from lumen.services.api_key_store import ApiKeyForbidden
+from lumen.services.inference_authority import authorize_run_generation_by_id
 from lumen.services.providers import routing as ps
+from lumen.services.providers.pricing import frozen_token_pricing
 
 logger = logging.getLogger(__name__)
 
@@ -149,8 +152,9 @@ async def generate_memory_if_applicable(
     project_id: str,
     run_id: str,
     user_id: str,
+    domain_id: str,
 ) -> list[dict] | None:
-    """Return validated deltas; only no-model/malformed output is a terminal no-op."""
+    """Return validated deltas; unconfigured models, denied authority and malformed output skip extraction."""
     try:
         resolved = await ps.resolve_memory_model()
     except Exception as exc:
@@ -159,7 +163,9 @@ async def generate_memory_if_applicable(
         return None
 
     try:
-        existing = await ms.list_memories(user_id=user_id, project_id=project_id)
+        existing = await ms.list_memories(
+            user_id=user_id, project_id=project_id, domain_id=domain_id, include_account=False,
+        )
         msgs = await cs.list_messages_for_run(run_id, user_id=user_id, project_id=project_id)
     except Exception as exc:
         raise MemoryExtractionRetryable("memory source loading failed") from exc
@@ -169,7 +175,6 @@ async def generate_memory_if_applicable(
         if (
             memory.get("is_active") is True
             and memory.get("scope") == "project"
-            and memory.get("project_id") == project_id
             and memory.get("status") == "active"
         )
     ][:_MAX_EXISTING]
@@ -198,15 +203,22 @@ async def generate_memory_if_applicable(
     model = resolved["model_name"]
 
     try:
-        response = await litellm_client.acompletion(
+        await authorize_run_generation_by_id(run_id=run_id, user_id=user_id, project_id=project_id, resolved=resolved)
+    except ApiKeyForbidden:
+        # Optional post-response work must not retry forbidden inference or alter the completed chat.
+        return None
+    try:
+        token_pricing = frozen_token_pricing(resolved)
+        response = await provider_client.acompletion(
             model,
             messages,
             custom_llm_provider=resolved.get("provider_type"),
             api_base=resolved.get("api_base"),
             api_key=resolved.get("api_key"),
             provider_auth=resolved.get("provider_auth"),
-            max_tokens=_MAX_TOKENS,
-            temperature=0.2,
+            max_tokens=None if resolved.get("provider_type") == "chatgpt" else _MAX_TOKENS,
+            temperature=None if resolved.get("provider_type") == "chatgpt" else 0.2,
+            extra={"capabilities_override": resolved.get("capabilities") or {}},
         )
     except Exception as exc:
         raise MemoryExtractionRetryable("memory model request failed") from exc
@@ -220,14 +232,17 @@ async def generate_memory_if_applicable(
         usage = getattr(response, "usage", None)
         if usage is None and isinstance(response, Mapping):
             usage = response.get("usage")
-        breakdown = litellm_client.extract_usage_breakdown(model, messages, text, usage)
+        breakdown = provider_metadata.extract_usage_breakdown(model, messages, text, usage)
         prompt_tokens, completion_tokens = breakdown.input_tokens, breakdown.output_tokens
-        usage_cost = litellm_client.cost_from_usage(
+        usage_cost = provider_metadata.cost_from_usage(
             model,
             prompt_tokens,
             completion_tokens,
             input_price_per_token=resolved.get("input_price_per_token"),
             output_price_per_token=resolved.get("output_price_per_token"),
+            input_price_per_token_above_200k=resolved.get("input_price_per_token_above_200k"),
+            output_price_per_token_above_200k=resolved.get("output_price_per_token_above_200k"),
+            long_context_threshold_tokens=resolved.get("long_context_threshold_tokens", 200_000),
             price_source=resolved.get("price_source"),
             provider_type=resolved.get("provider_type"),
             api_base=resolved.get("api_base"),
@@ -239,6 +254,11 @@ async def generate_memory_if_applicable(
             cache_write_price_per_token_above_200k=resolved.get("cache_write_price_per_token_above_200k"),
             cache_write_1h_price_per_token_above_200k=resolved.get("cache_write_1h_price_per_token_above_200k"),
             cache_price_sources=resolved.get("cache_price_sources"),
+            allow_catalog_cache=False,
+            allow_catalog_prices=False,
+            token_rates=token_pricing["token_rates"],
+            token_rates_above_200k=token_pricing.get("token_rates_above_200k"),
+            token_rates_follow_text=token_pricing.get("token_rates_follow_text") is True,
         )
         await credit.apply_usage(
             event_id=f"memory:{conversation_id}:{uuid.uuid4().hex}",
@@ -254,6 +274,7 @@ async def generate_memory_if_applicable(
             source="system",
             charge_wallet=False,
             breakdown=breakdown,
+            execution_route=resolved,
         )
     except Exception:
         logger.warning("메모리 추출 시스템 과금 기록 실패 conv=%s", conversation_id, exc_info=True)

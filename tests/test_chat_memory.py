@@ -38,6 +38,10 @@ class _AutomaticSession:
         self.calls += 1
         return _AutomaticResult(self.row if self.calls == 3 else None)
 
+    async def scalar(self, stmt):
+        assert "memory_vault_notes.domain_id" in str(stmt)
+        return self.row if self.row.scope == "project" else None
+
 
 def _automatic_row(**overrides):
     values = {
@@ -61,12 +65,12 @@ class TestAutomaticOps:
         session = _AutomaticSession(row)
         queued = []
 
-        async def fake_queue(_session, **kwargs):
+        async def fake_revise(_session, note, **kwargs):
+            note.content = kwargs["plaintext"]
             queued.append(kwargs)
 
         monkeypatch.setattr(ms, "decrypt_chat_content", lambda content: content)
-        monkeypatch.setattr(ms, "encrypt_chat_content", lambda content: content)
-        monkeypatch.setattr(ms, "_queue_semantic_mutation", fake_queue)
+        monkeypatch.setattr(ms.vs, "revise", fake_revise)
 
         applied = await ms.apply_automatic_ops_in_transaction(
             session,
@@ -86,6 +90,7 @@ class TestAutomaticOps:
             ],
             user_id="test-user-123",
             project_id="test-project-123",
+            domain_id="test-domain-123",
         )
 
         assert applied == {"add": 0, "update": 1, "delete": 0}
@@ -116,6 +121,7 @@ class TestAutomaticOps:
             ],
             user_id="test-user-123",
             project_id="test-project-123",
+            domain_id="test-domain-123",
         )
 
         assert applied == {"add": 0, "update": 0, "delete": 0}
@@ -143,6 +149,7 @@ class TestAutomaticOps:
             ],
             user_id="test-user-123",
             project_id="test-project-123",
+            domain_id="test-domain-123",
         )
 
         assert applied == {"add": 0, "update": 0, "delete": 0}
@@ -168,6 +175,7 @@ class TestAutomaticOps:
             ],
             user_id="test-user-123",
             project_id="test-project-123",
+            domain_id="test-domain-123",
         )
 
         assert applied == {"add": 0, "update": 0, "delete": 0}
@@ -258,6 +266,7 @@ class TestCrud:
         assert resp.status_code == 201
         assert captured["scope"] == "project"
         assert captured["project_id"] == "test-project-123"
+        assert captured["domain_id"] == "test-domain-123"
         assert captured["workspace_id"] is None
 
     async def test_create_and_update_accept_memory_category(self, client, monkeypatch):
@@ -275,7 +284,7 @@ class TestCrud:
         monkeypatch.setattr(ms, "update_memory", fake_update)
 
         created = await client.post(_URL, json={"content": "Rust를 자주 사용", "category": "development"})
-        updated = await client.patch(f"{_URL}/1", json={"category": "preference"})
+        updated = await client.patch(f"{_URL}/1", json={"category": "preference", "expectedHash": "a" * 64})
 
         assert created.status_code == 201
         assert updated.status_code == 200
@@ -286,6 +295,8 @@ class TestCrud:
             "project_id": "test-project-123",
             "patch": {"category": "preference"},
             "include_account": True,
+            "domain_id": "test-domain-123",
+            "expected_hash": "a" * 64,
         }
 
     async def test_account_scope_rejects_workspace_namespace(self, client):
@@ -321,6 +332,7 @@ class TestCrud:
 
         assert resp.status_code == 200
         assert captured["candidate"]["project_id"] == "test-project-123"
+        assert captured["candidate"]["domain_id"] == "test-domain-123"
         assert captured["candidate"]["workspace_id"] is None
         assert captured["candidate"]["limit"] == 20
         assert captured["hydrate"]["ids"] == [9, 4]
@@ -394,6 +406,7 @@ class TestCrud:
             "project_id": "test-project-123",
             "workspace_id": None,
             "include_account": True,
+            "domain_id": "test-domain-123",
         }
 
     async def test_update_forbidden_403(self, client, monkeypatch):

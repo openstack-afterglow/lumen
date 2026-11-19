@@ -12,11 +12,13 @@ from sqlalchemy.orm import aliased
 from lumen.config import get_settings
 from lumen.crypto import decrypt_chat_content
 from lumen.db import get_session_factory
-from lumen.models.chat_db import ChatMemory
 from lumen.models.chat_jobs import ChatMemoryOutbox
+from lumen.models.vault import VaultNote
+from lumen.services import auxiliary
 from lumen.services.memory_embeddings import embed_maintenance
 from lumen.services.memory_store import memory_content_fingerprint
 from lumen.services.semantic_memory import configured_memory_index
+from lumen.services.worker_routing import use_read_committed
 
 
 @dataclass(frozen=True)
@@ -33,16 +35,16 @@ class ClaimedMemoryMutation:
     active: bool
 
 
-def _snapshot(row: ChatMemoryOutbox, memory: ChatMemory | None) -> ClaimedMemoryMutation:
+def _snapshot(row: ChatMemoryOutbox, memory: VaultNote | None) -> ClaimedMemoryMutation:
     return ClaimedMemoryMutation(
         change_seq=row.change_seq,
-        memory_id=row.memory_id,
-        mutation=row.mutation,
+        memory_id=row.vault_note_id if row.vault_note_id is not None else row.memory_id,
+        mutation=row.mutation if row.vault_note_id is not None else "delete",
         content_hash=row.content_hash,
         required_generations=tuple(int(value) for value in row.required_generations),
         plaintext=decrypt_chat_content(memory.content) if memory and memory.content else None,
         user_id=memory.user_id if memory else None,
-        project_id=memory.project_id if memory else None,
+        project_id=memory.vector_project_id if memory else None,
         workspace_id=memory.workspace_id if memory else None,
         active=bool(memory and memory.status == "active" and memory.is_active),
     )
@@ -73,6 +75,8 @@ async def activate_pending_generations(session, *, required_generations: list[in
 async def claim_next(session, *, owner: str, lease_seconds: int = 60) -> ChatMemoryOutbox | None:
     """Claim the oldest queued/stale mutation under the caller's transaction."""
     now = datetime.now(UTC)
+    if await auxiliary.lock_admission(session, owner) is None:
+        return None
     prior = aliased(ChatMemoryOutbox)
     no_prior_mutation = (
         ~select(prior.change_seq)
@@ -94,6 +98,7 @@ async def claim_next(session, *, owner: str, lease_seconds: int = 60) -> ChatMem
             )
             .order_by(ChatMemoryOutbox.change_seq)
             .with_for_update(skip_locked=True)
+            .execution_options(populate_existing=True)
             .limit(1)
         )
     ).scalar_one_or_none()
@@ -111,15 +116,27 @@ async def claim_one(*, owner: str, lease_seconds: int = 60) -> ClaimedMemoryMuta
     if factory is None:
         return None
     required_generations = await configured_memory_index().required_generations()
+    return await _claim_snapshot(owner=owner, lease_seconds=lease_seconds, required_generations=required_generations)
+
+
+@auxiliary.retry_db
+async def _claim_snapshot(*, owner: str, lease_seconds: int, required_generations: list[int]):
+    factory = get_session_factory()
+    if factory is None:
+        return None
     async with factory() as session, session.begin():
+        await use_read_committed(session)
+        if await auxiliary.lock_admission(session, owner) is None:
+            return None
         await activate_pending_generations(session, required_generations=required_generations)
         row = await claim_next(session, owner=owner, lease_seconds=lease_seconds)
         if row is None:
             return None
-        memory = await session.get(ChatMemory, row.memory_id)
+        memory = await session.get(VaultNote, row.vault_note_id) if row.vault_note_id is not None else None
         return _snapshot(row, memory)
 
 
+@auxiliary.retry_db
 async def _finish_claim(
     claim: ClaimedMemoryMutation,
     *,
@@ -132,12 +149,12 @@ async def _finish_claim(
     if factory is None:
         return
     async with factory() as session, session.begin():
-        row = await session.get(ChatMemoryOutbox, claim.change_seq, with_for_update=True)
+        row = await session.get(ChatMemoryOutbox, claim.change_seq, with_for_update=True, populate_existing=True)
         if row is None or row.status != "running" or row.lease_owner != owner:
             return
 
-        current = await session.get(ChatMemory, row.memory_id)
-        stale_upsert = row.mutation == "upsert" and (
+        current = await session.get(VaultNote, row.vault_note_id) if row.vault_note_id is not None else None
+        stale_upsert = row.vault_note_id is not None and row.mutation == "upsert" and (
             current is None
             or current.status != "active"
             or not current.content
@@ -149,11 +166,7 @@ async def _finish_claim(
         if row.status == "completed":
             row.lease_owner = None
             row.lease_expires_at = None
-            if row.mutation == "delete" and current is not None and current.status == "deleting":
-                # The FK prevents ciphertext removal until this completed event is gone.
-                await session.delete(row)
-                await session.flush()
-                await session.delete(current)
+            # The immutable Vault revision history owns archived ciphertext.
             return
         row.attempts += 1
         row.error_code = error_code or "memory_vector_apply_failed"
@@ -191,11 +204,17 @@ async def _apply_snapshot(claim: ClaimedMemoryMutation) -> set[int]:
     return applied
 
 
+@auxiliary.worker_step
 async def process_one(*, owner: str) -> bool:
     """Process one ordered mutation; false means no committed claim was available."""
     claim = await claim_one(owner=owner)
     if claim is None:
         return False
+    async with auxiliary.keep_lease(owner=owner, model=ChatMemoryOutbox, key=claim.change_seq):
+        return await _process_claimed(claim, owner=owner)
+
+
+async def _process_claimed(claim: ClaimedMemoryMutation, *, owner: str) -> bool:
     try:
         applied = await _apply_snapshot(claim)
     except Exception:
@@ -219,34 +238,3 @@ def mark_generation_applied(row: ChatMemoryOutbox, *, generation: int) -> bool:
         row.lease_expires_at = None
         return True
     return False
-
-
-async def apply_claimed(session, row: ChatMemoryOutbox) -> bool:
-    """Apply an outbox row to all frozen generations using the maintenance route."""
-    if row.status != "running" or not row.required_generations:
-        raise ValueError("outbox row is not ready for vector application")
-    memory = await session.get(ChatMemory, row.memory_id)
-    index = configured_memory_index()
-    for generation in row.required_generations:
-        if row.mutation == "delete" or memory is None or memory.status != "active" or not memory.content:
-            await index.delete(generation=int(generation), memory_id=row.memory_id)
-        else:
-            content = decrypt_chat_content(memory.content)
-            if memory_content_fingerprint(content) != row.content_hash:
-                mark_generation_applied(row, generation=int(generation))
-                continue
-            embedding = await embed_maintenance(content)
-            await index.upsert(
-                MemoryVector(
-                    memory_id=memory.id,
-                    generation=int(generation),
-                    user_id=memory.user_id,
-                    project_id=memory.project_id,
-                    workspace_id=memory.workspace_id,
-                    embedding=embedding,
-                    embedding_model=get_settings().chat_memory_embedding_model,
-                    content_hash=row.content_hash,
-                )
-            )
-        mark_generation_applied(row, generation=int(generation))
-    return row.status == "completed"

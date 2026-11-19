@@ -1,0 +1,12 @@
+#!/bin/bash
+set -euo pipefail
+source_dir=/tmp/in_target.d/lumen-guest
+# Do not apt-resolve missing dependencies: every extra package must be in the lock.
+(cd "$source_dir/packages" && sha256sum --check --strict SHA256SUMS)
+dpkg --install "$source_dir/packages/"*.deb
+install -d -o root -g root -m 0755 /usr/share/lumen-guest /usr/local/libexec
+install -o root -g root -m 0600 "$source_dir/image.tar" /usr/share/lumen-guest/image.tar
+install -o root -g root -m 0644 "$source_dir/image.json" /usr/share/lumen-guest/image.json
+install -o root -g root -m 0755 "$source_dir/guest-run.sh" /usr/local/libexec/lumen-guest-run
+install -o root -g root -m 0644 "$source_dir/guest-settings.py" /usr/local/libexec/lumen-guest-settings.py
+install -o root -g root -m 0644 "$source_dir/lumen-guest.service" /etc/systemd/system/lumen-guest.service

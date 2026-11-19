@@ -1,5 +1,6 @@
 """Lumen ORM and Contract Models."""
 
+from lumen.models.billing import DomainCreditLedger, DomainCreditPool
 from lumen.models.chat_agent_platform import (
     ChatCodeWorkspace,
     ChatCodeWorkspaceAsset,
@@ -12,6 +13,7 @@ from lumen.models.chat_agent_platform import (
     ChatRunInteraction,
 )
 from lumen.models.chat_assets import ChatAsset, ChatMessageAsset, ChatRunAsset
+from lumen.models.chat_batches import ChatBatch, ChatBatchFile, ChatBatchItem, ChatBatchProjectQueue
 from lumen.models.chat_contracts import *  # noqa: F403
 from lumen.models.chat_db import (
     ChatAgent,
@@ -21,6 +23,7 @@ from lumen.models.chat_db import (
     ChatConversationMessage,
     ChatCustomTool,
     ChatGatewayDeviceGrant,
+    ChatMcpActivation,
     ChatMcpOAuthConnection,
     ChatMcpOAuthRequest,
     ChatMcpServer,
@@ -29,12 +32,15 @@ from lumen.models.chat_db import (
     ChatMessage,
     ChatMessageGraph,
     ChatPluginBinding,
+    ChatProviderUsage,
     ChatQuotaPolicy,
     ChatSkill,
     ChatUsageLog,
     ChatWorkspace,
     LlmModel,
     LlmProvider,
+    LlmProviderAccount,
+    LlmProviderCredential,
     UserWallet,
 )
 from lumen.models.chat_infrastructure import (
@@ -58,9 +64,15 @@ from lumen.models.chat_runs import (
     ChatTempThread,
     ChatToolApproval,
 )
+from lumen.models.stateless_reservations import StatelessCallReservation
+from lumen.models.vault import VaultNote, VaultRevision
 
 __all__ = [
+    "VaultNote",
+    "VaultRevision",
     "LlmProvider",
+    "LlmProviderAccount",
+    "LlmProviderCredential",
     "LlmModel",
     "ChatConversation",
     "ChatConversationActivePath",
@@ -68,9 +80,14 @@ __all__ = [
     "ChatMessage",
     "ChatMessageGraph",
     "ChatUsageLog",
+    "ChatProviderUsage",
     "ChatQuotaPolicy",
+    "StatelessCallReservation",
+    "DomainCreditLedger",
+    "DomainCreditPool",
     "UserWallet",
     "ChatMcpServer",
+    "ChatMcpActivation",
     "ChatMcpOAuthConnection",
     "ChatMcpOAuthRequest",
     "ChatApiKey",
@@ -96,6 +113,10 @@ __all__ = [
     "ChatAsset",
     "ChatMessageAsset",
     "ChatRunAsset",
+    "ChatBatch",
+    "ChatBatchFile",
+    "ChatBatchItem",
+    "ChatBatchProjectQueue",
     "ChatRunInteraction",
     "ChatContextCheckpoint",
     "ChatGitCredential",

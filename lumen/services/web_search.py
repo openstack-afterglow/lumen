@@ -1,4 +1,4 @@
-"""Managed LiteLLM web-search adapter with canonical citation metadata."""
+"""Managed standalone search with canonical, domain-filtered citation metadata."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 from lumen.services.providers import routing as ps
+from lumen.services.providers import search_transport
 
 _CONTEXT_TOKEN_LIMITS = {"low": 512, "medium": 2048, "high": 4096}
 
@@ -59,35 +60,25 @@ async def search_with_route(
     """Run only the user-selected provider route and normalize its safe citations."""
     if context_size not in _CONTEXT_TOKEN_LIMITS:
         raise ManagedSearchError("unsupported search context size")
-    if route.get("provider_auth") is not None:
-        raise ManagedSearchError("subscription providers do not support managed search")
     try:
-        import litellm
-
-        response = await litellm.asearch(
-            query=query,
-            search_provider=route["provider_type"],
-            search_domain_filter=list(allowed_domains) or None,
-            max_tokens_per_page=_CONTEXT_TOKEN_LIMITS[context_size],
-            country=country,
-            api_key=route.get("api_key"),
-            api_base=route.get("api_base"),
-            timeout=15,
+        response = await search_transport.search(
+            route, query, allowed_domains=allowed_domains, country=country,
+            max_tokens=_CONTEXT_TOKEN_LIMITS[context_size],
         )
     except Exception as exc:
         raise ManagedSearchError("managed search provider request failed") from exc
 
     citations: list[SearchCitation] = []
-    for result in getattr(response, "results", ()) or ():
+    for result in response:
         url = _safe_result_url(
-            getattr(result, "url", None),
+            result.get("url"),
             allowed_domains=allowed_domains,
             blocked_domains=blocked_domains,
         )
         if url is None:
             continue
-        title = getattr(result, "title", None)
-        snippet = getattr(result, "snippet", None)
+        title = result.get("title")
+        snippet = result.get("snippet")
         citations.append(
             SearchCitation(
                 url=url,
@@ -108,7 +99,7 @@ async def search_selected_provider(
     country: str | None,
 ) -> tuple[dict, list[SearchCitation]]:
     """Resolve exactly one active selected provider; never fall back to the executor."""
-    route = await ps.get_active_provider_route(provider_id)
+    route = await ps.get_active_provider_route(provider_id, required_capabilities=("search",))
     if route is None:
         raise ManagedSearchError("selected search provider is unavailable")
     return route, await search_with_route(

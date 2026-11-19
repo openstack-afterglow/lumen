@@ -20,16 +20,17 @@ from fastapi import APIRouter, HTTPException, Request
 from sqlalchemy import select
 
 from lumen.db import get_session_factory
-from lumen.models.chat_infrastructure import ChatRuntimeResource, ChatWorkerRegistration
+from lumen.models.chat_infrastructure import ChatRuntimePool, ChatRuntimeResource, ChatWorkerRegistration
 from lumen.models.chat_runs import ChatRun
 from lumen.services.infrastructure.config import RuntimeConfig
+from lumen.services.infrastructure.identity import IdentityRejected, accepts_fingerprint, peer_resource_id
 from lumen.services.infrastructure.transport import (
     InternalTransport,
     InternalTransportError,
     derive_dispatch_key,
-    resource_identity,
     sign_dispatch_capability,
 )
+from lumen.services.sandbox_selection import SandboxSelectionError, validate_selection
 
 _MAX_CAPABILITY_RESPONSE = 4096
 
@@ -58,6 +59,37 @@ def _fence_from_lease_owner(lease_owner: str) -> int:
     return int(suffix)
 
 
+def _authorize_selected_tool(
+    config: RuntimeConfig, run: ChatRun, resource: ChatRuntimeResource,
+    pool: ChatRuntimePool | None, body: dict[str, Any] | None,
+) -> None:
+    snapshot = run.capability_snapshot
+    try:
+        selected = validate_selection(
+            snapshot.get("sandbox_tools") if isinstance(snapshot, dict) else None, config=config,
+        )
+    except SandboxSelectionError:
+        raise DispatchRejected("dispatch unavailable") from None
+    if not isinstance(body, dict):
+        raise DispatchRejected("dispatch unavailable")
+    match = next((item for item in selected
+                  if item["name"] == body.get("tool") and item["profile"] == body.get("profile")), None)
+    if match is None or pool is None:
+        raise DispatchRejected("dispatch unavailable")
+    configured = config.pool(match["pool"])
+    cluster = config.kubernetes_cluster(configured.profile.cluster_profile_id)
+    if (
+        pool.deployment_id != config.deployment_id or pool.name != match["pool"]
+        or not pool.enabled or pool.role != "sandbox" or pool.backend != "kubernetes"
+        or resource.backend != "kubernetes" or resource.pool_id != pool.id
+        or pool.image_ref != match["image"] or resource.image_ref != match["image"]
+        or pool.profile_digest != match["pool_digest"] or resource.policy_digest != match["pool_digest"]
+        or pool.cluster_profile_id != cluster.id or resource.cluster_profile_id != cluster.id
+        or pool.namespace != cluster.namespace or resource.namespace != cluster.namespace
+    ):
+        raise DispatchRejected("dispatch unavailable")
+
+
 async def authorize_dispatch(
     config: RuntimeConfig, *, client_identity: str, client_fingerprint: str,
     run_id: str, lease_owner: str, resource_id: str, generation: int,
@@ -70,6 +102,20 @@ async def authorize_dispatch(
     if factory is None:
         raise RuntimeError("database is not configured")
     now = datetime.now(UTC)
+    is_fixed_worker = False
+    worker_id = None
+    worker_generation = None
+    try:
+        worker_id, worker_generation, role = peer_resource_id(client_identity)
+        if role != "worker":
+            raise IdentityRejected()
+    except IdentityRejected:
+        from lumen.services.infrastructure.fixed_worker import approved_peer
+
+        if approved_peer(config, client_identity, client_fingerprint):
+            is_fixed_worker = True
+        else:
+            raise DispatchRejected("dispatch unavailable") from None
     async with factory() as session:
         run = (await session.execute(select(ChatRun).where(ChatRun.id == run_id))).scalar_one_or_none()
         if (
@@ -89,37 +135,77 @@ async def authorize_dispatch(
         ))).scalar_one_or_none()
         if resource is None or not resource.address or not resource.certificate_fingerprint:
             raise DispatchRejected("dispatch unavailable")
-        worker = (await session.execute(select(ChatRuntimeResource).where(
-            ChatRuntimeResource.role == "worker", ChatRuntimeResource.observed_state == "ready",
-            ChatRuntimeResource.desired_state != "deleting",
-            ChatRuntimeResource.certificate_fingerprint == client_fingerprint,
-        ))).scalars().first()
-        if worker is None or client_identity != resource_identity("worker", worker.id, worker.generation):
+        kubernetes = resource.backend == "kubernetes"
+        deadlines = [run.lease_expires_at]
+        for deadline in (run.deadline_at, root.deadline_at, resource.deadline_at, resource.certificate_not_after):
+            if deadline is None:
+                if kubernetes:
+                    raise DispatchRejected("dispatch unavailable")
+            else:
+                deadlines.append(deadline)
+        if any(_utc(deadline) <= now for deadline in deadlines):
             raise DispatchRejected("dispatch unavailable")
-        registration = (await session.execute(select(ChatWorkerRegistration).where(
-            ChatWorkerRegistration.resource_id == worker.id,
-            ChatWorkerRegistration.resource_generation == worker.generation,
-            ChatWorkerRegistration.certificate_fingerprint == client_fingerprint,
-            ChatWorkerRegistration.pool_id == worker.pool_id,
-            ChatWorkerRegistration.worker_identity == lease_owner.rpartition("#")[0],
-            # Drain forbids new claims, not capabilities for this already running lease.
-            ChatWorkerRegistration.heartbeat_at >= now - timedelta(seconds=20),
-        ))).scalars().first()
-        if registration is None:
+        if kubernetes and (
+            root.status in {"completed", "failed", "canceled", "finalizing"}
+            or (method == "POST" and path == "/v1/executions")
+        ):
             raise DispatchRejected("dispatch unavailable")
+        if method == "POST" and path == "/v1/mcp/executions":
+            pool = await session.get(ChatRuntimePool, resource.pool_id)
+            _authorize_selected_tool(config, run, resource, pool, body)
+        if is_fixed_worker:
+            registration = (await session.execute(select(ChatWorkerRegistration).where(
+                ChatWorkerRegistration.id == run.worker_registration_id,
+                ChatWorkerRegistration.resource_id.is_(None),
+                ChatWorkerRegistration.certificate_fingerprint == client_fingerprint,
+                ChatWorkerRegistration.worker_identity == lease_owner.rpartition("#")[0],
+                ChatWorkerRegistration.heartbeat_at >= now - timedelta(seconds=20),
+            ))).scalars().first()
+            if registration is None:
+                raise DispatchRejected("dispatch unavailable")
+        else:
+            worker = (await session.execute(select(ChatRuntimeResource).where(
+                ChatRuntimeResource.id == worker_id, ChatRuntimeResource.generation == worker_generation,
+                ChatRuntimeResource.role == "worker", ChatRuntimeResource.observed_state.in_(["ready", "draining"]),
+                ChatRuntimeResource.desired_state != "deleting",
+            ))).scalars().first()
+            if worker is None or not accepts_fingerprint(worker, client_fingerprint, now=now):
+                raise DispatchRejected("dispatch unavailable")
+            registration = (await session.execute(select(ChatWorkerRegistration).where(
+                ChatWorkerRegistration.id == run.worker_registration_id,
+                ChatWorkerRegistration.resource_id == worker.id,
+                ChatWorkerRegistration.resource_generation == worker.generation,
+                ChatWorkerRegistration.certificate_fingerprint == worker.certificate_fingerprint,
+                ChatWorkerRegistration.pool_id == worker.pool_id,
+                ChatWorkerRegistration.worker_identity == lease_owner.rpartition("#")[0],
+                # Drain forbids new claims, not capabilities for this already running lease.
+                ChatWorkerRegistration.heartbeat_at >= now - timedelta(seconds=20),
+            ))).scalars().first()
+            if registration is None:
+                raise DispatchRejected("dispatch unavailable")
     if config.dispatch_key is None:
         raise RuntimeError("controller dispatch key is not configured")
     try:
         key = derive_dispatch_key(config.dispatch_key, resource_id=resource.id, run_id=run.id, generation=generation)
+        issued_at = int(time.time())
+        deadline_epoch = min(int(_utc(deadline).timestamp()) for deadline in deadlines)
+        ttl_seconds = min(15, deadline_epoch - issued_at)
+        if ttl_seconds < 1:
+            raise DispatchRejected("dispatch unavailable")
         capability = sign_dispatch_capability(
             key, resource_id=resource.id, run_id=run.id, generation=generation, method=method, path=path,
             fence=fence, body=body, call_id=call_id, workspace_revision=workspace_revision,
+            ttl_seconds=ttl_seconds,
         )
+        # The signer reads its own clock. Never return a grant past the hard bound.
+        expires_at = int(time.time()) + ttl_seconds
+        if expires_at > deadline_epoch:
+            raise DispatchRejected("dispatch unavailable")
     except InternalTransportError as exc:
         raise DispatchRejected("dispatch unavailable") from exc
     return CapabilityGrant(
         capability=capability, address=resource.address, port=resource.port or config.listen_port,
-        certificate_fingerprint=resource.certificate_fingerprint, exp=int(time.time()) + 15,
+        certificate_fingerprint=resource.certificate_fingerprint, exp=expires_at,
     )
 
 

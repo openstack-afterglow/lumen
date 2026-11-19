@@ -9,14 +9,17 @@ from __future__ import annotations
 import re
 from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Literal
+from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field, SecretStr, field_validator, model_validator
+from pydantic_core import PydanticCustomError
 
 from lumen.auth import require_admin
-from lumen.services import model_discovery, models_dev
-from lumen.services.providers import billing, credentials, errors, repository, subscriptions
+from lumen.services import model_discovery
+from lumen.services.native_catalog import ModelKind, catalog_response, validate_embedding_metadata
+from lumen.services.providers import accounts, billing, credentials, errors, repository, routing, subscriptions
+from lumen.services.providers.pricing import domain_billing_readiness, frozen_token_pricing
 
 _PER_TOKEN_QUANTUM = Decimal("0.0000000001")
 _TOKENS_PER_MILLION = Decimal("1000000")
@@ -28,7 +31,7 @@ _CLAUDE_SUBSCRIPTION_TOKEN = re.compile(r"sk-ant-oat[A-Za-z0-9._-]*\Z")
 # --- 프로바이더 ---
 class ProviderCreateRequest(BaseModel):
     name: str = Field(..., max_length=100)
-    provider_type: str = Field(default="openai", max_length=40)  # litellm custom_llm_provider
+    provider_type: str = Field(default="openai", max_length=40)
     api_provider: str = Field(default="openai", max_length=40)
     sort_order: int = Field(default=0, strict=True, ge=0, le=2147483647)
     auth_mode: Literal["api_key", "chatgpt_device", "anthropic_subscription"] = "api_key"
@@ -38,6 +41,7 @@ class ProviderCreateRequest(BaseModel):
     billing_admin_key: str | None = Field(default=None, max_length=1000)
     margin_multiplier: float = Field(default=1.0, ge=0)
     is_active: bool = True
+    selection_policy: Literal["priority", "weighted"] = "priority"
 
     model_config = {"extra": "forbid"}
 
@@ -45,6 +49,14 @@ class ProviderCreateRequest(BaseModel):
     @classmethod
     def validate_name(cls, value):
         return repository.validate_provider_name(value)
+
+    @field_validator("provider_type", mode="before")
+    @classmethod
+    def validate_provider_type(cls, value):
+        try:
+            return repository.validate_provider_type(value)
+        except errors.UnsupportedProviderTypeError as exc:
+            raise PydanticCustomError(exc.code, str(exc)) from None
 
     @field_validator("api_provider", mode="before")
     @classmethod
@@ -86,6 +98,8 @@ class ProviderUpdateRequest(BaseModel):
     billing_admin_key: str | None = Field(default=None, max_length=1000)
     margin_multiplier: float | None = Field(default=None, ge=0)
     is_active: bool | None = None
+    selection_policy: Literal["explicit", "priority", "weighted"] | None = None
+    selected_credential_id: int | None = Field(default=None, strict=True, gt=0)
 
     model_config = {"extra": "forbid"}
 
@@ -93,6 +107,14 @@ class ProviderUpdateRequest(BaseModel):
     @classmethod
     def validate_name(cls, value):
         return repository.validate_provider_name(value)
+
+    @field_validator("provider_type", mode="before")
+    @classmethod
+    def validate_provider_type(cls, value):
+        try:
+            return repository.validate_provider_type(value)
+        except errors.UnsupportedProviderTypeError as exc:
+            raise PydanticCustomError(exc.code, str(exc)) from None
 
     @field_validator("api_provider", mode="before")
     @classmethod
@@ -123,6 +145,7 @@ class ProviderResponse(BaseModel):
     id: int
     name: str
     provider_type: str
+    provider_family: Literal["native", "compatible"] = "native"
     api_provider: str
     sort_order: int = 0
     api_base: str | None
@@ -138,8 +161,6 @@ class ProviderResponse(BaseModel):
     margin_multiplier: float
     billing_capability: (
         Literal[
-            "openrouter_key",
-            "deepseek_balance",
             "openai_admin_usage",
             "anthropic_admin_usage",
         ]
@@ -147,7 +168,8 @@ class ProviderResponse(BaseModel):
     ) = None
     created_at: str | None
     updated_at: str | None
-    models_dev_provider_id: str | None = None
+    selection_policy: Literal["explicit", "priority", "weighted"] = "priority"
+    selected_credential_id: int | None = None
 
 
 class ProviderBillingBalance(BaseModel):
@@ -227,8 +249,6 @@ class ProviderBillingResponse(BaseModel):
     provider_type: str
     capability: (
         Literal[
-            "openrouter_key",
-            "deepseek_balance",
             "openai_admin_usage",
             "anthropic_admin_usage",
         ]
@@ -308,11 +328,21 @@ class CapabilitiesInput(BaseModel):
     reasoning: bool = False
     tool_call: bool = False
     attachment: bool = False
+    decisions: bool = False
+    prompt_caching: bool | None = None
+    structured_output: bool | None = None
+    web_search: bool | None = None
     modalities: dict | None = None
     reasoning_options: list = Field(default_factory=list)
     context_limit: int | None = Field(default=None, ge=0)
+    embedding: dict | None = None
 
     model_config = {"extra": "forbid"}
+
+    @field_validator("embedding")
+    @classmethod
+    def validate_embedding(cls, value: dict | None) -> dict | None:
+        return validate_embedding_metadata(value)
 
 
 class ModelCreateRequest(BaseModel):
@@ -320,13 +350,13 @@ class ModelCreateRequest(BaseModel):
     model_name: str = Field(..., max_length=190)
     display_name: str | None = Field(default=None, max_length=150)
     sort_order: int = Field(default=0, strict=True, ge=0, le=2147483647)
-    model_kind: Literal["text", "image", "tts", "stt", "realtime"] = "text"
+    model_kind: ModelKind = "text"
     media_pricing: dict | None = None
     input_price_per_million: Decimal | None = Field(default=None, ge=0)
     output_price_per_million: Decimal | None = Field(default=None, ge=0)
-    # Optional prompt-cache rates, independent of each other and of the input/output pair.
-    # Unset rates use the exact direct-provider catalog; unset cache read then stays
-    # unpriced, while unset writes inherit input (5m) and then 5m (1h) for new runs.
+    # Optional prompt-cache rates, independent of each other and of input/output prices.
+    # Unset rates use the exact native catalog; cache read otherwise stays unpriced.
+    # Text writes then inherit input (short TTL) and short-TTL writes (long TTL).
     cache_read_price_per_million: Decimal | None = Field(default=None, ge=0)
     cache_write_price_per_million: Decimal | None = Field(default=None, ge=0)
     cache_write_1h_price_per_million: Decimal | None = Field(default=None, ge=0)
@@ -336,7 +366,7 @@ class ModelCreateRequest(BaseModel):
     def _kind_prices(self):
         # Media models may price text input/output/cache-read for a token basis; the
         # repository validates media_pricing per kind (text allows token_rates only).
-        if self.model_kind != "text" and any(getattr(self, field) is not None for field in (
+        if self.model_kind not in {"text", "decision"} and any(getattr(self, field) is not None for field in (
             "cache_write_price_per_million", "cache_write_1h_price_per_million",
         )):
             raise ValueError("media 모델에는 cache write 가격을 설정할 수 없습니다")
@@ -364,26 +394,18 @@ class ModelCreateRequest(BaseModel):
             raise ValueError("가격이 저장 정밀도보다 작습니다")
         return value
 
-    @model_validator(mode="after")
-    def _price_pair(self):
-        if self.model_kind == "text" and (self.input_price_per_million is None) != (
-            self.output_price_per_million is None
-        ):
-            raise ValueError("입력·출력 가격은 함께 설정하거나 함께 비워야 합니다")
-        return self
-
 
 class ModelUpdateRequest(BaseModel):
     model_name: str | None = Field(default=None, max_length=190)
     display_name: str | None = Field(default=None, max_length=150)
     sort_order: int | None = Field(default=None, strict=True, ge=0, le=2147483647)
-    model_kind: Literal["text", "image", "tts", "stt", "realtime"] | None = None
+    model_kind: ModelKind | None = None
     media_pricing: dict | None = None
     input_price_per_million: Decimal | None = Field(default=None, ge=0)
     output_price_per_million: Decimal | None = Field(default=None, ge=0)
-    # Optional prompt-cache rates, independent of each other and of the input/output pair.
-    # Unset rates use the exact direct-provider catalog; unset cache read then stays
-    # unpriced, while unset writes inherit input (5m) and then 5m (1h) for new runs.
+    # Optional prompt-cache rates, independent of each other and of input/output prices.
+    # Unset rates use the exact native catalog; cache read otherwise stays unpriced.
+    # Text writes then inherit input (short TTL) and short-TTL writes (long TTL).
     cache_read_price_per_million: Decimal | None = Field(default=None, ge=0)
     cache_write_price_per_million: Decimal | None = Field(default=None, ge=0)
     cache_write_1h_price_per_million: Decimal | None = Field(default=None, ge=0)
@@ -416,29 +438,42 @@ class ModelUpdateRequest(BaseModel):
             raise ValueError("가격이 저장 정밀도보다 작습니다")
         return value
 
-    @model_validator(mode="after")
-    def _price_pair(self):
-        # A PATCH may target a media model whose text directions are priced
-        # independently; the repository enforces the text pair on the stored kind.
-        price_fields = {"input_price_per_million", "output_price_per_million"}
-        if self.model_kind != "text" or not self.model_fields_set & price_fields:
-            return self
-        if not price_fields <= self.model_fields_set or (
-            (self.input_price_per_million is None) != (self.output_price_per_million is None)
-        ):
-            raise ValueError("입력·출력 가격은 함께 설정하거나 함께 비워야 합니다")
-        return self
+
+class ModelReorderRequest(BaseModel):
+    provider_id: int = Field(strict=True, gt=0, le=9223372036854775807)
+    expected_model_ids: list[Annotated[int, Field(strict=True, gt=0, le=9223372036854775807)]] = Field(
+        min_length=1, max_length=500,
+    )
+    model_ids: list[Annotated[int, Field(strict=True, gt=0, le=9223372036854775807)]] = Field(
+        min_length=1, max_length=500,
+    )
+
+    model_config = {"protected_namespaces": (), "extra": "forbid"}
+
+    @field_validator("expected_model_ids", "model_ids")
+    @classmethod
+    def validate_model_order(cls, value):
+        return repository.validate_model_order(value)
 
 
 class ModelResponse(BaseModel):
     id: int
     provider_id: int
     model_name: str
-    model_kind: Literal["text", "image", "tts", "stt", "realtime"] = "text"
+    model_kind: ModelKind = "text"
     media_pricing: dict | None = None
+    effective_media_pricing: dict | None = None
+    effective_media_price_sources: dict = Field(default_factory=dict)
+    effective_text_price_sources: dict[str, Literal["manual", "catalog"]] = Field(default_factory=dict)
+    # Image rows only: priced choices this provider/model can execute, independent of credentials.
+    image_pricing_readiness: dict | None = None
     api_model_name: str
     api_provider: str
     provider_type: str | None = None
+    provider_family: Literal["native", "compatible"] = "native"
+    price_origin: Literal["manual", "native_catalog"] | None = None
+    catalog_version: str | None = None
+    catalog_entry: dict | None = None
     provider_sort_order: int = 0
     sort_order: int = 0
     display_name: str | None
@@ -458,29 +493,82 @@ class ModelResponse(BaseModel):
     effective_cache_write_price_per_million: Decimal | None = None
     effective_cache_write_1h_price_per_million: Decimal | None = None
     effective_cache_price_sources: dict[str, str | None] | None = None
-    models_dev_model_id: str | None = None
     price_source: str | None = None
     capabilities: dict | None = None
     capability_source: str | None = None
     effective_capabilities: dict | None = None
     effective_capability_source: str | None = None
+    # Text models only: {"ready", "reason_code"}; set capabilities.context_limit to fix context_limit_unknown.
+    domain_billing: dict | None = None
     created_at: str | None
     updated_at: str | None
 
     model_config = {"protected_namespaces": ()}
 
 
-class ModelsDevImportSelection(BaseModel):
-    local_model_id: int
-    models_dev_model_id: str = Field(..., min_length=1, max_length=190)
+class NativeCatalogEmbedding(BaseModel):
+    """Published embedding dimensions; null means the provider did not publish a constraint."""
+
+    default_dimensions: int | None
+    supports_dimensions: bool
+    min_dimensions: int | None
+    max_dimensions: int | None
+    allowed_dimensions: list[int] | None
 
 
-class ModelsDevImportRequest(BaseModel):
-    local_provider_id: int
-    models_dev_provider_id: str = Field(..., min_length=1, max_length=100)
-    selections: list[ModelsDevImportSelection] = Field(..., min_length=1, max_length=500)
+class NativeCatalogTokenPrices(BaseModel):
+    """Published USD prices per million tokens, preserved as decimal strings."""
 
-    model_config = {"extra": "forbid"}
+    input: str | None = None
+    output: str | None = None
+    cache_read: str | None = None
+    cache_write: str | None = None
+    cache_write_long: str | None = None
+
+
+class NativeCatalogLongContextPrices(NativeCatalogTokenPrices):
+    threshold_tokens: int
+    token_rates: dict[str, dict[str, str | None]] | None = None
+
+
+class NativeCatalogTokenPricing(NativeCatalogTokenPrices):
+    cache_write_ttl: str | None = None
+    cache_write_long_ttl: str | None = None
+    long_context: NativeCatalogLongContextPrices | None = None
+
+
+class NativeCatalogModel(BaseModel):
+    id: str
+    aliases: list[str]
+    kind: ModelKind
+    display_name: str
+    status: Literal["active", "preview", "deprecated"]
+    context_window: int | None
+    max_input_tokens: int | None = None
+    max_output_tokens: int | None
+    input_modalities: list[str] | None
+    output_modalities: list[str] | None
+    capabilities: dict[str, bool]
+    reasoning_options: list[dict] | None = None
+    embedding: NativeCatalogEmbedding | None = None
+    token_pricing: NativeCatalogTokenPricing | None
+    media_pricing: dict | None
+    source_urls: list[str]
+    verified_at: str
+    notes: str | None
+
+
+class NativeCatalogProvider(BaseModel):
+    provider_type: Literal["openai", "anthropic", "gemini", "perplexity"]
+    display_name: str
+    pricing_sources: list[str]
+    models: list[NativeCatalogModel]
+
+
+class NativeCatalogResponse(BaseModel):
+    schema_version: Literal[1]
+    catalog_version: str
+    providers: list[NativeCatalogProvider]
 
 
 class TitleModelRequest(BaseModel):
@@ -551,6 +639,8 @@ async def list_provider_billing():
 async def create_provider(payload: ProviderCreateRequest):
     try:
         return await repository.create_provider(**payload.model_dump())
+    except errors.UnsupportedProviderTypeError as exc:
+        raise HTTPException(status_code=422, detail={"code": exc.code, "message": str(exc)}) from exc
     except errors.ProviderValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except errors.ChatStorageUnavailable as exc:
@@ -565,6 +655,8 @@ async def update_provider(provider_id: int, payload: ProviderUpdateRequest):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except errors.ActiveRunConfigurationConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except errors.UnsupportedProviderTypeError as exc:
+        raise HTTPException(status_code=422, detail={"code": exc.code, "message": str(exc)}) from exc
     except errors.ProviderValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except errors.ChatStorageUnavailable as exc:
@@ -708,7 +800,7 @@ async def delete_provider(provider_id: int):
 
 
 class AvailableModelCandidate(BaseModel):
-    """Additive discovery candidate — factual provider metadata only, never capability/price."""
+    """Live provider IDs with reviewed native metadata, or unannotated compatible IDs."""
 
     id: str
     display_name: str | None = None
@@ -716,8 +808,18 @@ class AvailableModelCandidate(BaseModel):
     generation_methods: list[str] = Field(default_factory=list)
     input_token_limit: int | None = None
     output_token_limit: int | None = None
-    # Classified from the exact installed catalog mode; ``None`` stays manually selectable.
-    model_kind: Literal["text", "image", "tts", "stt", "realtime"] | None = None
+    # Classified from the reviewed catalog or a definitive provider method.
+    model_kind: ModelKind | None = None
+    provider_family: Literal["native", "compatible"] = "native"
+    requires_manual_pricing: bool = False
+    status: str | None = None
+    token_pricing: dict | None = None
+    media_pricing: dict | None = None
+    capabilities: dict | None = None
+    source_urls: list[str] = Field(default_factory=list)
+    verified_at: str | None = None
+    catalog_version: str | None = None
+    catalog_entry: dict | None = None
 
     model_config = {"protected_namespaces": ()}
 
@@ -731,19 +833,22 @@ class AvailableModelsError(BaseModel):
 class AvailableModelsResponse(BaseModel):
     provider_id: int
     fetched_at: str
-    source: Literal["api", "litellm", "none"]
+    source: Literal["api", "catalog", "none"]
     live_status: Literal["success", "empty", "unsupported", "error"]
     complete: bool
     error: AvailableModelsError | None = None
     models: list[str]
     candidates: list[AvailableModelCandidate]
+    provider_family: Literal["native", "compatible"] = "native"
+    requires_manual_pricing: bool = False
+    catalog_version: str | None = None
 
     model_config = {"protected_namespaces": ()}
 
 
 @router.get("/admin/providers/{provider_id}/available-models", response_model=AvailableModelsResponse)
 async def available_models(provider_id: int, response: Response):
-    """프로바이더 API(또는 litellm 정적 목록)에서 사용 가능한 모델 후보를 조회. 등록 전 선택/검토용."""
+    """List live provider IDs or the bundled native subscription catalog for administrator review."""
     response.headers.update(_NO_STORE)
     try:
         return await model_discovery.discover_models(provider_id)
@@ -766,75 +871,33 @@ async def list_models(active_only: bool = False):
         raise _map_storage(exc) from exc
 
 
-@router.get("/admin/models/pricing/models-dev/providers")
-async def list_models_dev_providers(
-    local_provider_id: int,
-    refresh: bool = False,
-):
+@router.get("/admin/models/native-catalog", response_model=NativeCatalogResponse, response_model_exclude_unset=True)
+async def get_native_catalog(provider_type: Literal["openai", "anthropic", "gemini", "perplexity"] | None = None):
+    """Return the bundled, reviewed official catalog without network or database I/O."""
+    return catalog_response(provider_type=provider_type)
+
+
+@router.get("/admin/title-model")
+async def get_title_model():
+    """Configured title/compaction model and whether domain-paid compaction can use it.
+
+    Title and memory jobs stay system-funded. Only in-run compaction is domain-paid; when the
+    title model is not domain-billing ready, domain-paid runs compact with their own chat model.
+    """
     try:
-        registered_providers = await repository.list_providers()
-        current_provider = next(
-            (provider for provider in registered_providers if provider["id"] == local_provider_id),
-            None,
-        )
-        if current_provider is None:
-            raise errors.ProviderNotFoundError(f"프로바이더 {local_provider_id} 를 찾을 수 없습니다")
-        catalog = await models_dev.get_catalog(refresh=refresh)
-        current_provider_matches = models_dev.matching_provider_ids(catalog, current_provider)
-        providers = models_dev.registered_provider_list(
-            catalog,
-            registered_providers,
-            current_provider_id=local_provider_id,
-        )
-    except models_dev.ModelsDevCatalogError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    except errors.ProviderNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        route = await routing.resolve_title_model()
     except errors.ChatStorageUnavailable as exc:
         raise _map_storage(exc) from exc
+    if route is None:
+        return {"model_id": None, "model_name": None, "domain_billing": None,
+                "domain_compaction_route": "execution_model"}
+    readiness = domain_billing_readiness(route.get("capabilities") or {}, frozen_token_pricing(route))
     return {
-        "source_url": catalog.source_url,
-        "fetched_at": catalog.fetched_at,
-        "preferred_provider_ids": sorted(current_provider_matches),
-        "providers": providers,
+        "model_id": route["model_id"],
+        "model_name": route["model_name"],
+        "domain_billing": readiness,
+        "domain_compaction_route": "title_model" if readiness["ready"] else "execution_model",
     }
-
-
-@router.get("/admin/models/pricing/models-dev/providers/{models_dev_provider_id}")
-async def get_models_dev_provider(models_dev_provider_id: str, refresh: bool = False):
-    try:
-        catalog = await models_dev.get_catalog(refresh=refresh)
-    except models_dev.ModelsDevCatalogError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    details = models_dev.provider_detail(catalog, models_dev_provider_id)
-    if details is None:
-        raise HTTPException(status_code=404, detail="models.dev provider를 찾을 수 없습니다")
-    models = details.pop("models")
-    return {"source_url": catalog.source_url, "fetched_at": catalog.fetched_at, "provider": details, "models": models}
-
-
-@router.post("/admin/models/pricing/models-dev/import", response_model=list[ModelResponse])
-async def import_models_dev_prices(payload: ModelsDevImportRequest):
-    try:
-        catalog = await models_dev.get_catalog()
-        return await repository.import_models_dev_prices(
-            local_provider_id=payload.local_provider_id,
-            models_dev_provider_id=payload.models_dev_provider_id,
-            selections=[selection.model_dump() for selection in payload.selections],
-            catalog=catalog,
-        )
-    except models_dev.ModelsDevCatalogError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    except errors.ProviderNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except errors.ModelsDevImportConflictError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except errors.ActiveRunConfigurationConflict as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except errors.ProviderValidationError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except errors.ChatStorageUnavailable as exc:
-        raise _map_storage(exc) from exc
 
 
 @router.put("/admin/title-model", status_code=204)
@@ -867,10 +930,27 @@ async def set_memory_model(payload: MemoryModelRequest):
 async def create_model(payload: ModelCreateRequest):
     try:
         return await repository.create_model(**payload.model_dump())
+    except errors.ImagePricingNotReady as exc:
+        raise HTTPException(status_code=409, detail=exc.detail()) from exc
     except errors.ProviderValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except errors.ChatStorageUnavailable as exc:
         raise _map_storage(exc) from exc
+
+
+@router.post("/admin/models/reorder", status_code=204)
+async def reorder_models(payload: ModelReorderRequest):
+    try:
+        await repository.reorder_models(**payload.model_dump())
+    except errors.ProviderNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc), headers=_NO_STORE) from exc
+    except (errors.ModelOrderConflictError, errors.ActiveRunConfigurationConflict) as exc:
+        raise HTTPException(status_code=409, detail=str(exc), headers=_NO_STORE) from exc
+    except errors.ProviderValidationError as exc:
+        raise HTTPException(status_code=400, detail=str(exc), headers=_NO_STORE) from exc
+    except errors.ChatStorageUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc), headers=_NO_STORE) from exc
+    return Response(status_code=204, headers=_NO_STORE)
 
 
 @router.patch("/admin/models/{model_id}", response_model=ModelResponse)
@@ -881,6 +961,8 @@ async def update_model(model_id: int, payload: ModelUpdateRequest):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except errors.ActiveRunConfigurationConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except errors.ImagePricingNotReady as exc:
+        raise HTTPException(status_code=409, detail=exc.detail()) from exc
     except errors.ProviderValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except errors.ChatStorageUnavailable as exc:
@@ -897,3 +979,271 @@ async def delete_model(model_id: int):
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except errors.ChatStorageUnavailable as exc:
         raise _map_storage(exc) from exc
+
+
+class ProviderAccountCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    is_active: bool = True
+    priority: int = Field(default=0, strict=True, ge=0, le=2147483647)
+    weight: int = Field(default=1, strict=True, ge=1, le=2147483647)
+    allowed_model_ids: list[int] | None = None
+    allowed_capabilities: list[str] | None = None
+    quota_group: str | None = Field(default=None, max_length=100)
+    model_config = {"extra": "forbid"}
+
+
+class ProviderAccountUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    is_active: bool | None = None
+    priority: int | None = Field(default=None, strict=True, ge=0, le=2147483647)
+    weight: int | None = Field(default=None, strict=True, ge=1, le=2147483647)
+    allowed_model_ids: list[int] | None = None
+    allowed_capabilities: list[str] | None = None
+    quota_group: str | None = Field(default=None, max_length=100)
+    model_config = {"extra": "forbid"}
+
+
+class ProviderCredentialCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    api_key: SecretStr | None = None
+    api_key_env: str | None = Field(default=None, max_length=128)
+    is_active: bool = True
+    priority: int = Field(default=0, strict=True, ge=0, le=2147483647)
+    weight: int = Field(default=1, strict=True, ge=1, le=2147483647)
+    allowed_model_ids: list[int] | None = None
+    allowed_capabilities: list[str] | None = None
+    expires_at: datetime | None = None
+    cooldown_until: datetime | None = None
+    model_config = {"extra": "forbid"}
+
+
+class ProviderCredentialUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    api_key: SecretStr | None = None
+    api_key_env: str | None = Field(default=None, max_length=128)
+    is_active: bool | None = None
+    priority: int | None = Field(default=None, strict=True, ge=0, le=2147483647)
+    weight: int | None = Field(default=None, strict=True, ge=1, le=2147483647)
+    allowed_model_ids: list[int] | None = None
+    allowed_capabilities: list[str] | None = None
+    expires_at: datetime | None = None
+    cooldown_until: datetime | None = None
+    model_config = {"extra": "forbid"}
+
+
+class ProviderCredentialResponse(BaseModel):
+    id: int
+    account_id: int
+    name: str
+    created_at: datetime = Field(description="UTC credential creation time")
+    auth_mode: Literal["api_key", "chatgpt_device", "anthropic_subscription"]
+    generation: int
+    is_active: bool
+    priority: int
+    weight: int
+    api_key_configured: bool
+    api_key_source: str | None
+    api_key_env: str | None
+    subscription_status: str
+    subscription_expires_at: datetime | None
+    allowed_model_ids: list[int] | None
+    allowed_capabilities: list[str] | None
+    expires_at: datetime | None = None
+    cooldown_until: datetime | None = None
+
+
+class ProviderAccountResponse(ProviderAccountCreate):
+    id: int
+    provider_id: int
+    created_at: datetime = Field(description="UTC account creation time")
+    credentials: list[ProviderCredentialResponse]
+
+
+def _credential_patch(payload):
+    patch = payload.model_dump(exclude_unset=True)
+    if isinstance(patch.get("api_key"), SecretStr):
+        patch["api_key"] = patch["api_key"].get_secret_value()
+    return patch
+
+
+async def _account_action(operation, response):
+    from sqlalchemy.exc import IntegrityError, OperationalError
+    try:
+        result = await operation
+        response.headers.update(_NO_STORE)
+        return result
+    except IntegrityError:
+        raise HTTPException(409, "account or credential conflicts with existing configuration", headers=_NO_STORE) from None
+    except OperationalError:
+        raise HTTPException(503, "provider credential storage unavailable", headers=_NO_STORE) from None
+    except (errors.ProviderNotFoundError, errors.ProviderValidationError, errors.ProviderSubscriptionError,
+            errors.ProviderConfigurationChangedError, errors.ProviderAuthAttemptConflict, errors.ChatStorageUnavailable) as exc:
+        raise _map_subscription_error(exc) from None
+
+
+@router.get("/admin/providers/{provider_id}/accounts", response_model=list[ProviderAccountResponse])
+async def list_provider_accounts(provider_id: int, response: Response):
+    return await _account_action(accounts.list_accounts(provider_id), response)
+
+
+@router.post("/admin/providers/{provider_id}/accounts", response_model=ProviderAccountResponse, status_code=201)
+async def create_provider_account(provider_id: int, payload: ProviderAccountCreate, response: Response):
+    return await _account_action(accounts.create_account(provider_id, payload.model_dump()), response)
+
+
+@router.patch("/admin/providers/{provider_id}/accounts/{account_id}", response_model=ProviderAccountResponse)
+async def update_provider_account(provider_id: int, account_id: int, payload: ProviderAccountUpdate, response: Response):
+    return await _account_action(accounts.update_account(provider_id, account_id, payload.model_dump(exclude_unset=True)), response)
+
+
+@router.delete("/admin/providers/{provider_id}/accounts/{account_id}", status_code=204)
+async def delete_provider_account(provider_id: int, account_id: int):
+    response = Response(status_code=204, headers=_NO_STORE)
+    await _account_action(accounts.delete_account(provider_id, account_id), response)
+    return response
+
+
+class ProviderAccountUsagePeriod(BaseModel):
+    kind: Literal["calendar_month"]
+    start: datetime = Field(description="Inclusive UTC month start")
+    end: datetime = Field(description="Exclusive UTC start of the next month")
+    timezone: Literal["UTC"]
+
+
+class ProviderCredentialUsage(BaseModel):
+    credential_id: int | None
+    requests: int
+    prompt_tokens: int
+    completion_tokens: int
+    raw_cost: str = Field(description="All-time Lumen-allocated raw cost as a decimal string, not a provider invoice")
+    month_requests: int
+    month_prompt_tokens: int
+    month_completion_tokens: int
+    month_raw_cost: str = Field(description="Lumen-allocated raw cost in the UTC month as a decimal string")
+    last_used_at: datetime | None = Field(description="Latest UTC allocation timestamp recorded at settlement")
+
+
+class ProviderAccountUsageResponse(BaseModel):
+    provider_id: int
+    account_id: int
+    period: ProviderAccountUsagePeriod
+    credentials: list[ProviderCredentialUsage]
+
+
+@router.get("/admin/providers/{provider_id}/accounts/{account_id}/usage", response_model=ProviderAccountUsageResponse)
+async def provider_account_usage(provider_id: int, account_id: int, response: Response):
+    return await _account_action(accounts.account_usage(provider_id, account_id), response)
+
+
+class ProviderRelayDispatch(BaseModel):
+    attempt_id: str
+    endpoint: str | None
+    model: str | None
+    operation: Literal["chat", "responses", "messages", "count_tokens", "embeddings", "search", "image", "tts", "stt", "realtime"]
+    status: Literal["dispatched", "response_received"]
+    status_code: int | None
+    recorded_at: datetime
+
+
+class ProviderRelayUsage(BaseModel):
+    ledger_id: int
+    generation: int
+    settled_at: datetime
+    settled_model: str
+    status: Literal["settled"]
+    dispatches: list[ProviderRelayDispatch] | None
+
+
+class ProviderRelayPage(BaseModel):
+    provider_id: int
+    account_id: int
+    credential_id: int
+    boundary: Literal["settled_usage"]
+    items: list[ProviderRelayUsage]
+    next_before_id: int | None
+
+
+@router.get("/admin/providers/{provider_id}/accounts/{account_id}/credentials/{credential_id}/relays", response_model=ProviderRelayPage)
+async def provider_credential_relays(provider_id: int, account_id: int, credential_id: int, response: Response,
+                                    limit: int = Query(default=10, ge=1, le=50),
+                                    before_id: int | None = Query(default=None, gt=0)):
+    return await _account_action(accounts.credential_relays(provider_id, account_id, credential_id,
+        limit=limit, before_id=before_id), response)
+
+
+@router.post("/admin/providers/{provider_id}/accounts/{account_id}/credentials", response_model=ProviderCredentialResponse, status_code=201)
+async def create_provider_credential(provider_id: int, account_id: int, payload: ProviderCredentialCreate, response: Response):
+    return await _account_action(accounts.create_credential(provider_id, account_id, _credential_patch(payload)), response)
+
+
+@router.patch("/admin/providers/{provider_id}/accounts/{account_id}/credentials/{credential_id}", response_model=ProviderCredentialResponse)
+async def update_provider_credential(provider_id: int, account_id: int, credential_id: int, payload: ProviderCredentialUpdate, response: Response):
+    return await _account_action(accounts.update_credential(provider_id, account_id, credential_id, _credential_patch(payload)), response)
+
+
+@router.delete("/admin/providers/{provider_id}/accounts/{account_id}/credentials/{credential_id}", status_code=204)
+async def delete_provider_credential(provider_id: int, account_id: int, credential_id: int):
+    response = Response(status_code=204, headers=_NO_STORE)
+    await _account_action(accounts.delete_credential(provider_id, account_id, credential_id), response)
+    return response
+
+
+@router.put("/admin/providers/{provider_id}/accounts/{account_id}/credentials/{credential_id}/auth/token", response_model=ProviderCredentialResponse)
+async def set_credential_subscription_token(provider_id: int, account_id: int, credential_id: int, payload: SubscriptionTokenRequest, response: Response):
+    return await _account_action(subscriptions.set_subscription_token(provider_id, account_id=account_id,
+        credential_id=credential_id, token=payload.token.get_secret_value(), expires_at=payload.expires_at), response)
+
+
+@router.delete("/admin/providers/{provider_id}/accounts/{account_id}/credentials/{credential_id}/auth", status_code=204)
+async def disconnect_credential_subscription(provider_id: int, account_id: int, credential_id: int):
+    response = Response(status_code=204, headers=_NO_STORE)
+    await _account_action(subscriptions.disconnect_subscription(provider_id, account_id=account_id, credential_id=credential_id), response)
+    return response
+
+
+@router.post("/admin/providers/{provider_id}/accounts/{account_id}/credentials/{credential_id}/auth/device", response_model=DeviceAuthStartResponse, status_code=201)
+async def begin_credential_device_auth(provider_id: int, account_id: int, credential_id: int, response: Response, admin_info: dict = Depends(require_admin)):
+    result = await _account_action(subscriptions.begin_device_auth(provider_id, account_id=account_id,
+        credential_id=credential_id, user_id=admin_info["user_id"], project_id=admin_info["project_id"]), response)
+    response.status_code = 201 if result.pop("_created", False) else 200
+    return result
+
+
+@router.post("/admin/providers/{provider_id}/accounts/{account_id}/credentials/{credential_id}/auth/device/{attempt_id}/poll", response_model=DeviceAuthStatusResponse)
+async def poll_credential_device_auth(provider_id: int, account_id: int, credential_id: int, attempt_id: str, response: Response, admin_info: dict = Depends(require_admin)):
+    return await _account_action(subscriptions.poll_device_auth(provider_id, attempt_id, account_id=account_id,
+        credential_id=credential_id, user_id=admin_info["user_id"], project_id=admin_info["project_id"]), response)
+
+
+@router.delete("/admin/providers/{provider_id}/accounts/{account_id}/credentials/{credential_id}/auth/device/{attempt_id}", status_code=204)
+async def cancel_credential_device_auth(provider_id: int, account_id: int, credential_id: int, attempt_id: str, admin_info: dict = Depends(require_admin)):
+    response = Response(status_code=204, headers=_NO_STORE)
+    await _account_action(subscriptions.cancel_device_auth(provider_id, attempt_id, account_id=account_id,
+        credential_id=credential_id, user_id=admin_info["user_id"], project_id=admin_info["project_id"]), response)
+    return response
+
+
+class ProviderProbeRequest(BaseModel):
+    model_id: int = Field(strict=True, gt=0)
+    generation: int = Field(strict=True, ge=0)
+    model_config = {"extra": "forbid"}
+
+
+class ProviderProbeResponse(BaseModel):
+    status: Literal["connected", "failed"]
+    reason: Literal["auth_rejected", "timeout", "invalid_response", "provider_error"] | None
+    mode: Literal["structured", "plain"]
+    elapsed_ms: int
+    model_id: int
+    generation: int
+    checked_at: datetime
+
+
+@router.post("/admin/providers/{provider_id}/accounts/{account_id}/credentials/{credential_id}/probe", response_model=ProviderProbeResponse)
+async def probe_provider_credential(provider_id: int, account_id: int, credential_id: int,
+                                    payload: ProviderProbeRequest, response: Response,
+                                    admin_info: dict = Depends(require_admin)):
+    from lumen.services.providers.probe import test_connection
+
+    return await _account_action(test_connection(provider_id, account_id, credential_id,
+        model_id=payload.model_id, generation=payload.generation, principal=admin_info), response)

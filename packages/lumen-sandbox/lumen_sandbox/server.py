@@ -160,6 +160,15 @@ def create_app(config: Config, workload: Workload) -> Starlette:
         except PermissionError:
             return JSONResponse({"error": "unauthorized"}, status_code=403)
 
+    async def get_workspace(request: Request) -> Response:
+        try:
+            claim = checked(request)
+            return JSONResponse({"workspace_revision": journal.workspace_revision(claim["fence"])})
+        except PermissionError:
+            return JSONResponse({"error": "unauthorized"}, status_code=403)
+        except Conflict as exc:
+            return JSONResponse({"error": str(exc)}, status_code=409)
+
     async def artifact(request: Request) -> Response:
         try:
             claim = checked(request)
@@ -203,6 +212,7 @@ def create_app(config: Config, workload: Workload) -> Starlette:
                 await asyncio.gather(*active.values())
 
     return Starlette(routes=[Route("/readyz", ready), Route("/v1/executions", submit, methods=["POST"]),
+        Route("/v1/workspace", get_workspace, methods=["GET"]),
         Route("/v1/executions/{eid}", get_execution, methods=["GET"]), Route("/v1/executions/{eid}", cancel, methods=["DELETE"]),
         Route("/v1/artifacts/{aid}", artifact, methods=["GET"])], lifespan=lifespan)
 

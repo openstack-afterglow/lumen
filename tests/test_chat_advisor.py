@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+import json
 
+import httpx
 import pytest
 
+from lumen.services import provider_client
 from lumen.services.advisor import AdvisorError, ask_selected_advisor
+from lumen.services.provider_client import ProviderObject
 from lumen.services.providers import routing as ps
 
 
@@ -18,18 +21,26 @@ async def test_advisor_uses_only_selected_model_and_bounded_visible_history(monk
             "provider_type": "openai",
             "api_base": "https://api.example",
             "api_key": "secret",
+            "capabilities": {"prompt_caching": False},
         }
 
     captured: dict = {}
 
-    async def fake_completion(**kwargs):
-        captured.update(kwargs)
-        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="Keep the response focused."))])
+    async def ready():
+        return "http://127.0.0.1:18643", "internal-token"
 
-    import litellm
+    def handle(request):
+        envelope = json.loads(request.content)
+        captured.update(envelope["body"], custom_llm_provider=envelope["provider"])
+        assert envelope["api_base"] == "https://api.example"
+        assert envelope["api_key"] == "secret" and envelope["single_attempt"] is True
+        return httpx.Response(200, headers={"X-Lumen-Bifrost-Contract": "single-attempt-v1"},
+            json={"choices": [{"message": {"content": "Keep the response focused."}}],
+                  "usage": {"prompt_tokens": 12, "completion_tokens": 4}})
 
     monkeypatch.setattr(ps, "resolve_model_by_id", resolve)
-    monkeypatch.setattr(litellm, "acompletion", fake_completion)
+    monkeypatch.setattr(provider_client, "get_bifrost_runtime", ready)
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", lambda **kwargs: httpx.MockTransport(handle))
     result = await ask_selected_advisor(
         model_id=9,
         goal="Answer the question",
@@ -44,9 +55,10 @@ async def test_advisor_uses_only_selected_model_and_bounded_visible_history(monk
     assert result.advice == "Keep the response focused."
     assert captured["model"] == "advisor-model"
     assert captured["custom_llm_provider"] == "openai"
-    assert captured["stream"] is False
+    assert result.prompt_tokens == 12 and result.completion_tokens == 4
     assert [message["role"] for message in captured["messages"]] == ["system", "user", "assistant", "user"]
     assert captured["messages"][-1]["content"] == "Current goal:\nAnswer the question"
+    assert "capabilities_override" not in captured
 
 
 async def test_advisor_does_not_fallback_when_selected_model_is_unavailable(monkeypatch):
@@ -62,12 +74,27 @@ async def test_advisor_rejects_empty_provider_response(monkeypatch):
     async def resolve(model_id: int):
         return {"model_name": "advisor-model", "provider_type": "openai"}
 
-    async def fake_completion(**kwargs):
-        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=" "))])
-
-    import litellm
+    async def fake_completion(*args, **kwargs):
+        return ProviderObject(choices=[{"message": {"content": " "}}])
 
     monkeypatch.setattr(ps, "resolve_model_by_id", resolve)
-    monkeypatch.setattr(litellm, "acompletion", fake_completion)
+    monkeypatch.setattr(provider_client, "acompletion", fake_completion)
     with pytest.raises(AdvisorError, match="no text"):
         await ask_selected_advisor(model_id=9, goal="goal", visible_messages=[])
+
+
+async def test_advisor_passes_effective_cache_capability_to_client(monkeypatch):
+    from lumen.services.advisor import ask_with_route
+
+    observed = {}
+    async def completion(**kwargs):
+        observed.update(kwargs)
+        return ProviderObject(choices=[{"message": {"content": "advice"}}],
+                              usage={"prompt_tokens": 2, "completion_tokens": 1})
+
+    monkeypatch.setattr(provider_client, "acompletion", completion)
+    await ask_with_route(
+        route={"model_name": "opaque", "provider_type": "anthropic", "capabilities": {"prompt_caching": False}},
+        goal="review", visible_messages=[],
+    )
+    assert observed["extra"] == {"capabilities_override": {"prompt_caching": False}}
