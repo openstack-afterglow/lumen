@@ -34,8 +34,9 @@ async def _view(scope: Scope = Query(default="self"), principal: Principal = Dep
 
 
 @router.get("/usage")
-async def get_chat_usage(view: UsageView = Depends(_view)):
-    return await user_usage_summary(view)
+async def get_chat_usage(view: UsageView = Depends(_view), principal: Principal = Depends(_dashboard)):
+    # Any member sees its verified domain's pool aggregates; API keys never reach this route.
+    return await user_usage_summary(view, member_domain_id=principal.get("domain_id") or None)
 
 
 @router.get("/usage/timeseries")
