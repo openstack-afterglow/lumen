@@ -27,6 +27,7 @@ _LEGACY_LIMIT = 1 << 40
 # Deferred rows stay pending (status NULL); the reason is logged because no column carries it.
 _RETRY = {
     "origin_disabled": timedelta(minutes=15),
+    "origin_unresolved": timedelta(minutes=60),
     "directory_unavailable": timedelta(minutes=1),
     "decrypt_failed": timedelta(minutes=5),
 }
@@ -98,36 +99,35 @@ async def _import_one(session, row: ChatMemory, domain_id: str | None) -> None:
     row.vault_migration_status = "imported"
 
 
-def _defer(row: ChatMemory, reason: str, now: datetime) -> None:
+def _defer(row: ChatMemory, reason: str, now: datetime) -> str:
     row.vault_migration_retry_at = now + _RETRY[reason]
-    logger.warning(
-        "vault_import_deferred memory_id=%s project_id=%s reason=%s retry_at=%s",
-        row.id, row.project_id or "-", reason, row.vault_migration_retry_at.isoformat(),
-    )
+    logger.debug("vault_import_deferred_row memory_id=%s reason=%s", row.id, reason)
+    return reason
 
 
 @auxiliary.retry_db
 async def _finish_one(factory, note_id: int, project_id: str | None, domain_id: str | None, *,
-                      blocked: str | None, deferral: str | None = None) -> None:
+                      blocked: str | None, deferral: str | None = None) -> str | None:
+    """Return the deferral reason when the row stays pending."""
     now = datetime.now(UTC)
     async with factory() as session, session.begin():
         row = await session.get(ChatMemory, note_id, with_for_update=True)
         if row is None or row.vault_migration_status is not None or row.project_id != project_id:
-            return
+            return None
         if blocked is not None:
             row.vault_migration_status = blocked
-            return
+            return None
         if project_id and domain_id is None:
-            _defer(row, deferral or "directory_unavailable", now)
-            return
+            return _defer(row, deferral or "directory_unavailable", now)
         try:
             async with session.begin_nested():
                 await _import_one(session, row, domain_id)
         except InvalidTag:
             # Misconfigured encryption keys and bad ciphertext are indistinguishable.
-            _defer(row, "decrypt_failed", now)
+            return _defer(row, "decrypt_failed", now)
         except (UnresolvedProject, ValueError, IntegrityError):
             row.vault_migration_status = "invalid"
+        return None
 
 
 async def migrate_batch(*, limit: int = 32) -> int:
@@ -146,6 +146,7 @@ async def migrate_batch(*, limit: int = 32) -> int:
             or_(ChatMemory.vault_migration_retry_at.is_(None), ChatMemory.vault_migration_retry_at <= datetime.now(UTC)),
         ).order_by(ChatMemory.id).limit(limit))).all()
     domains: dict[str, tuple[str | None, str | None, str | None]] = {}
+    deferred: dict[tuple[str | None, str], int] = {}
     for note_id, project_id in targets:
         if project_id is None:
             domain_id, blocked, deferral = None, None, None
@@ -158,10 +159,20 @@ async def migrate_batch(*, limit: int = 32) -> int:
                 except DisabledProject:
                     # A disabled project or domain can be re-enabled; keep its rows pending.
                     domains[project_id] = None, None, "origin_disabled"
+                except UnresolvedProject:
+                    # Inconsistent identity metadata needs operator attention, not minute-by-minute retries.
+                    domains[project_id] = None, None, "origin_unresolved"
                 except Exception:
                     domains[project_id] = None, None, "directory_unavailable"
             domain_id, blocked, deferral = domains[project_id]
-        await _finish_one(factory, note_id, project_id, domain_id, blocked=blocked, deferral=deferral)
+        reason = await _finish_one(factory, note_id, project_id, domain_id, blocked=blocked, deferral=deferral)
+        if reason is not None:
+            deferred[(project_id, reason)] = deferred.get((project_id, reason), 0) + 1
+    for (project_id, reason), rows in sorted(deferred.items(), key=lambda item: (item[0][0] or "", item[0][1])):
+        logger.warning(
+            "vault_import_deferred project_id=%s reason=%s rows=%s retry_after_seconds=%s",
+            project_id or "-", reason, rows, int(_RETRY[reason].total_seconds()),
+        )
     return len(targets)
 
 
