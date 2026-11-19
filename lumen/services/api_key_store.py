@@ -654,7 +654,8 @@ async def _require_owned_key(
         if row.key_kind != "service" or row.owner_domain_id != domain_id:
             raise ApiKeyNotFound(f"{key_id} 를 찾을 수 없습니다")
     elif row.key_kind != "personal" or row.owner_user_id != user_id:
-        raise ApiKeyForbidden("소유자가 아닙니다")
+        # Same answer as a missing key: never confirm another owner's key ID.
+        raise ApiKeyNotFound(f"{key_id} 를 찾을 수 없습니다")
     return row
 
 

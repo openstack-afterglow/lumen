@@ -157,24 +157,69 @@ def _client_tool(kind: str, tool: dict) -> bool:
     return isinstance(environment, dict) and environment.get("type") == "local"
 
 
+# Choices that only steer among declared tools (OpenAI string/function/custom,
+# Anthropic auto/any/tool/none). Any other forced type names a hosted tool.
+_CLIENT_TOOL_CHOICES = frozenset({"auto", "none", "required", "any", "tool", "function", "custom"})
+
+
+def _tool_kinds(tool: object) -> list[str]:
+    """The hosted kinds a tools[] entry declares; empty for a client tool."""
+    if not isinstance(tool, dict):
+        return ["invalid"]
+    kind = tool.get("type")
+    if kind is None:
+        if "name" in tool or "input_schema" in tool:
+            return []  # Anthropic custom tool
+        return sorted(key for key in tool if key not in _GEMINI_CLIENT_TOOL_KEYS)
+    if not isinstance(kind, str) or not _client_tool(kind, tool):
+        return [str(kind)]
+    return []
+
+
+def _choice_kinds(choice: object, tools: list) -> list[str]:
+    """Hosted kinds a tool_choice forces, including allowed_tools subsets."""
+    if choice is None:
+        return []
+    if isinstance(choice, str):
+        return [] if choice in _CLIENT_TOOL_CHOICES else [choice]
+    if not isinstance(choice, dict):
+        return ["invalid_tool_choice"]
+    kind = choice.get("type")
+    if kind == "allowed_tools":
+        # Responses nests tools directly; Chat Completions under `allowed_tools`.
+        nested = choice.get("allowed_tools")
+        subset = (nested if isinstance(nested, dict) else choice).get("tools")
+        if not isinstance(subset, list):
+            return ["allowed_tools"]
+        return [hosted for item in subset if (hosted := _choice_entry_kind(item, tools))]
+    return [hosted] if (hosted := _choice_entry_kind(choice, tools)) else []
+
+
+def _choice_entry_kind(choice: object, tools: list) -> str | None:
+    if not isinstance(choice, dict) or not isinstance(choice.get("type"), str):
+        return "invalid_tool_choice"
+    kind = choice["type"]
+    if kind in _CLIENT_TOOL_CHOICES or kind in _CLIENT_TOOL_TYPES or kind.startswith(_CLIENT_TOOL_PREFIXES):
+        return None
+    # A forced shell is client-run only if every declared shell is explicitly local.
+    shells = [tool for tool in tools if isinstance(tool, dict) and tool.get("type") == "shell"]
+    if kind == "shell" and shells and all(_client_tool("shell", tool) for tool in shells):
+        return None
+    return kind
+
+
 def hosted_tools(request: dict) -> tuple[str, ...]:
-    """Name every server- or provider-executed tool the request asks for.
+    """Name every server- or provider-executed tool the request declares or forces.
 
     Untyped Anthropic custom tools and Gemini function declarations are client tools;
     any other untyped Gemini tool entry (googleSearch, codeExecution, ...) is hosted.
+    A `tool_choice` may force a hosted type even without a declaration, so it is
+    classified too.
     """
     hosted = [field for field in _HOSTED_REQUEST_FIELDS if request.get(field) is not None]
-    for tool in request.get("tools") or ():
-        if not isinstance(tool, dict):
-            hosted.append("invalid")
-            continue
-        kind = tool.get("type")
-        if kind is None:
-            if "name" in tool or "input_schema" in tool:
-                continue  # Anthropic custom tool
-            hosted.extend(sorted(key for key in tool if key not in _GEMINI_CLIENT_TOOL_KEYS))
-        elif not isinstance(kind, str) or not _client_tool(kind, tool):
-            hosted.append(str(kind))
+    tools = request.get("tools") or []
+    hosted.extend(kind for tool in tools for kind in _tool_kinds(tool))
+    hosted.extend(_choice_kinds(request.get("tool_choice"), tools if isinstance(tools, list) else []))
     return tuple(dict.fromkeys(hosted))
 
 

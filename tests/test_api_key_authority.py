@@ -362,7 +362,7 @@ async def test_member_cannot_revoke_another_owners_key_but_can_manage_own_across
     test_app.dependency_overrides[auth.get_token_info] = principal
     async with AsyncClient(transport=ASGITransport(app=test_app), base_url="http://test") as client:
         response = await client.delete("/api-keys/7")
-        assert response.status_code == 403 and session.row.is_active
+        assert response.status_code == 404 and session.row.is_active  # Indistinguishable from a missing key.
         caller.update(user_id="u", project_id="other")
         response = await client.delete("/api-keys/7")
         assert response.status_code == 204

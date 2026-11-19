@@ -162,6 +162,12 @@ async def test_personal_key_ignores_project_headers_and_can_be_managed_from_othe
         listing = await client.get("/v1/api-keys", headers=session)
         assert [item["id"] for item in listing.json()] == [row.id]
         assert (await client.post("/v1/api-keys", headers=session, json={"name": "new"})).status_code == 201
+        # Another user's key and a missing key are indistinguishable.
+        intruder = {"X-Auth-Token": "successor"}
+        for key_path in (f"/v1/api-keys/{row.id}", "/v1/api-keys/987654"):
+            assert (await client.delete(key_path, headers=intruder)).status_code == 404
+            limits = await client.patch(f"{key_path}/limits", headers=intruder, json={"monthly_credit_limit": "1"})
+            assert limits.status_code == 404, limits.text
         assert (await client.delete(f"/v1/api-keys/{row.id}", headers=session)).status_code == 204
         assert (await client.get("/v1/models", headers=_header(raw))).status_code == 401
     async with key_db() as table:
@@ -465,6 +471,22 @@ async def test_client_declared_tools_are_forwarded_for_model_keys(key_db, direct
     )],
     ("/v1/messages", {"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "x"}],
                       "container": {"id": "c"}}),
+    # A forced tool_choice may name a hosted tool without declaring it.
+    *[("/v1/responses", {"model": "m", "input": "x", "tool_choice": choice}) for choice in (
+        {"type": "web_search_preview"}, {"type": "code_interpreter"}, {"type": "file_search"},
+        {"type": "image_generation"}, {"type": "computer_use_preview"}, {"type": "mcp", "server_label": "s"},
+        {"type": "shell"},
+        {"type": "allowed_tools", "mode": "auto", "tools": [{"type": "function", "name": "f"}, {"type": "web_search"}]},
+    )],
+    ("/v1/responses", {"model": "m", "input": "x", "tool_choice": {"type": "shell"},
+                       "tools": [{"type": "shell", "environment": {"type": "container_auto"}}]}),
+    *[("/v1/chat/completions", {"model": "m", "messages": [{"role": "user", "content": "x"}], "tool_choice": choice})
+      for choice in ({"type": "web_search_preview"}, {"type": "allowed_tools", "allowed_tools": {
+          "mode": "required", "tools": [{"type": "function", "function": {"name": "f"}}, {"type": "file_search"}]}})],
+    *[("/v1/messages", {"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "x"}],
+                        "tool_choice": choice}) for choice in (
+        {"type": "web_search_20250305"}, {"type": "code_execution"},
+    )],
 ])
 @pytest.mark.parametrize("kind", ["personal", "service"])
 async def test_hosted_tools_are_rejected_for_model_keys(key_db, directory, monkeypatch, kind, path, body):
@@ -486,6 +508,23 @@ def test_gemini_function_declarations_are_client_tools():
     assert hosted_tools({"tools": [{"functionDeclarations": [{"name": "f"}]}]}) == ()
     assert hosted_tools({"tools": [{"googleSearch": {}}, {"codeExecution": {}}, {"urlContext": {}}]}) == (
         "googleSearch", "codeExecution", "urlContext")
+
+
+def test_client_tool_choices_stay_forwarded():
+    from lumen.services.inference_authority import hosted_tools
+
+    local_shell = {"type": "shell", "environment": {"type": "local"}}
+    for choice in ("auto", "none", "required", {"type": "function", "name": "f"},
+                   {"type": "function", "function": {"name": "f"}}, {"type": "custom", "name": "apply_patch"},
+                   {"type": "auto"}, {"type": "any"}, {"type": "none"}, {"type": "tool", "name": "Bash"},
+                   {"type": "apply_patch"}, {"type": "local_shell"},
+                   {"type": "allowed_tools", "mode": "auto", "tools": [{"type": "function", "name": "f"}]},
+                   {"type": "allowed_tools", "allowed_tools": {"mode": "required",
+                                                               "tools": [{"type": "function", "function": {"name": "f"}}]}}):
+        assert hosted_tools({"tool_choice": choice}) == (), choice
+    # Forcing shell is client-run only when every declared shell is explicitly local.
+    assert hosted_tools({"tools": [local_shell], "tool_choice": {"type": "shell"}}) == ()
+    assert hosted_tools({"tool_choice": {"type": "shell"}}) == ("shell",)
 
 
 @pytest.mark.parametrize("kind", ["personal", "service"])
