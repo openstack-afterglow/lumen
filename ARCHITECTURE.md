@@ -674,9 +674,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "58e58e8e14401d2fdfe0ca6df2704689a429cb9d815592325f4096e589368567",
-  "reviewed_at": "2026-11-19T03:35:54Z",
-  "summary": "Test isolation: conftest client fixtures install dependency_overrides via the test monkeypatch and restore the pre-fixture snapshot, so a later monkeypatch.setitem of the same override can no longer resurrect the Keystone principal (test_ai_compat leaked into test_gemini_sdk_compat and test_model_api_keys); test-only, integration 3ddd745"
+  "source_sha256": "1e8f70bfbb76911b5f32c0cb625faf7efed465c6143b10859461e7633fe1899d",
+  "reviewed_at": "2026-11-19T03:53:24Z",
+  "summary": "Lumen 0.6.21 release prep (final): domain scope, domain credit pools and usage views, personal/service keys with tool classification and gateway hold fix, Agent Vault with recoverable import, image token pricing, Gemini compat"
 }
 ```
 <!-- architecture-review:end -->
