@@ -94,7 +94,7 @@ def directory(monkeypatch):
 async def _key(key_db, kind, scopes):
     row, raw = store._new_key("test", tuple(scopes), expires_at=None, key_kind=kind, **(
         {"owner_domain_id": "domain-a", "created_by_user_id": "creator"} if kind == "service" else
-        {"owner_user_id": "creator", "owner_project_id": "historical-project"}
+        {"owner_user_id": "creator", "owner_project_id": "historical-project", "created_by_user_id": "creator"}
     ))
     async with key_db() as session, session.begin():
         session.add(row)

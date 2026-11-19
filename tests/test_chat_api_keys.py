@@ -60,7 +60,7 @@ class TestStorePureLogic:
     def test_expiry_serialization_includes_utc_for_mysql_datetime(self):
         row = SimpleNamespace(
             key_kind="personal",
-            id=1, name="n", key_prefix="sk-afgl-AbCd", scopes=["models:read"], is_active=True,
+            id=1, name="n", key_prefix="sk-afgl-AbCd", scopes=["models:read"], is_active=True, created_by_user_id="u",
             owner_monthly_credit_limit=None, admin_monthly_credit_limit=None, owner_weekly_credit_limit=None,
             created_at=None, last_used_at=None, revoked_at=None,
             expires_at=datetime(2099, 1, 1),
@@ -80,6 +80,7 @@ class TestStorePureLogic:
             last_used_at=None,
             created_at=None,
             scopes=["models:read"],
+            created_by_user_id="u",
             revoked_at=None,
             expires_at=None,
             owner_monthly_credit_limit=Decimal("50.5"),
@@ -324,6 +325,7 @@ class TestStorePureLogic:
             last_used_at=None,
             created_at=None,
             scopes=["models:read"],
+            created_by_user_id="u",
             revoked_at=None,
             expires_at=None,
             owner_user_id="u-owner",

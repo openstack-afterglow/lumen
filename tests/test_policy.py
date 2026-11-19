@@ -256,7 +256,8 @@ async def test_allow_rule_cannot_bypass_key_foreign_target_or_owner_checks(opera
             await auth.get_principal(request)
         assert error.value.status_code == 403
     row = SimpleNamespace(id=7, owner_user_id="someone-else", owner_project_id="project", is_active=True,
-        key_kind="personal", credential_kind="api_key", revoked_at=None, expires_at=None, scopes=["models:read"])
+        key_kind="personal", credential_kind="api_key", revoked_at=None, expires_at=None, scopes=["models:read"],
+        created_by_user_id="someone-else")
     monkeypatch.setattr(api_key_store, "_verify_model_key_owner", lambda **kwargs: None)
     session = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: row)))
     with pytest.raises(api_key_store.ApiKeyForbidden):
@@ -313,7 +314,7 @@ async def test_key_authentication_preserves_policy_503_and_corrected_file_recove
     replace, _ = operator_policy
     row = SimpleNamespace(key_hash="digest", is_active=True, revoked_at=None, expires_at=None,
         owner_user_id="owner", owner_project_id="project", id=7, scopes=["models:read"],
-        credential_kind="api_key", key_kind="personal")
+        credential_kind="api_key", key_kind="personal", created_by_user_id="owner")
 
     class Session:
         commit = AsyncMock()
@@ -408,7 +409,7 @@ async def test_operator_narrowed_key_scopes_keep_original_standard_role_ceiling(
     assert ("compat:images:write" in response["allowed_scopes"]) is ("manager" in issued_roles)
     assert "models:read" in response["allowed_scopes"]
     row = SimpleNamespace(id=7, owner_user_id="owner", owner_project_id="project", is_active=True,
-                          key_kind="personal", credential_kind="claude_gateway",
+                          key_kind="personal", credential_kind="claude_gateway", created_by_user_id="owner",
                           revoked_at=None, expires_at=None, scopes=["models:read", "compat:images:write"])
     session = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: row)))
     scopes = await api_key_store.current_api_key_scopes(
