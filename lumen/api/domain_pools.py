@@ -34,7 +34,8 @@ class TopUp(BaseModel):
     note: Annotated[str, Field(max_length=1000)] | None = None
 
 
-async def _manager(principal: Principal) -> str:
+async def require_domain_manager(principal: Principal) -> str:
+    """Return the caller's domain after a live Keystone manager check; 403 otherwise."""
     if (principal.get("credential_class", principal.get("auth_type")) != "keystone"
             or principal.get("credential_restricted")):
         raise HTTPException(403, "domain_manager_required")
@@ -59,7 +60,7 @@ def _factory():
 
 @router.get("/domain-pool")
 async def get_domain_pool(principal: Principal = Depends(get_principal)):
-    domain_id = await _manager(principal)
+    domain_id = await require_domain_manager(principal)
     async with _factory()() as session:
         pool = await session.get(DomainCreditPool, domain_id)
         return domain_credit.public(pool, domain_id)
@@ -67,7 +68,7 @@ async def get_domain_pool(principal: Principal = Depends(get_principal)):
 
 @router.patch("/domain-pool")
 async def set_domain_limit(body: ManagerPatch, principal: Principal = Depends(get_principal)):
-    domain_id = await _manager(principal)
+    domain_id = await require_domain_manager(principal)
 
     async def transaction():
         async with _factory()() as session, session.begin():

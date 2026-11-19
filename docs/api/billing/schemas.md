@@ -53,6 +53,7 @@ Each section lists the fields of one component schema referenced by this group's
 | `cache_creation_1h_input_tokens` | integer | yes | — | Cache Creation 1H Input Tokens (numeric lower bound) |
 | `credited_cost` | string | yes | — | Credited Cost |
 | `source` | enum: `web`, `api` | yes | — | Source |
+| `billing_scope` | enum: `user`, `domain` | no | `"user"` | Billing Scope |
 | `api_key_id` | integer \| null | no | — | Api Key Id |
 | `conversation_id` | string \| null | no | — | Conversation Id |
 | `run_id` | string \| null | no | — | Run Id |
