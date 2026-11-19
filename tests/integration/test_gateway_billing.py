@@ -95,6 +95,42 @@ async def test_gateway_message_holds_and_settles_once(gateway_owner, monkeypatch
     assert wallet.used_quota_this_month == ledger.credited_cost
 
 
+@pytest.mark.parametrize("complete", [True, False])
+async def test_streaming_gateway_message_settles_once_or_stays_unknown(gateway_owner, monkeypatch, complete):
+    factory, user, client = gateway_owner
+
+    async def upstream(**kwargs):
+        assert kwargs["stream"] is True
+
+        async def events():
+            yield {"type": "message_start", "message": {"usage": {"input_tokens": 5, "output_tokens": 0}}}
+            yield {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "done"}}
+            yield {"type": "message_delta", "usage": {"output_tokens": 50}}
+            if not complete:
+                raise ConnectionError("upstream stream cut before message_stop")
+            yield {"type": "message_stop"}
+
+        return events()
+
+    monkeypatch.setattr(completion_api.provider_client, "aanthropic_messages", upstream)
+    response = await client.post("/v1/claude-gateway/v1/messages", json={**_message(64), "stream": True})
+    assert response.status_code == 200, response.text
+    assert "event: message_start" in response.text
+    assert ("event: message_stop" in response.text) is complete
+    async with factory() as session:
+        hold = (await session.scalars(select(StatelessCallReservation).where(
+            StatelessCallReservation.user_id == user))).one()
+        ledger = (await session.scalars(select(ChatUsageLog).where(ChatUsageLog.user_id == user))).all()
+        wallet = await session.get(UserWallet, user)
+    if complete:
+        assert hold.status == "settled" and [row.event_id for row in ledger] == [hold.event_id]
+        assert ledger[0].credited_cost == hold.actual_credits == wallet.used_quota_this_month == Decimal(5 + 50 * 2)
+    else:
+        # Dispatched but without terminal usage: the full bound stays held, nothing is charged.
+        assert hold.status == "unknown" and ledger == []
+        assert wallet.used_quota_this_month == 0
+
+
 async def test_concurrent_gateway_messages_beyond_budget_are_refused_before_dispatch(gateway_owner, monkeypatch):
     factory, user, client = gateway_owner
     async with factory() as session, session.begin():
