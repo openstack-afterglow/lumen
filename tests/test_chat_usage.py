@@ -33,8 +33,10 @@ async def test_get_chat_usage_summary(client, monkeypatch):
         "request_count": 7,
     }
 
-    async def fake_summary(view):
+    async def fake_summary(view, *, member_domain_id):
         assert view == usage_service.UsageView("test-user-123")
+        # The session's verified domain is passed for the read-only pool aggregates.
+        assert member_domain_id == "test-domain-123"
         return summary
 
     monkeypatch.setattr(usage_mod, "user_usage_summary", fake_summary)
@@ -47,7 +49,7 @@ async def test_get_chat_usage_summary(client, monkeypatch):
 async def test_get_chat_usage_scoped_to_token(client, monkeypatch):
     captured = {}
 
-    async def fake_summary(view):
+    async def fake_summary(view, *, member_domain_id):
         captured["user_id"] = view.user_id
         captured["scope"] = view.scope
         return {
