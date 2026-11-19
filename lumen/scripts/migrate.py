@@ -13,9 +13,10 @@ from sqlalchemy import text
 
 from lumen.config import get_settings
 from lumen.plugins.registry import get_plugin
-from lumen.scripts.backfill_history import backfill_history, count_unready
+from lumen.scripts.backfill_history import backfill_history, count_unready, has_history_domain_scope
 from lumen.scripts.provider_account_migration import (
     ACCOUNT_ID,
+    HISTORICAL_RECEIPTS,
     REPAIRED_CUTOVER_SQL,
     AccountMigrationError,
     inspect_account_state,
@@ -83,17 +84,24 @@ def _statements(path: Path) -> list[str]:
     return [statement.strip() for statement in sql.split(";") if statement.strip()]
 
 
-async def _verify_graph_backfill(connection) -> None:
+async def _verify_graph_backfill(connection, *, domain_scope: bool = False) -> None:
     """Reject incomplete ownership before nullable graph columns become constrained."""
+    project_mismatch = "graph.project_id <> conversation.project_id"
+    owner_mismatch = project_mismatch
+    if domain_scope:
+        owner_mismatch = (
+            "NOT (graph.domain_id <=> conversation.domain_id) "
+            f"OR (graph.domain_id IS NULL AND {project_mismatch})"
+        )
     checks = (
         (
-            """
+            f"""
             SELECT conversation.id
             FROM chat_conversations AS conversation
             LEFT JOIN chat_message_graphs AS graph ON graph.id = conversation.graph_id
             WHERE conversation.graph_id IS NULL OR conversation.graph_id IN ('', '0')
                OR graph.id IS NULL OR graph.user_id <> conversation.user_id
-               OR graph.project_id <> conversation.project_id
+               OR ({owner_mismatch})
             LIMIT 1
             """,
             "conversation graph ownership is invalid",
@@ -128,9 +136,9 @@ async def _verify_graph_backfill(connection) -> None:
             raise MigrationLedgerError(f"{reason}: id={row[0]}")
 
 
-async def _verify_active_paths(connection) -> None:
+async def _verify_active_paths(connection, *, domain_scope: bool = False) -> None:
     """Fail closed when the additive active-path projection does not match immutable ancestry."""
-    await _verify_graph_backfill(connection)
+    await _verify_graph_backfill(connection, domain_scope=domain_scope)
     checks = (
         (
             """
@@ -345,7 +353,9 @@ async def migrate(database_url: str, *, apply: bool, repair_schema_drift: bool =
                     )
                 ).first()
                 if row is not None:
-                    if row.relative_path != migration.relative_path or row.sha256 != migration.sha256:
+                    if (row.relative_path, row.sha256) != (migration.relative_path, migration.sha256) and (
+                        HISTORICAL_RECEIPTS.get(migration.logical_id) != (row.relative_path, row.sha256)
+                    ):
                         raise MigrationLedgerError(f"applied migration identity drift: {migration.logical_id}")
                     continue
                 pending.append(migration.logical_id)
@@ -413,7 +423,7 @@ async def migrate(database_url: str, *, apply: bool, repair_schema_drift: bool =
             unready = await count_unready(engine)
             if unready == 0 and membership_applied is not None:
                 async with engine.begin() as connection:
-                    await _verify_active_paths(connection)
+                    await _verify_active_paths(connection, domain_scope=await has_history_domain_scope(connection))
         else:
             async with engine.connect() as connection:
                 unready = int((await connection.execute(text("SELECT COUNT(*) FROM chat_conversations"))).scalar_one())

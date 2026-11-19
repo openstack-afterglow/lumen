@@ -18,16 +18,21 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
 
+from fastapi import HTTPException
 from lumen_plugin_api.tools import AgentExecutionPolicy
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from lumen import auth
 from lumen.config import get_settings
 from lumen.crypto import decrypt_chat_content, encrypt_chat_content
-from lumen.models.chat_db import ChatAgent
 from lumen.models.chat_infrastructure import ChatDelegationCall, ChatDelegationGroup, ChatRuntimeResource
 from lumen.models.chat_runs import ChatRun
 from lumen.plugins.registry import get_registry
+from lumen.services import agent_store as ags
+from lumen.services import credit, worker_routing
+from lumen.services.domain_scope import history_domain_id
+from lumen.services.inference_authority import dispatch_deadline, dispatch_expired
 from lumen.services.providers.errors import AmbiguousModelRouteError
 from lumen.services.run_protocol_v2 import transition_allowed
 from lumen.services.run_store import NONTERMINAL, TERMINAL, append_event
@@ -240,7 +245,8 @@ def _require_child_authority(
         raise ChildFailure("child_policy_denied", "child skill exceeds frozen parent authority")
 
 async def _prepare_child_inputs(
-    parent: ChatRun, parent_payload: dict[str, Any], call: DelegationCall, agent: dict[str, Any]
+    parent: ChatRun, parent_payload: dict[str, Any], call: DelegationCall, agent: dict[str, Any], *,
+    domain_id: str | None = None,
 ) -> dict[str, Any]:
     """Resolve the child's frozen route, policy, skills and tool bindings before any lock is held."""
     from lumen.models.chat_contracts import ChatFeatureOptions
@@ -280,21 +286,43 @@ async def _prepare_child_inputs(
             "can_delegate_write": False,
         }
     )
-    route = None
-    if agent.get("model_name"):
+    model_row_id = agent.get("model_row_id")
+    if model_row_id is not None or agent.get("model_name"):
         try:
-            route = await ps.resolve_model(str(agent["model_name"]))
+            route = (await ps.resolve_model_by_id(model_row_id, model_kind="text") if model_row_id is not None
+                     else await ps.resolve_model(agent["model_name"]))
         except AmbiguousModelRouteError as exc:
             raise ChildFailure("child_route_ambiguous", "child agent model route is ambiguous") from exc
         if route is None:
             raise ChildFailure("child_route_unavailable", "child agent model is not available")
+        if model_row_id is not None:
+            gate = chat_admission._capability_gate("text", route)
+            if not gate["available"] or not gate["pricing_available"]:
+                raise ChildFailure("child_route_unavailable", "child agent model cannot serve priced text")
+        if parent.payer_domain_id is not None:
+            readiness = chat_admission.route_domain_billing(route)
+            if not readiness["ready"]:
+                raise ChildFailure(
+                    "child_route_unavailable",
+                    f"child agent model is not available for domain billing ({readiness['reason_code']})",
+                )
     else:
         route = await ps.resolve_model_snapshot(parent.capability_snapshot or {})
         if route is None:
             raise ChildFailure("child_route_unavailable", "parent route is not available for the child")
     try:
         extension_selection = await chat_admission._resolve_extension_selection(
-            agent, features, user_id=parent.user_id, project_id=parent.project_id
+            agent,
+            features,
+            user_id=parent.user_id,
+            project_id=parent.project_id,
+            token_info={
+                "auth_type": "keystone",
+                "credential_class": "keystone",
+                "user_id": parent.user_id,
+                "project_id": parent.project_id,
+                "domain_id": domain_id,
+            } if domain_id is not None else None,
         )
         plugin_tool_snapshots = await chat_admission._freeze_plugin_bindings(
             [item for item in agent.get("plugin_tool_ids", []) if isinstance(item, str)],
@@ -341,6 +369,31 @@ async def _prepare_child_inputs(
     }
 
 
+async def current_agent_domain(run: ChatRun) -> str | None:
+    """Resolve domain scope from the run's selected project, never its frozen agent."""
+    if run.api_key_id is not None or run.source != "web":
+        return None
+    if (run.capability_snapshot or {}).get("credential_authority") is not None:
+        return None
+    try:
+        authority = await auth.resolve_project_authority(run.user_id, run.project_id)
+    except HTTPException as exc:
+        if exc.status_code == 403:
+            raise ChildFailure("child_agent_unavailable", "delegate agent is not available") from exc
+        raise DurableRunError("current project authority is unavailable") from exc
+    return history_domain_id({"credential_class": "keystone", "domain_id": authority.get("domain_id")})
+
+
+async def require_frozen_agent(session: AsyncSession, run: ChatRun, *, domain_id: str | None) -> None:
+    """Recheck the agent row using the caller's freshly verified domain scope."""
+    if run.agent_id is None or run.run_scope != "child":
+        return
+    if await ags.load_active_agent(
+        session, run.agent_id, user_id=run.user_id, project_id=run.project_id, domain_id=domain_id,
+    ) is None:
+        raise ChildFailure("child_agent_unavailable", "delegate agent is not available")
+
+
 async def prepare_delegations(
     *,
     parent_run_id: str,
@@ -353,7 +406,6 @@ async def prepare_delegations(
     Route/policy/skill/tool resolution runs before the lock; the transaction then re-checks
     cancellation, deadline, lease fence, fingerprints, counts, policy and quotas atomically.
     """
-    from lumen.services import agent_store as ags
     from lumen.services.infrastructure import store as infra_store
 
     if not calls:
@@ -364,19 +416,30 @@ async def prepare_delegations(
     async with factory() as session:
         parent_identity = (await session.execute(select(ChatRun).where(ChatRun.id == parent_run_id))).scalar_one()
     parent_payload = _payload(parent_identity)
+    scope_deadline = dispatch_deadline()
+    domain_id = await current_agent_domain(parent_identity)
     agent_rows: dict[int, dict[str, Any]] = {}
     prepared_inputs: dict[str, dict[str, Any]] = {}
     for call in calls:
-        agent = await ags.get_agent_for_run(call.agent_id, user_id=parent_identity.user_id, project_id=parent_identity.project_id)
+        agent = await ags.get_agent_for_run(
+            call.agent_id, user_id=parent_identity.user_id, project_id=parent_identity.project_id, domain_id=domain_id,
+        )
         if agent is None:
             raise ChildFailure("child_agent_unavailable", "delegate agent is not available")
         agent_rows[call.agent_id] = agent
-        prepared_inputs[call.call_id] = await _prepare_child_inputs(parent_identity, parent_payload, call, agent)
+        prepared_inputs[call.call_id] = await _prepare_child_inputs(
+            parent_identity, parent_payload, call, agent, domain_id=domain_id,
+        )
     settings = get_settings()
 
     async def transaction() -> dict[str, Any]:
         order = budgets.LockOrder()
         async with factory() as session, session.begin():
+            await worker_routing.use_read_committed(session)
+            payer = credit.run_payer(parent_identity)
+            if payer.domain_id is not None:
+                await credit.lock_payer(session, payer, user_id=parent_identity.user_id,
+                                        project_id=parent_identity.project_id, api_key_id=parent_identity.api_key_id)
             quota, root, ancestors = await _lock_lineage(session, parent_identity, order)
             parent = root if parent_identity.id == root.id else ancestors[-1] if ancestors and ancestors[-1].id == parent_identity.id else None
             if parent is None:
@@ -419,6 +482,9 @@ async def prepare_delegations(
                     if by_call[call.call_id].fingerprint != call.fingerprint():
                         raise DurableRunConflict("replayed delegation call has a different fingerprint")
                 return _group_view(group, rows)
+            if domain_id is not None and (dispatch_expired(scope_deadline) or parent.project_id != parent_identity.project_id
+                                          or parent.user_id != parent_identity.user_id):
+                raise ChildFailure("child_agent_unavailable", "delegate agent authorization is stale")
             root_sandbox_deadline = None
             if (root.capability_snapshot or {}).get("sandbox_tools"):
                 # Only new groups need a live root Pod; frozen groups replay after expiry.
@@ -447,7 +513,11 @@ async def prepare_delegations(
                 ):
                     raise ChildFailure("sandbox_unavailable", "root selected sandbox is unavailable")
 
-            parent_agent = await session.get(ChatAgent, parent.agent_id) if parent.agent_id is not None else None
+            parent_agent = None
+            if parent.agent_id is not None:
+                parent_agent = await ags.load_active_agent(
+                    session, parent.agent_id, user_id=parent.user_id, project_id=parent.project_id, domain_id=domain_id,
+                )
             delegable = {
                 int(item) for item in (getattr(parent_agent, "delegable_agent_ids", None) or []) if isinstance(item, int)
             }
@@ -460,13 +530,10 @@ async def prepare_delegations(
             rows: list[ChatDelegationCall] = []
             pending_resources: list[tuple[ChatRun, int]] = []
             for ordinal, call in enumerate(calls):
-                agent_row = await session.get(ChatAgent, call.agent_id)
-                if (
-                    agent_row is None
-                    or not agent_row.is_active
-                    or agent_row.owner_user_id != parent.user_id
-                    or agent_row.project_id != parent.project_id
-                ):
+                agent_row = await ags.load_active_agent(
+                    session, call.agent_id, user_id=parent.user_id, project_id=parent.project_id, domain_id=domain_id,
+                )
+                if agent_row is None:
                     raise ChildFailure("child_agent_unavailable", "delegate agent is not available")
                 try:
                     validate_child_request(
@@ -498,6 +565,7 @@ async def prepare_delegations(
                     model_name=prepared["route"]["model_name"],
                     source=parent.source,
                     api_key_id=parent.api_key_id,
+                    payer_domain_id=parent.payer_domain_id,
                     agent_id=call.agent_id,
                     execution_protocol_version=2,
                     execution_mode="code" if call.access == "write" else "plan",
@@ -538,6 +606,8 @@ async def prepare_delegations(
                         session, quota=quota, root=root, run_id=child_id, kind="sandbox_seconds", amount=call.sandbox_seconds, order=order
                     )
                 except budgets.BudgetExceeded as exc:
+                    raise ChildFailure(exc.code, str(exc)) from exc
+                except credit.DomainCreditInsufficient as exc:
                     raise ChildFailure(exc.code, str(exc)) from exc
                 row = ChatDelegationCall(
                     id=str(uuid.uuid4()),
@@ -619,6 +689,8 @@ async def prepare_delegations(
                     raise ChildFailure(exc.code, str(exc)) from exc
             if root_sandbox_deadline is not None and root_sandbox_deadline <= _now():
                 raise ChildFailure("sandbox_expired", "root selected sandbox lifetime has expired")
+            if domain_id is not None and dispatch_expired(scope_deadline):
+                raise ChildFailure("child_agent_unavailable", "delegate agent authorization is stale")
             return _group_view(group, rows)
 
     return await budgets.retry_deadlocks(transaction)

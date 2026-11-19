@@ -37,7 +37,7 @@ def test_gemini_http_routes_keep_provider_and_lumen_credentials_separate():
             selector = f"lumen/{registered_provider}/{model_id}"
 
             issued = client.post("/v1/api-keys", headers=owner, json={
-                "name": "system Gemini Decisions", "scopes": ["compat:completions:write", "models:read"],
+                "name": "system Gemini Decisions", "scopes": ["decisions:write", "models:read"],
             })
             assert issued.status_code == 201, issued.text
             registered_key = issued.json()["id"]

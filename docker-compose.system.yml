@@ -137,7 +137,7 @@ services:
       retries: 24
 
   mariadb:
-    image: mariadb:11
+    image: ${LUMEN_TEST_MARIADB_IMAGE:-mariadb:11}
     # Host pytest uses published ports; only these data services are dual-homed.
     networks: [default, isolated]
     environment:

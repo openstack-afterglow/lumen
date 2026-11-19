@@ -232,7 +232,7 @@ def original_token(monkeypatch, *, project_id="p1", user_id="u1", username="user
 @pytest.fixture
 def current_authority(monkeypatch):
     async def resolve(user_id, project_id):
-        return {"roles": ["member"], "is_system_admin": user_id == "sys-admin-1"}
+        return {"roles": ["member"], "is_system_admin": user_id == "sys-admin-1", "domain_id": "project-domain"}
     monkeypatch.setattr(deps, "resolve_project_authority", resolve)
 
 
@@ -346,7 +346,7 @@ class TestKeystoneProjectScoping:
             deps.validate_token("invalid-token")
         assert error.value.status_code == status
 
-    async def test_api_key_isolation_never_invokes_keystone(self, monkeypatch):
+    async def test_gateway_key_principal_never_exchanges_a_keystone_token(self, monkeypatch):
         def forbidden_keystone(**kwargs):
             raise AssertionError("Keystone v3.Token should never be instantiated for API key authentication")
 
@@ -356,6 +356,9 @@ class TestKeystoneProjectScoping:
         async def fake_verify_key(key: str):
             if key == "sk-afgl-secret123":
                 return {
+                    "auth_type": "api_key",
+                    "credential_class": "claude_gateway",
+                    "source": "api",
                     "user_id": "api-usr-1",
                     "project_id": "api-proj-1",
                     "api_key_id": 42,
@@ -485,10 +488,12 @@ class TestKeystoneProjectScoping:
         assert principal["project_id"] == "home-proj"
         assert principal["connection_project_id"] == "home-proj"
 
-    async def test_api_key_target_project_mismatch_rejected(self, monkeypatch):
+    async def test_gateway_key_target_project_mismatch_rejected(self, monkeypatch):
         async def fake_verify_key(key: str):
             if key == "sk-afgl-secret123":
                 return {
+                    "auth_type": "api_key",
+                    "credential_class": "claude_gateway",
                     "user_id": "api-usr-1",
                     "project_id": "api-proj-1",
                     "api_key_id": 42,

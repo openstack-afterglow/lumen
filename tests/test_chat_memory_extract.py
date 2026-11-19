@@ -46,7 +46,7 @@ class TestGenerateMemory:
 
         monkeypatch.setattr(me.ps, "resolve_memory_model", fake_resolve)
         monkeypatch.setattr(me.provider_client, "acompletion", fake_acompletion)
-        await me.generate_memory_if_applicable(conversation_id="c1", project_id="p1", run_id="r1", user_id="u1")
+        await me.generate_memory_if_applicable(conversation_id="c1", project_id="p1", run_id="r1", user_id="u1", domain_id="d1")
         assert called["acompletion"] is False  # 모델 미지정 → 호출 안 함
 
     async def test_add_update_and_delete_deltas_are_returned_for_one_atomic_job_commit(self, monkeypatch):
@@ -63,13 +63,13 @@ class TestGenerateMemory:
                 "price_source": None,
             }
 
-        async def fake_list_memories(*, user_id, project_id):
-            assert (user_id, project_id) == ("u1", "p1")
+        async def fake_list_memories(*, user_id, project_id, domain_id, include_account):
+            assert (user_id, project_id, domain_id, include_account) == ("u1", "p1", "d1", False)
             return [
                 {
                     "id": 5,
                     "scope": "project",
-                    "project_id": "p1",
+                    "project_id": "same-domain-other-project",
                     "category": "general",
                     "content": "기존 사실",
                     "status": "active",
@@ -120,7 +120,7 @@ class TestGenerateMemory:
         monkeypatch.setattr(me.credit, "apply_usage", fake_credit)
 
         result = await me.generate_memory_if_applicable(
-            conversation_id="c1", project_id="p1", run_id="r1", user_id="u1"
+            conversation_id="c1", project_id="p1", run_id="r1", user_id="u1", domain_id="d1",
         )
 
         assert result == [
@@ -200,7 +200,7 @@ class TestGenerateMemory:
         monkeypatch.setattr(me.provider_metadata, "native_catalog_entry", forbid_catalog)
         monkeypatch.setattr(me.provider_metadata, "bundled_cache_rates", forbid_catalog)
         assert await me.generate_memory_if_applicable(
-            conversation_id="c1", project_id="p1", run_id="r1", user_id="u1",
+            conversation_id="c1", project_id="p1", run_id="r1", user_id="u1", domain_id="d1",
         ) == []
         cost = captured["usage_cost"]
         assert cost.input_cost == 271_991 * Decimal("0.000003")
@@ -232,7 +232,7 @@ class TestGenerateMemory:
         monkeypatch.setattr(me.provider_client, "acompletion", failing_completion)
 
         with pytest.raises(me.MemoryExtractionRetryable):
-            await me.generate_memory_if_applicable(conversation_id="c1", project_id="p1", run_id="r1", user_id="u1")
+            await me.generate_memory_if_applicable(conversation_id="c1", project_id="p1", run_id="r1", user_id="u1", domain_id="d1")
 
     def test_normalize_ops_rejects_unknown_categories_and_duplicate_targets(self):
         existing = {

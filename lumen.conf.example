@@ -44,6 +44,7 @@ redis_sentinel_password = ""
 [lumen]
 # 정확히 64개의 hex 문자. lumen_encryption_key가 필요하다.
 lumen_encryption_key = "CHANGE_TO_64_HEX_CHARACTERS"
+# Dashboard Vault requires the environment-only LUMEN_AFTERGLOW_INGRESS_SECRET (32+ bytes).
 service_chat_enabled = true
 worker_concurrency = 4
 # Fixed workers keep existing text/media service; run batch on a separate process.

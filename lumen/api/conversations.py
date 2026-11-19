@@ -20,6 +20,7 @@ from lumen.auth import require_scopes
 from lumen.config import get_settings
 from lumen.services import capabilities
 from lumen.services import conversation_store as cs
+from lumen.services.domain_scope import history_domain_id
 from lumen.services.provider_metadata import is_gemini_decision_model, provider_family
 from lumen.services.providers import audio_transport, errors, image_transport, realtime_transport, repository, routing
 
@@ -49,6 +50,8 @@ class AvailableModel(BaseModel):
     context_limit: int | None = None
     # Whether reasoning_effort="none" passes chat admission for this model (same rule).
     reasoning_none_supported: bool = False
+    # Text models only: whether domain-paid chat can admit this model, with a reason code when not.
+    domain_billing: dict | None = None
     effective_input_price_per_million: Decimal | None = None
 
     model_config = {"protected_namespaces": ()}
@@ -100,6 +103,7 @@ async def list_available_models(
                     caps if isinstance(caps, dict) else None,
                     provider_type,
                 ),
+                **({"domain_billing": m.get("domain_billing")} if model_kind == "text" else {}),
                 **({"effective_input_price_per_million": m.get("effective_input_price_per_million")}
                    if model_kind == "decision" else {}),
             }
@@ -332,6 +336,7 @@ async def create_conversation(
         return await cs.create_conversation(
             project_id=token_info["project_id"],
             user_id=token_info["user_id"],
+            domain_id=history_domain_id(token_info),
             title=payload.title,
             model_name=payload.model_name,
             workspace_id=payload.workspace_id,
@@ -352,6 +357,7 @@ async def set_conversation_workspace(
             conversation_id,
             user_id=token_info["user_id"],
             project_id=token_info["project_id"],
+            domain_id=history_domain_id(token_info),
             workspace_id=payload.workspace_id,
         )
     except (
@@ -370,7 +376,11 @@ async def list_conversations(
 ):
     try:
         return await cs.list_conversations(
-            user_id=token_info["user_id"], project_id=token_info["project_id"], limit=limit, offset=offset
+            user_id=token_info["user_id"],
+            project_id=token_info["project_id"],
+            domain_id=history_domain_id(token_info),
+            limit=limit,
+            offset=offset,
         )
     except cs.ChatStorageUnavailable as exc:
         raise _map_error(exc) from exc
@@ -386,6 +396,7 @@ async def search_conversations(
         return await cs.search_conversations(
             user_id=token_info["user_id"],
             project_id=token_info["project_id"],
+            domain_id=history_domain_id(token_info),
             query=q,
             limit=limit,
         )
@@ -399,7 +410,10 @@ async def get_conversation(
 ):
     try:
         return await cs.get_conversation(
-            conversation_id, user_id=token_info["user_id"], project_id=token_info["project_id"]
+            conversation_id,
+            user_id=token_info["user_id"],
+            project_id=token_info["project_id"],
+            domain_id=history_domain_id(token_info),
         )
     except (cs.ConversationNotFound, cs.ConversationForbidden, cs.ChatStorageUnavailable) as exc:
         raise _map_error(exc) from exc
@@ -411,7 +425,10 @@ async def delete_conversation(
 ):
     try:
         await cs.delete_conversation(
-            conversation_id, user_id=token_info["user_id"], project_id=token_info["project_id"]
+            conversation_id,
+            user_id=token_info["user_id"],
+            project_id=token_info["project_id"],
+            domain_id=history_domain_id(token_info),
         )
     except (
         cs.ConversationNotFound,
@@ -431,11 +448,13 @@ async def list_messages(
     token_info: dict = Depends(require_scopes("native:conversations:read")),
 ):
     """Return an indexed page; cursor boundaries are exclusive and revision-fenced."""
+    domain_id = history_domain_id(token_info)
     try:
         await cs.get_conversation(
             conversation_id,
             user_id=token_info["user_id"],
             project_id=token_info["project_id"],
+            domain_id=domain_id,
         )
         if cursor is not None and anchor is not None:
             raise HTTPException(status_code=422, detail="anchor_and_cursor_are_mutually_exclusive")
@@ -449,6 +468,7 @@ async def list_messages(
             conversation_id,
             user_id=token_info["user_id"],
             project_id=token_info["project_id"],
+            domain_id=domain_id,
             anchor=anchor or "latest",
             cursor_direction=decoded["direction"] if decoded else None,
             cursor_position=decoded["position"] if decoded else None,
@@ -503,6 +523,7 @@ async def set_active_leaf(
             conversation_id,
             user_id=token_info["user_id"],
             project_id=token_info["project_id"],
+            domain_id=history_domain_id(token_info),
             message_id=payload.message_id,
             descend=payload.descend,
         )
@@ -525,6 +546,7 @@ async def fork_conversation(
             conversation_id,
             user_id=token_info["user_id"],
             project_id=token_info["project_id"],
+            domain_id=history_domain_id(token_info),
             message_id=payload.message_id,
         )
     except (

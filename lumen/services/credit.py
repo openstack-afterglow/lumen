@@ -3,11 +3,8 @@
 과금 모델: 모델별 raw_cost(USD) × margin_multiplier × credit_per_usd = credited_cost(크레딧).
 월간 쿼터 상한(used_quota_this_month ≥ max_quota_monthly)을 초과하면 요청을 차단한다.
 
-⚠️ 보안/정합성:
-- precheck 는 **fail-closed**: DB 장애 시 요청 거부(ChatStorageUnavailable → 503).
-- apply_usage 는 **원자적 SQL UPDATE**(used_quota += credited)로 동시요청 race 를 완화한다.
-- pre-check ↔ apply_usage 사이 TOCTOU 로 소폭 초과는 허용(하드락 미도입) — 내부 쿼터 용도.
-- 스트리밍 중단 시에도 호출부가 finally 에서 apply_usage 를 호출해 부분 사용량을 과금한다.
+- Payer locks come before project quota, runs and holds; all accounting reads use READ COMMITTED.
+- Domain credits are prepaid; user wallets retain their existing quota behavior.
 """
 
 from __future__ import annotations
@@ -24,8 +21,9 @@ from sqlalchemy.exc import IntegrityError, OperationalError
 
 from lumen.config import get_settings
 from lumen.db import get_session_factory, is_db_available, mark_db_unhealthy
+from lumen.models.billing import DomainCreditLedger, Payer
 from lumen.models.chat_db import ChatApiKey, ChatProviderUsage, ChatQuotaPolicy, ChatUsageLog, UserWallet
-from lumen.services import quota_policy
+from lumen.services import domain_credit, quota_policy
 from lumen.services.api_key_store import calculate_effective_limit
 from lumen.services.provider_metadata import UsageCost
 from lumen.services.providers.credentials import execution_identity
@@ -45,6 +43,93 @@ class ChatStorageUnavailable(RuntimeError):
 
 class QuotaExceeded(RuntimeError):
     """월 쿼터 초과 — 402."""
+
+class DomainCreditInsufficient(QuotaExceeded):
+    code = "domain_credit_insufficient"
+
+    def __init__(self):
+        super().__init__(self.code)
+
+
+def billing_payer(user_id: str, payer: Payer | None = None) -> Payer:
+    return payer if payer is not None else Payer("user", user_id, None)
+
+
+def run_payer(run) -> Payer:
+    domain_id = getattr(run, "payer_domain_id", None)
+    return Payer("domain", None, domain_id) if domain_id else billing_payer(run.user_id)
+
+
+def actor_id(value: str | None, api_key_id: int | None) -> str | None:
+    return None if api_key_id is not None and value == f"lumen:key:{api_key_id}" else value
+
+
+async def lock_wallet(session, user_id: str, project_id: str | None):
+    transaction = session.get_transaction()
+    marker, locked = session.info.get("locked_user_wallets", (None, {}))
+    if marker is not transaction:
+        locked = {}
+        session.info["locked_user_wallets"] = transaction, locked
+    if user_id in locked:
+        return locked[user_id]
+    wallet = await session.scalar(select(UserWallet).where(UserWallet.user_id == user_id)
+                                  .with_for_update().execution_options(populate_existing=True))
+    if wallet is None:
+        wallet = await _get_or_create_wallet(session, user_id, project_id)
+    locked[user_id] = wallet
+    return wallet
+
+
+async def lock_payer(session, payer: Payer, *, user_id: str, project_id: str | None, api_key_id: int | None):
+    """Lock pool, then the real user's wallet if needed; do not lock project/run rows here."""
+    if payer.domain_id is not None:
+        pool = await domain_credit.lock_pool(session, payer.domain_id)
+        if pool is None:
+            raise DomainCreditInsufficient()
+        if api_key_id is None:
+            await lock_wallet(session, user_id, project_id)
+        return pool
+    return await lock_wallet(session, payer.user_id, project_id)
+
+
+async def lock_run_payer(session, run_id: str):
+    from lumen.models.chat_runs import ChatRun
+
+    row = (await session.execute(select(
+        ChatRun.user_id, ChatRun.project_id, ChatRun.api_key_id, ChatRun.payer_domain_id,
+    ).where(ChatRun.id == run_id))).one_or_none()
+    if row is not None:
+        await lock_payer(session, run_payer(row), user_id=row.user_id,
+                         project_id=row.project_id, api_key_id=row.api_key_id)
+
+
+async def charge_domain_in_transaction(session, *, payer: Payer, amount: Decimal, reference: str,
+                                       user_id: str | None) -> None:
+    if payer.domain_id is None:
+        raise ValueError("domain payer required")
+    pool = await domain_credit.lock_pool(session, payer.domain_id)
+    if pool is None or amount > pool.balance_credits:
+        raise DomainCreditInsufficient()
+    pool.monthly_used_credits += amount
+    domain_credit.append_entry(session, pool, kind="charge", amount=-amount, reference=reference,
+                               actor_user_id=user_id)
+
+
+async def release_domain_in_transaction(session, *, payer: Payer, reference: str, user_id: str | None) -> None:
+    """Release a proven unused hold; no balance was debited, so its ledger delta is zero."""
+    if payer.domain_id is not None:
+        pool = await domain_credit.lock_pool(session, payer.domain_id)
+        domain_credit.append_entry(session, pool, kind="refund", amount=Decimal(0), reference=reference,
+                                   actor_user_id=user_id, note="unused reservation released")
+        await domain_credit.refresh_reserved(session, pool)
+
+
+async def refresh_domain_reserved(session, payer: Payer) -> None:
+    if payer.domain_id is not None:
+        pool = await domain_credit.lock_pool(session, payer.domain_id)
+        if pool is not None:
+            await domain_credit.refresh_reserved(session, pool)
+
 
 
 class QuotaLimitConflict(ValueError):
@@ -395,6 +480,7 @@ async def _ledger_credited_since(
     since: datetime,
     user_id: str | None = None,
     api_key_id: int | None = None,
+    user_payer_only: bool = False,
     api_only: bool = False,
 ) -> Decimal:
     stmt = select(func.coalesce(func.sum(ChatUsageLog.credited_cost), Decimal("0"))).where(
@@ -402,6 +488,8 @@ async def _ledger_credited_since(
     )
     if user_id is not None:
         stmt = stmt.where(ChatUsageLog.user_id == user_id, ChatUsageLog.source != "system")
+    if user_payer_only:
+        stmt = stmt.where(ChatUsageLog.payer_domain_id.is_(None))
     if api_key_id is not None:
         stmt = stmt.where(ChatUsageLog.api_key_id == api_key_id)
     if api_only:
@@ -409,75 +497,102 @@ async def _ledger_credited_since(
     return Decimal(str((await session.execute(stmt)).scalar_one()))
 
 
-async def reserve_call_credit_in_transaction(session, *, user_id: str, project_id: str,
-                                             api_key_id: int | None, bound: Decimal) -> None:
-    """Serialize provider-call starts on the wallet and count unsettled holds before I/O.
-
-    Shared by durable text, media and realtime calls. Call only from a READ
-    COMMITTED transaction set before its first statement: earlier run reads
-    otherwise pin a stale REPEATABLE READ snapshot. Held and ledger aggregates
-    must stay nonlocking: their unindexed FOR UPDATE scans can block another
-    user's reservation insert. Failed or uncertain calls retain their bound until
-    reconciliation; settled calls enter the ledger. A zero bound is only valid
-    for a route whose frozen prices are explicitly free; it still passes every
-    wallet/key gate. No remote I/O runs under this row lock.
-    """
-    from lumen.models.chat_runs import ChatModelCallReservation, ChatRun
-    from lumen.models.stateless_reservations import StatelessCallReservation
+async def reserve_call_credit_in_transaction(session, *, user_id: str, project_id: str | None,
+                                             api_key_id: int | None, bound: Decimal,
+                                             payer: Payer | None = None, precheck: bool = False) -> None:
+    """Check bounded headroom under the payer lock, before recording the caller's hold."""
+    payer = billing_payer(user_id, payer)
 
     if not bound.is_finite() or bound < 0:
         raise QuotaExceeded("호출 사용 한도가 올바르지 않습니다")
-    # A plain session.get() before this lock pins a REPEATABLE READ snapshot and
-    # can miss a competing reservation committed while waiting for the wallet.
-    wallet = (await session.execute(select(UserWallet).where(UserWallet.user_id == user_id)
-              .with_for_update().execution_options(populate_existing=True))).scalar_one_or_none()
-    if wallet is None:
-        wallet = await _get_or_create_wallet(session, user_id, project_id)
+    if payer.scope == "user" and payer.user_id != user_id:
+        raise ValueError("user payer does not match billing actor")
+    account = await lock_payer(session, payer, user_id=user_id, project_id=project_id, api_key_id=api_key_id)
+
+    def exceeded(used, limit):
+        return used + bound > limit or (precheck and used >= limit)
+
+    if payer.domain_id is not None:
+        pending = await domain_credit.pending(session, payer.domain_id)
+        limit = domain_credit.effective_limit(account)
+        if (not account.is_active or exceeded(pending, account.balance_credits)
+                or (limit is not None and exceeded(account.monthly_used_credits + pending, limit))):
+            raise DomainCreditInsufficient()
+        if api_key_id is None:
+            wallet = await session.get(UserWallet, user_id)
+            _maybe_reset_month(wallet)
+            if not wallet.is_active:
+                raise QuotaExceeded("비활성 지갑입니다")
+            system = await quota_policy.get_system_quota(session, user_id)
+            await _check_actor_monthly(session, user_id, wallet, system.monthly, exceeded)
+        else:
+            key = await _domain_key(session, api_key_id, payer.domain_id)
+            if any(value is not None for value in (key.owner_monthly_credit_limit, key.admin_monthly_credit_limit,
+                                                   key.owner_weekly_credit_limit)):
+                key_pending = await domain_credit.pending(session, payer.domain_id, api_key_id=api_key_id)
+                await _check_key_caps(session, key, key_pending, exceeded)
+        return
+
+    wallet = account
     _maybe_reset_month(wallet)
     if not wallet.is_active:
         raise QuotaExceeded("비활성 지갑입니다")
-    held = select(func.coalesce(func.sum(ChatModelCallReservation.bound_credits), Decimal("0"))).join(
-        ChatRun, ChatRun.id == ChatModelCallReservation.run_id).where(
-        ChatRun.user_id == user_id, ChatModelCallReservation.status.in_(("reserved", "unknown"))
-    )
-    stateless_held = select(func.coalesce(func.sum(StatelessCallReservation.bound_credits), Decimal("0"))).where(
-        StatelessCallReservation.user_id == user_id,
-        StatelessCallReservation.status.in_(("reserved", "unknown")),
-    )
-    pending = Decimal(str((await session.execute(held)).scalar_one()))
-    pending += Decimal(str((await session.execute(stateless_held)).scalar_one()))
     system = await quota_policy.get_system_quota(session, user_id)
-    if system.monthly > 0 and wallet.used_quota_this_month + pending + bound > system.monthly:
-        raise QuotaExceeded("월 사용 한도를 초과했습니다")
+    await _check_actor_monthly(session, user_id, wallet, system.monthly, exceeded)
     if system.weekly > 0:
-        usage = await _ledger_credited_since(session, since=week_start(), user_id=user_id)
-        if usage + pending + bound > system.weekly:
+        usage = await _ledger_credited_since(session, since=week_start(), user_id=payer.user_id, user_payer_only=True)
+        pending = await domain_credit.pending(session, None, actor_user_id=user_id, user_funded=True)
+        if exceeded(usage + pending, system.weekly):
             raise QuotaExceeded("주간 사용 한도를 초과했습니다")
     if api_key_id is not None:
         key = await session.get(ChatApiKey, api_key_id)
-        if (key is None or key.owner_user_id != user_id or key.owner_project_id != project_id
+        partitioned_key = project_id == f"lumen:key:{api_key_id}"
+        if (key is None or key.owner_user_id != payer.user_id
+                or (not partitioned_key and project_id is not None and key.owner_project_id != project_id)
                 or not key.is_active or key.revoked_at is not None):
             raise ChatStorageUnavailable("chat DB 오류")
-        held_key = held.where(ChatRun.api_key_id == api_key_id)
-        key_pending = Decimal(str((await session.execute(held_key)).scalar_one()))
-        key_pending += Decimal(str((await session.execute(
-            stateless_held.where(StatelessCallReservation.api_key_id == api_key_id)
-        )).scalar_one()))
-        monthly = calculate_effective_limit(key.owner_monthly_credit_limit,
-                                            key.admin_monthly_credit_limit, system.monthly)
-        if monthly is not None:
-            usage = await _ledger_credited_since(session, since=month_start(), api_key_id=api_key_id, api_only=True)
-            if usage + key_pending + bound > monthly:
-                raise QuotaExceeded("API 키 월 사용 한도를 초과했습니다")
-        weekly = calculate_effective_limit(key.owner_weekly_credit_limit, None, system.weekly)
-        if weekly is not None:
-            usage = await _ledger_credited_since(session, since=week_start(), api_key_id=api_key_id, api_only=True)
-            if usage + key_pending + bound > weekly:
-                raise QuotaExceeded("API 키 주간 사용 한도를 초과했습니다")
+        key_pending = await domain_credit.pending(session, None, actor_user_id=user_id,
+                                                  api_key_id=api_key_id, user_funded=True)
+        await _check_key_caps(session, key, key_pending, exceeded, monthly_default=system.monthly,
+                              weekly_default=system.weekly)
+
+
+async def _check_actor_monthly(session, user_id: str, wallet: UserWallet, limit: Decimal, exceeded) -> None:
+    """Account for all payer paths under the common actor wallet lock."""
+    if limit <= 0:
+        return
+    ledger = DomainCreditLedger
+    domain_spend = await session.scalar(select(func.coalesce(func.sum(-ledger.amount_credits), 0)).where(
+        ledger.actor_user_id == user_id, ledger.kind == "charge", ledger.created_at >= month_start(),
+    ))
+    pending = await domain_credit.pending(session, None, actor_user_id=user_id)
+    if exceeded(wallet.used_quota_this_month + domain_spend + pending, limit):
+        raise QuotaExceeded("월 사용 한도를 초과했습니다")
+
+
+async def _domain_key(session, api_key_id: int, domain_id: str) -> ChatApiKey:
+    key = await session.get(ChatApiKey, api_key_id)
+    if (key is None or getattr(key, "owner_domain_id", None) != domain_id
+            or not key.is_active or key.revoked_at is not None):
+        raise ChatStorageUnavailable("chat DB 오류")
+    return key
+
+
+async def _check_key_caps(session, key, pending, exceeded, *, monthly_default=Decimal(0), weekly_default=Decimal(0)):
+    monthly = calculate_effective_limit(key.owner_monthly_credit_limit, key.admin_monthly_credit_limit, monthly_default)
+    if monthly is not None:
+        usage = await _ledger_credited_since(session, since=month_start(), api_key_id=key.id, api_only=True)
+        if exceeded(usage + pending, monthly):
+            raise QuotaExceeded("API 키 월 사용 한도를 초과했습니다")
+    weekly = calculate_effective_limit(key.owner_weekly_credit_limit, None, weekly_default)
+    if weekly is not None:
+        usage = await _ledger_credited_since(session, since=week_start(), api_key_id=key.id, api_only=True)
+        if exceeded(usage + pending, weekly):
+            raise QuotaExceeded("API 키 주간 사용 한도를 초과했습니다")
 
 
 async def precheck(user_id: str, project_id: str | None = None, api_key_id: int | None = None,
-                   *, bound: Decimal | None = None) -> None:
+                   *, bound: Decimal | None = None, payer: Payer | None = None) -> None:
     """Reject exhausted quotas, or insufficient headroom when a call bound is known.
 
     No hold is recorded here. The worker reruns the bound check under the same
@@ -485,25 +600,29 @@ async def precheck(user_id: str, project_id: str | None = None, api_key_id: int 
     """
     from lumen.services.durable_runs.budgets import retry_deadlocks
 
+    if bound is None and payer is None:
+        await _precheck_user(user_id, project_id, api_key_id)
+        return
+
     async def check_bound():
-        assert bound is not None
         async with _require_db()() as session, session.begin():
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
             await reserve_call_credit_in_transaction(session, user_id=user_id, project_id=project_id,
-                                                      api_key_id=api_key_id, bound=bound)
+                                                      api_key_id=api_key_id, payer=payer,
+                                                      bound=bound if bound is not None else Decimal(0),
+                                                      precheck=bound is None)
 
     try:
-        await retry_deadlocks(check_bound if bound is not None else lambda: _precheck_once(user_id, project_id, api_key_id))
+        await retry_deadlocks(check_bound)
     except OperationalError as exc:  # only a lock conflict that outlived the retries reaches here
         raise ChatStorageUnavailable("chat DB 오류") from exc
 
+async def _precheck_user(user_id: str, project_id: str | None, api_key_id: int | None) -> None:
+    """Keep the existing advisory wallet check; bounded calls recheck under lock."""
+    from lumen.services.durable_runs.budgets import is_lock_conflict, retry_deadlocks
 
-async def _precheck_once(user_id: str, project_id: str | None, api_key_id: int | None) -> None:
-    from lumen.services.durable_runs.budgets import is_lock_conflict
-
-    factory = _require_db()
-    try:
-        async with factory() as session, session.begin():
+    async def transaction():
+        async with _require_db()() as session, session.begin():
             wallet = await _get_or_create_wallet(session, user_id, project_id)
             _maybe_reset_month(wallet)
             system = await quota_policy.get_system_quota(session, user_id)
@@ -512,84 +631,24 @@ async def _precheck_once(user_id: str, project_id: str | None, api_key_id: int |
             if system.monthly > 0 and wallet.used_quota_this_month >= system.monthly:
                 raise QuotaExceeded("월 사용 한도를 초과했습니다")
             if system.weekly > 0:
-                week_usage = await _ledger_credited_since(
-                    session,
-                    since=week_start(),
-                    user_id=user_id,
-                )
-                if week_usage >= system.weekly:
+                used = await _ledger_credited_since(session, since=week_start(), user_id=user_id, user_payer_only=True)
+                if used >= system.weekly:
                     raise QuotaExceeded("주간 사용 한도를 초과했습니다")
-
             if api_key_id is not None:
-                key_row = await session.get(ChatApiKey, api_key_id)
-                if key_row is None or key_row.owner_user_id != user_id:
+                key = await session.get(ChatApiKey, api_key_id)
+                if (key is None or key.owner_user_id != user_id or not key.is_active or key.revoked_at is not None
+                        or (project_id not in (None, f"lumen:key:{api_key_id}", key.owner_project_id))):
                     raise ChatStorageUnavailable("chat DB 오류")
-                if project_id is not None and key_row.owner_project_id != project_id:
-                    raise ChatStorageUnavailable("chat DB 오류")
-                if not key_row.is_active or key_row.revoked_at is not None:
-                    raise ChatStorageUnavailable("chat DB 오류")
+                await _check_key_caps(session, key, Decimal(0), lambda used, limit: used >= limit,
+                                      monthly_default=system.monthly, weekly_default=system.weekly)
 
-                owner_lim = key_row.owner_monthly_credit_limit
-                admin_lim = key_row.admin_monthly_credit_limit
-                owner_weekly = key_row.owner_weekly_credit_limit
-
-                if owner_lim is not None:
-                    if not isinstance(owner_lim, Decimal):
-                        try:
-                            owner_lim = Decimal(str(owner_lim))
-                        except Exception as exc:
-                            raise ChatStorageUnavailable("chat DB 오류") from exc
-                    if not owner_lim.is_finite() or owner_lim <= 0:
-                        raise ChatStorageUnavailable("chat DB 오류")
-
-                if owner_weekly is not None:
-                    if not isinstance(owner_weekly, Decimal):
-                        try:
-                            owner_weekly = Decimal(str(owner_weekly))
-                        except Exception as exc:
-                            raise ChatStorageUnavailable("chat DB 오류") from exc
-                    if not owner_weekly.is_finite() or owner_weekly <= 0:
-                        raise ChatStorageUnavailable("chat DB 오류")
-                if admin_lim is not None:
-                    if not isinstance(admin_lim, Decimal):
-                        try:
-                            admin_lim = Decimal(str(admin_lim))
-                        except Exception as exc:
-                            raise ChatStorageUnavailable("chat DB 오류") from exc
-                    if not admin_lim.is_finite() or admin_lim <= 0:
-                        raise ChatStorageUnavailable("chat DB 오류")
-
-                effective_limit = calculate_effective_limit(owner_lim, admin_lim, system.monthly)
-                if effective_limit is not None:
-                    month_usage = await _ledger_credited_since(
-                        session,
-                        since=month_start(),
-                        api_key_id=api_key_id,
-                        api_only=True,
-                    )
-                    if month_usage >= effective_limit:
-                        raise QuotaExceeded("API 키 월 사용 한도를 초과했습니다")
-
-                effective_weekly = calculate_effective_limit(
-                    owner_weekly,
-                    None,
-                    system.weekly,
-                )
-                if effective_weekly is not None:
-                    key_week_usage = await _ledger_credited_since(
-                        session,
-                        since=week_start(),
-                        api_key_id=api_key_id,
-                        api_only=True,
-                    )
-                    if key_week_usage >= effective_weekly:
-                        raise QuotaExceeded("API 키 주간 사용 한도를 초과했습니다")
+    try:
+        await retry_deadlocks(transaction)
     except (QuotaExceeded, ChatStorageUnavailable):
         raise
     except OperationalError as exc:
-        if is_lock_conflict(exc):
-            raise
-        mark_db_unhealthy()
+        if not is_lock_conflict(exc):
+            mark_db_unhealthy()
         raise ChatStorageUnavailable("chat DB 오류") from exc
     except Exception as exc:
         raise ChatStorageUnavailable("chat DB 오류") from exc
@@ -860,8 +919,9 @@ async def apply_usage_in_transaction(
     session,
     *,
     event_id: str,
-    user_id: str,
-    project_id: str,
+    user_id: str | None,
+    project_id: str | None,
+    payer: Payer | None = None,
     model_name: str,
     provider: str | None,
     prompt_tokens: int,
@@ -874,6 +934,7 @@ async def apply_usage_in_transaction(
     api_key_id: int | None = None,
     run_id: str | None = None,
     charge_wallet: bool = True,
+    settled_credits: Decimal | None = None,
     usage_components: list[dict[str, Any]] | None = None,
     breakdown: UsageBreakdown | None = None,
     execution_route: dict[str, Any] | None = None,
@@ -888,7 +949,11 @@ async def apply_usage_in_transaction(
     if breakdown is not None and breakdown.input_tokens != int(prompt_tokens):
         raise ValueError("usage breakdown total does not match prompt_tokens")
     cache_columns = breakdown.cache_fields() if breakdown is not None else {}
-    credited = credits_for_cost(usage_cost.raw_cost, margin_multiplier, credit_per_usd)
+    payer = billing_payer(user_id, payer)
+    if settled_credits is not None and (payer.domain_id is None or charge_wallet):
+        raise ValueError("only a prepaid usage projection can supply settled credits")
+    credited = (settled_credits if settled_credits is not None
+                else credits_for_cost(usage_cost.raw_cost, margin_multiplier, credit_per_usd))
     pricing_snapshot = {
         **usage_cost.pricing_snapshot,
         "margin_multiplier": format(Decimal(margin_multiplier), "f"),
@@ -904,8 +969,11 @@ async def apply_usage_in_transaction(
     session.add(
         ChatUsageLog(
             event_id=event_id,
-            project_id=project_id,
-            user_id=user_id,
+            project_id=actor_id(project_id, api_key_id),
+            user_id=actor_id(user_id, api_key_id),
+            domain_id=payer.domain_id,
+            billing_scope=payer.scope,
+            **payer.columns(),
             conversation_id=conversation_id,
             model_name=model_name,
             provider=provider,
@@ -935,15 +1003,21 @@ async def apply_usage_in_transaction(
         completion_tokens=int(completion_tokens), raw_cost=usage_cost.raw_cost,
     ):
         session.add(ChatProviderUsage(event_id=event_id, **allocation))
+    # The unique event row comes first: a concurrent replay of the same event blocks on its key and
+    # then replays, instead of racing this transaction to the wallet or pool row.
     await session.flush()
-    if charge_wallet:
-        wallet = await _get_or_create_wallet(session, user_id, project_id)
+    if charge_wallet and payer.domain_id is not None:
+        await charge_domain_in_transaction(session, payer=payer, amount=credited, reference=event_id,
+                                           user_id=actor_id(user_id, api_key_id))
+    if charge_wallet and payer.scope == "user":
+        wallet = await _get_or_create_wallet(session, payer.user_id, project_id)
         _maybe_reset_month(wallet)
         await session.execute(
             update(UserWallet)
-            .where(UserWallet.user_id == user_id)
+            .where(UserWallet.user_id == payer.user_id)
             .values(used_quota_this_month=UserWallet.used_quota_this_month + credited)
         )
+    await session.flush()
     return credited
 
 
@@ -952,6 +1026,7 @@ async def apply_usage(
     event_id: str,
     user_id: str,
     project_id: str,
+    payer: Payer | None = None,
     model_name: str,
     provider: str | None,
     prompt_tokens: int,
@@ -977,6 +1052,7 @@ async def apply_usage(
                         event_id=event_id,
                         user_id=user_id,
                         project_id=project_id,
+                        payer=payer,
                         model_name=model_name,
                         provider=provider,
                         prompt_tokens=prompt_tokens,

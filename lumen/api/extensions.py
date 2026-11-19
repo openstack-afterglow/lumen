@@ -269,9 +269,10 @@ async def admin_update_mcp_connection(item_id: int, body: AdminMcpConnectionPatc
 async def admin_refresh_mcp_connection_catalog(item_id: int, token_info: dict = Depends(require_admin)):
     """Re-discover one connection's tools. An OAuth connection is discovered with the caller's own token."""
     try:
-        return await mcp_connections.refresh_catalog(
-            item_id, user_id=token_info.get("user_id"), project_id=token_info.get("project_id")
-        )
+        with mcp_settings.actor(token_info):
+            return await mcp_connections.refresh_catalog(
+                item_id, user_id=token_info.get("user_id"), project_id=token_info.get("project_id")
+            )
     except mcp_registry_model.McpRegistryError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except _EXC as exc:
@@ -409,10 +410,11 @@ async def user_list_mcp(
 async def user_create_mcp(body: McpServerBody, token_info: dict = Depends(require_scopes("native:mcp:write"))):
     uid, pid = _owner(token_info)
     try:
-        source = await es.create(
-            "mcp", body.model_dump(exclude_unset=True), scope="user", owner_user_id=uid, owner_project_id=pid
-        )
-        return {**source, **(await mcp_oauth.detect(source["id"], user_id=uid, project_id=pid))}
+        with mcp_settings.actor(token_info):
+            source = await es.create(
+                "mcp", body.model_dump(exclude_unset=True), scope="user", owner_user_id=uid, owner_project_id=pid
+            )
+            return {**source, **(await mcp_oauth.detect(source["id"], user_id=uid, project_id=pid))}
     except _EXC + (mcp_oauth.McpOAuthError,) as exc:
         raise _http(exc) from exc
 
@@ -438,12 +440,13 @@ async def user_update_mcp(
 ):
     uid, pid = _owner(token_info)
     try:
-        source = await es.update(
-            "mcp", item_id, body.model_dump(exclude_unset=True), requester_user_id=uid, requester_project_id=pid
-        )
-        if "url" in body.model_fields_set:
-            return {**source, **(await mcp_oauth.detect(source["id"], user_id=uid, project_id=pid))}
-        return source
+        with mcp_settings.actor(token_info):
+            source = await es.update(
+                "mcp", item_id, body.model_dump(exclude_unset=True), requester_user_id=uid, requester_project_id=pid
+            )
+            if "url" in body.model_fields_set:
+                return {**source, **(await mcp_oauth.detect(source["id"], user_id=uid, project_id=pid))}
+            return source
     except _EXC + (mcp_oauth.McpOAuthError,) as exc:
         raise _http(exc) from exc
 
@@ -452,7 +455,8 @@ async def user_update_mcp(
 async def user_delete_mcp(item_id: int, token_info: dict = Depends(require_scopes("native:extensions:delete"))):
     uid, pid = _owner(token_info)
     try:
-        await es.delete("mcp", item_id, requester_user_id=uid, requester_project_id=pid)
+        with mcp_settings.actor(token_info):
+            await es.delete("mcp", item_id, requester_user_id=uid, requester_project_id=pid)
     except _EXC as exc:
         raise _http(exc) from exc
 
@@ -471,9 +475,7 @@ async def user_get_mcp_oauth_status(item_id: int, token_info: dict = Depends(req
 async def user_start_mcp_oauth(
     item_id: int, request: Request, response: Response, token_info: dict = Depends(require_scopes("native:mcp:write"))
 ):
-    if token_info["auth_type"] == "api_key":
-        raise HTTPException(status_code=403, detail="MCP OAuth 시작은 Keystone 세션이 필요합니다")
-    if token_info.get("credential_restricted"):
+    if not mcp_settings.human(token_info):
         raise HTTPException(status_code=403, detail="MCP OAuth approval requires an unrestricted human session")
     uid, pid = _owner(token_info)
     initiator_nonce = secrets.token_urlsafe(32)
@@ -520,7 +522,8 @@ async def user_list_tools(token_info: dict = Depends(require_scopes("native:exte
     uid, pid = _owner(token_info)
     # 선택적 기능 목록: 저장소 미가용/데이터 없음은 빈 목록으로 graceful 처리(503 아님).
     try:
-        return await es.list_for_user("tool", user_id=uid, project_id=pid)
+        with mcp_settings.actor(token_info):
+            return await es.list_for_user("tool", user_id=uid, project_id=pid)
     except es.ChatStorageUnavailable:
         return []
     except _EXC as exc:
@@ -531,9 +534,10 @@ async def user_list_tools(token_info: dict = Depends(require_scopes("native:exte
 async def user_create_tool(body: CustomToolBody, token_info: dict = Depends(require_scopes("native:extensions:write"))):
     uid, pid = _owner(token_info)
     try:
-        return await es.create(
-            "tool", body.model_dump(exclude_unset=True), scope="user", owner_user_id=uid, owner_project_id=pid
-        )
+        with mcp_settings.actor(token_info):
+            return await es.create(
+                "tool", body.model_dump(exclude_unset=True), scope="user", owner_user_id=uid, owner_project_id=pid
+            )
     except _EXC as exc:
         raise _http(exc) from exc
 
@@ -544,9 +548,10 @@ async def user_update_tool(
 ):
     uid, pid = _owner(token_info)
     try:
-        return await es.update(
-            "tool", item_id, body.model_dump(exclude_unset=True), requester_user_id=uid, requester_project_id=pid
-        )
+        with mcp_settings.actor(token_info):
+            return await es.update(
+                "tool", item_id, body.model_dump(exclude_unset=True), requester_user_id=uid, requester_project_id=pid
+            )
     except _EXC as exc:
         raise _http(exc) from exc
 
@@ -555,7 +560,63 @@ async def user_update_tool(
 async def user_delete_tool(item_id: int, token_info: dict = Depends(require_scopes("native:extensions:delete"))):
     uid, pid = _owner(token_info)
     try:
-        await es.delete("tool", item_id, requester_user_id=uid, requester_project_id=pid)
+        with mcp_settings.actor(token_info):
+            await es.delete("tool", item_id, requester_user_id=uid, requester_project_id=pid)
+    except _EXC as exc:
+        raise _http(exc) from exc
+
+
+@user_router.get("/domains/{domain_id}/custom-tools")
+async def user_list_domain_tools(
+    domain_id: str, token_info: dict = Depends(require_scopes("native:extensions:read")),
+):
+    uid, pid = _owner(token_info)
+    try:
+        with mcp_settings.actor(token_info):
+            return await es.list_domain_tools(domain_id, user_id=uid, project_id=pid)
+    except _EXC as exc:
+        raise _http(exc) from exc
+
+
+@user_router.post("/domains/{domain_id}/custom-tools", status_code=201)
+async def user_create_domain_tool(
+    domain_id: str, body: CustomToolBody, token_info: dict = Depends(require_scopes("native:extensions:write")),
+):
+    uid, pid = _owner(token_info)
+    try:
+        with mcp_settings.actor(token_info):
+            return await es.create(
+                "tool", body.model_dump(exclude_unset=True), scope="domain",
+                owner_user_id=uid, owner_project_id=pid, owner_domain_id=domain_id,
+            )
+    except _EXC as exc:
+        raise _http(exc) from exc
+
+
+@user_router.patch("/domains/{domain_id}/custom-tools/{item_id}")
+async def user_update_domain_tool(
+    domain_id: str, item_id: int, body: CustomToolBody,
+    token_info: dict = Depends(require_scopes("native:extensions:write")),
+):
+    uid, pid = _owner(token_info)
+    try:
+        with mcp_settings.actor(token_info):
+            return await es.update(
+                "tool", item_id, body.model_dump(exclude_unset=True),
+                requester_user_id=uid, requester_project_id=pid, domain_id=domain_id,
+            )
+    except _EXC as exc:
+        raise _http(exc) from exc
+
+
+@user_router.delete("/domains/{domain_id}/custom-tools/{item_id}", status_code=204)
+async def user_delete_domain_tool(
+    domain_id: str, item_id: int, token_info: dict = Depends(require_scopes("native:extensions:delete")),
+):
+    uid, pid = _owner(token_info)
+    try:
+        with mcp_settings.actor(token_info):
+            await es.delete("tool", item_id, requester_user_id=uid, requester_project_id=pid, domain_id=domain_id)
     except _EXC as exc:
         raise _http(exc) from exc
 

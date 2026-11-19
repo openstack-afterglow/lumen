@@ -1,5 +1,68 @@
 # 테스트
 
+## 0.6.21 domain-scope integration (`chore/ds-final-integration`)
+
+Integrated tree `feat/domain-scope-service-keys` (`3520ece`: migrations 036–040, Gemini compat, leaf image pricing, client-tool key policy, billing dispatch fixes) plus test-infra fixes, 2026-11-19, CPython 3.13 (host) / 3.12 (system image).
+
+- `lumen/data/schema_snapshot.sql` regenerated on disposable MariaDB with every ledger migration applied (`LUMEN_UPDATE_SCHEMA_SNAPSHOT=1 lumen-test integration -k schema_snapshot`); without the variable the snapshot test passed (1 passed).
+- `docs/api` regenerated from `app.openapi()` after mapping Agent Vault, Chat Extension Archives, Decisions, Domain Credits, Embeddings, Gemini Compat, OpenAI Decisions Compat and OpenAI and Gemini Embeddings Compat and labelling `GoogleApiKey`: 264 operations, no unmapped tag, a second run is byte-identical. The generator has no check mode.
+- Order dependency: `test_title_recovery…` in `test_native_api_key_flow.py` leaves 23 unready conversations and only `lumen-migrate --apply` projects them, so the domain billing migration dry-run returned `([], 23)` after it. The test now converges with an apply that must replay nothing, then keeps the dry-run and apply `([], 0)` assertions. Native-first (dirty and fresh database) and domain-first orders passed.
+- Test-infra fixes: the SSE admission summary-route fake accepts `domain_paid` (10 contract failures), a merge-duplicated `domain_id` fixture key (Ruff F601), and the Gemini decisions system key now carries the documented `decisions:write` action.
+- `test-passed`: contract pytest 8,727 passed, 1 failed, 876 deselected; root Ruff clean; SDK 145 passed; SDK Ruff clean. `lumen-test integration` 832 passed, 4 skipped, 8,768 deselected. `lumen-test system` 36 passed, 4 failed.
+- Remaining failures are new since 0.6.20 (the four system cases passed on tag `0.6.20`, 7 selected): contract `test_gemini_api_key_header_uses_regular_scoped_key_authority` (403 `Model API keys cannot access this endpoint`; Gemini compat follow-up pending). System `test_process_stack_temp_completion_e2e` expects `lumen` in a model key's `/v1/models`, which `ea7d808` removed deliberately. `test_process_stack_native_protocols_and_gateway_device_login` and `test_process_stack_discovers_and_routes_new_claude_without_restart` get 422 `Model context or output bound unavailable` because `ea7d808` requires `context_limit` for payer-bound unbounded routes and the fake Claude rows have none. `test_member_api_key_action_scopes_at_native_and_compat_http[tools]` still expects compat 403 although `6cad1f6` gave `tools` no scope and `5f175f5` forwards client tools.
+- Release prep `chore/release-0.6.21` (`b34fd3f`, version 0.6.21 on top of `54d6a61`), 2026-11-19, fresh `git clone --no-hardlinks`, `uv sync --frozen --extra service --extra dev` (CPython 3.13 host; system image 3.12). `test-passed`: `uv run --frozen lumen-test contract` 8,744 passed, 876 deselected, root Ruff clean, SDK 145 passed, SDK Ruff clean. `uv run --frozen lumen-test integration` 832 passed, 4 skipped, 8,784 deselected. `uv run --frozen lumen-test system` 40 passed. No failures; the failures listed above are resolved in the integrated tree. Synthetic Keystone/provider only; no live provider, production IAM, migration rehearsal on a production copy, image build or rollout.
+- Final release prep `chore/release-0.6.21-final` (`c253ff5`: integration `9e99091` merged on top of docs `8fca9e9` and CHANGELOG `182a8b6`), 2026-11-19, fresh `git clone --no-hardlinks`, `uv sync --frozen --extra service --extra dev`. `test-passed`: `uv run --frozen lumen-test contract` 8,794 passed, 888 deselected, root Ruff clean, SDK 145 passed, SDK Ruff clean (CPython 3.13.12). `uv run --frozen lumen-test integration -rs` 844 passed, 4 skipped, 8,834 deselected; skips are `test_approval_recovery.py` ×3 (needs `LUMEN_TEST_CHECKPOINTER_POSTGRES_URL`) and `test_valkey_sentinel.py` ×1 (needs an owned Valkey topology); `test_schema_snapshot_matches_the_ledger_result` passed, so `lumen/data/schema_snapshot.sql` matches migrations 001–040 including the rewritten 037. `uv run --frozen lumen-test system -rs` 40 passed (CPython 3.12.16 image). `scripts/gen_api_docs.py` from `app.openapi()` left `docs/api` byte-identical (264 operations). Architecture stamp and check passed. Synthetic Keystone/provider only.
+
+## Leaf media price overrides
+
+`test-passed`: 734 focused pytest cases across model routing, provider catalog, native-catalog admin, credit, image transport/compat, modality pricing and media rejection, plus Ruff on changed Python files. New cases cover a leaf override of only image output keeping catalog image input and token basis, null leaf clearing, replace-mode rows, exact-key variant overlay, merged readiness/validation (including a non-media PATCH and a rename on a leaf row), no-catalog leaf rows and admin provenance. Ten unrelated `tests/test_chat_cache_pricing.py` executor cases (`payer_domain_id`/`usage_record`) fail identically on the unmodified base. `lumen-test integration -k token_usage` on disposable MariaDB/Redis passed 17 cases, including `catalog_leaf_edited`: the durable image admission snapshot freezes merged catalog input + manual output rates and settlement uses them. No live provider or deployment check ran. `scripts/gen_api_docs.py` was not rerun because it already fails on the unmapped `Agent Vault` tag.
+
+Image unit readiness follow-up: `test-passed` with 734 focused cases and Ruff. Base-only unit pricing is not ready (`pricing_unavailable`). A Gemini 2.5 row with only a positive `1024x1024:high` variant is not ready (`unsupported_image_variants`), and adding `1024x1024:auto` makes it ready. Leaf variant overlays count toward readiness. The full `lumen-test integration` run on disposable MariaDB/Redis had 814 passed, 4 skipped and 5 failed. None of the failures involve pricing: `keystone_session_required` in `test_native_api_key_flow.py`, a missing `payer_domain_id` column in `test_runtime_workload_migration.py`, and a stale schema snapshot.
+
+## Gemini Models API and SDK compatibility
+
+`test-passed` locally (2026-11-19, CPython 3.13.12, `google-genai==3.5.0`, `openai==2.53.0`, `anthropic==0.125.0`). `tests/test_gemini_sdk_compat.py`, `tests/test_official_sdk_compat.py`, `tests/test_embeddings_api.py` and `tests/test_cli_model_catalog.py`: 138 passed. The official clients call the real mounted ASGI app. Only the API-key lookup, credential decryption, credit precheck/settlement, an in-memory SQLite catalog and the private Bifrost endpoint are synthetic.
+
+Gen AI coverage:
+- discovery: models.list paging through `pageToken`; exact text and embedding names for duplicated public IDs; chat-eligibility discovery (tools- and streaming-disabled priced model listed with `generateContent` only and callable; unpriced model hidden); models.get bare/exact/ambiguous-409/`X-Lumen-Provider`;
+- native Gemini: `generate_content` with system instruction, `topK` and pass-through `safetySettings`, plus an injected `maxOutputTokens` equal to the hold bound; inline PNG; `generate_content_stream` (`alt=sse`, usage in the final chunk);
+- translated routes: OpenAI with function declarations returned as `functionCall`; streaming through an Anthropic route;
+- embeddings: `embed_content`;
+- errors and policy: Google error envelopes for 404, the virtual `lumen` model, server tools, `candidateCount`, translated-only rejections, upstream 429, 401, missing-scope 403 and `countTokens` 501; one settlement row per successful call.
+
+The OpenAI SDK covers model list, chat, Responses and base64 embeddings; the Anthropic SDK covers paged model list and Messages. A mixed catalog (custom OpenAI, Claude, Gemini, bounded official `gpt-6.2-sol`) lists only Messages-eligible IDs; each listed ID succeeds through `messages.create`, and the hidden ID returns `messages_accounting_unsupported`.
+
+`go vet ./...` and `go test ./...` in `runtime/bifrost` passed, including the native `gemini_generate` wire, response passthrough and usage-terminal test. The full root `-m "not integration and not system"` suite had the same 82 failures on this branch and on the base `37ab4b1` (identical failure lists; for example, `tests/test_gemini_decisions.py` payer assertions and `tests/test_service_inference_authority.py`).
+
+A `@google/genai` wire probe confirmed the Node.js SDK sends `x-goog-api-key` and keeps `models/lumen/<p>/<m>` slashes raw for list/get/generate/stream. It ran against a stubbed fetch, not Lumen.
+
+After merging the migration 038 key branch (`feat/ds-keys-on-int@8194594`), the unit fixtures return the real personal model-key principal (payer, `lumen:key:<id>` storage actor, synthetic Keystone owner/domain) and record payer-scoped stateless reserve/settle/finish. `tests/test_gemini_sdk_compat.py` and `tests/test_official_sdk_compat.py` 27 passed. These include a Sonar case: the route is hidden from `/v1/models` (both formats), `/v1/cli/models` and `/v1beta/models`, and OpenAI, Anthropic and Gemini dispatch return 403 `model_requires_server_tools` with no hold or provider call. The six-file unit set (`test_gemini_sdk_compat`, `test_official_sdk_compat`, `test_embeddings_api`, `test_ai_compat`, `test_cli_model_catalog`, `test_model_api_keys`) ran 183 passed / 48 failed. The same 48 fail on a clean `8194594` checkout (key-branch fixture drift still being fixed there).
+
+`uv run lumen-test integration -k "gemini_model_key or model_api_key_billing or embedding_settlement"`: 9 passed on disposable MariaDB/Redis. `tests/integration/test_gemini_model_key_sdk.py` drives the official SDK through the real API-key dependency with persisted personal and service keys; only the Keystone directory and private Bifrost are synthetic. It covers:
+- two Gemini providers with same-named embedding rows listed as distinct exact IDs, each embedded successfully;
+- `generate_content` settles exactly one payer-scoped stateless hold and writes a ledger row: personal → user payer, service → domain pool, `project_id` NULL;
+- a key holding only `models:read` gets 403 `PERMISSION_DENIED` for generate and embed;
+- an official `perplexity/sonar` row is hidden from discovery and refused with 403 `model_requires_server_tools`, with no hold row;
+- a text row and an embedding row sharing a public name are listed as two exact IDs; get works for each and the bare name returns 409; `generate_content`/`embed_content` succeed on the respective IDs.
+
+Not verified: live providers, JavaScript end-to-end against Lumen, deployment.
+
+## Prepaid domain billing (migration 037)
+
+`test-defined`: `tests/integration/test_domain_credit.py` uses the migrated, disposable MariaDB. It races two humans and a service-key-shaped hold against a dashboard provider intent, checks project-quota lock order from two sessions, and checks nested allocation accounting. It also covers duplicate settlement/release/top-up, ledger balance, live manager denial, and the effective admin ceiling. No paid provider calls run in these tests.
+
+## Native catalog row selection (migration 039)
+
+`test-passed` on the model-identity slice: 1,066 focused pytest cases and Ruff on changed Python files. Coverage includes duplicate model names under separate provider connections, exact kind filters, native route assertions, legacy media decimal IDs, agent create/update/clone and child routing, retry after an agent model change, and unchanged OpenAI/Anthropic request schemas. Synthetic upstream tests confirm that local row IDs never enter the Decisions provider payload.
+
+`test-passed` after compatibility corrections: 1,025 focused cases and Ruff. Coverage includes explicit root selection with a stale or ambiguous name-only agent default, exact agent pin enforcement, shared legacy alias checks, and 409 responses for ambiguous OpenAI-compatible image generation and speech.
+
+The migration manifest and ORM contract passed locally. The history projection has a MariaDB integration case; that test and migration application against MariaDB were not run for this slice. No live provider or deployment check ran.
+
+## Agent Vault (migration 040)
+
+`test-passed`: focused pytest passed 164 cases on migrated disposable MariaDB 10.11.19; Ruff passed on touched Python files. `tests/integration/test_agent_vault.py` covers Vault scoping, decrypt fences, hash races, append-only records, account/project/workspace imports, extraction, Markdown and a dashboard graph tool round trip. `tests/test_afterglow_ingress.py` exercises actual Vault and persistent chat routes with signed, missing and invalid proofs, including token and project header changes. `tests/test_vault_secret.py` covers all nine detector patterns and ECMAScript whitespace parity. A local YAML/Jinja render confirms the Kolla API-only signer setting and disabled defaults. Keystone, the semantic index and the model are synthetic; no live authentication, pgvector, paid inference or deployment is verified.
+
 ## Lumen 0.6.20 — 발행·운영 배포·OpenAI 유료 확인
 
 - `live-verified`: `0.6.20` tag는 `d2751b6d76d34e58dfa04a0a405652ea3b2d154f`(검토한 `ed1e77d`와 트리 동일)이다. PR CI [`44288865371`](https://github.com/openstack-afterglow/lumen/actions/runs/44288865371), `dev` CI [`44290416680`](https://github.com/openstack-afterglow/lumen/actions/runs/44290416680), tag 이미지 [`44290538562`](https://github.com/openstack-afterglow/lumen/actions/runs/44290538562), 패키지 [`44290538570`](https://github.com/openstack-afterglow/lumen/actions/runs/44290538570)가 통과했다. 패키지 workflow가 미리 만든 [한영 GitHub Release](https://github.com/openstack-afterglow/lumen/releases/tag/0.6.20) 초안을 휠 8개와 함께 11:05:42 UTC에 게시했고(배포 전, 배포 대기로 표기), 배포 후 수신증으로 본문을 갱신했다.
@@ -507,6 +570,8 @@ uv run lumen-test integration
 uv run lumen-test system
 ```
 
+Migration 038 and model-key boundaries: run `pytest -q tests/test_model_api_keys.py tests/test_chat_api_keys.py tests/test_api_key_authority.py tests/test_policy.py tests/test_mcp_domain_authority.py`. Run `pytest -m integration tests/integration/test_model_api_key_migration.py` with disposable MariaDB to verify the immutable legacy key fields, new owner checks, and repeat execution. The HTTP tests use persisted fixture keys and synthetic identity, worker, and provider results. They do not verify paid model calls or production Keystone.
+
 `contract`/`integration`/`system`은 `.env`의 `OPENAI_API_KEY`/`GEMINI_API_KEY`를 live provider 호출에 사용하지 않는다. System은 fake HTTP provider를 사용한다. 실제 유료 호출은 로컬 Compose에서 별도로 migration→provider bootstrap→API/worker 기동, native model registry의 선택 kind·가격·credential 상태 확인 후 실행한다. 호환 `/v1/models`는 text 모델 목록이므로 media route readiness를 증명하지 않는다. OpenAI·Gemini의 짧은 text completion을 각각 1건씩, media는 명시된 `LUMEN_BOOTSTRAP_MODELS_JSON` 모델/가격·S3/scanner 준비가 있는 경우에만 경계별로 수행한다. 출력은 provider response/status와 Lumen ledger 사용량만 요약하고 key 또는 전체 `docker compose config`를 로그에 남기지 않는다. 실제 provider의 모델 접근 거절/과금 정책은 계정마다 다르며 synthetic green으로 실증을 대체하지 않는다.
 
 실제 미디어 transport 수용은 operator가 승인한 키로 지원 ID당 짧은 이미지·발화 1건을 직접 요청하고, 반환 PNG/JPEG를 decoder로 열고, TTS WAV의 RIFF/data 길이와 PCM duration을 확인한 뒤 그 WAV를 STT에 넣어 발화 문자열이 보존되는지 확인한다. 임시 in-memory rate는 전송 계층 실행 gate만 통과시키며 DB에 저장하거나 vendor 청구 단가로 광고하지 않는다. Durable HTTP/compat 수용은 **별도로** HTTPS S3, ClamAV, 명시된 가격, API/worker와 scan/download, reservation·usage ledger가 모두 준비된 환경에서 실행한다. 임시 격리 stack의 test-only 가격은 vendor rate 정확도를 증명하지 않으며 운영 승격에는 확인된 가격과 invoice 대조가 필요하다. `GET /models`에 ID가 있다는 사실만으로 해당 계정의 실제 호출 권한이나 Lumen route 지원을 증명하지 않는다.
@@ -696,6 +761,17 @@ uv run pytest -m "not integration and not system" tests
 # SDK 독립 검증 및 린트
 (cd sdk && uv run pytest && uv run ruff check .)
 ```
+
+### Migration 036 domain-scope acceptance (local test-passed)
+
+Focused contract pytest: 555 passed. Ruff passed for changed Python files. The disposable MariaDB/Redis integration run applied the ledger without schema repair and passed 76 tests, including ORM and schema snapshot drift checks:
+
+```sh
+uv run --frozen --offline --extra service --extra dev lumen-test integration -q --tb=short \
+  -k 'domain_scope_backfill or domain_history or shared_history_migration or agent_domain_scope or child_runs or mcp_domain_connections or mcp_connections_db or mcp_owner_activation or schema_snapshot or orm_declarations'
+```
+
+The integration slice proves same-user/domain history and agent behavior, origin-only legacy fallback, current-project run/asset authority, MCP activation and credential revision fences, archive recovery, same-server state replacement, and multi-account deduplication. Keystone fixtures are synthetic. No live Keystone, production upgrade, or cross-slice key and billing claims are included.
 
 ---
 

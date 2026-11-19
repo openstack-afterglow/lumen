@@ -1,5 +1,6 @@
 """Lumen ORM and Contract Models."""
 
+from lumen.models.billing import DomainCreditLedger, DomainCreditPool
 from lumen.models.chat_agent_platform import (
     ChatCodeWorkspace,
     ChatCodeWorkspaceAsset,
@@ -64,8 +65,11 @@ from lumen.models.chat_runs import (
     ChatToolApproval,
 )
 from lumen.models.stateless_reservations import StatelessCallReservation
+from lumen.models.vault import VaultNote, VaultRevision
 
 __all__ = [
+    "VaultNote",
+    "VaultRevision",
     "LlmProvider",
     "LlmProviderAccount",
     "LlmProviderCredential",
@@ -79,6 +83,8 @@ __all__ = [
     "ChatProviderUsage",
     "ChatQuotaPolicy",
     "StatelessCallReservation",
+    "DomainCreditLedger",
+    "DomainCreditPool",
     "UserWallet",
     "ChatMcpServer",
     "ChatMcpActivation",

@@ -146,7 +146,7 @@ async def test_yaml_reload_changes_real_route_and_current_capability_projection(
     principal = actor(["member"])
     monkeypatch.setattr(auth, "validate_token", Mock(return_value={**principal, "auth_token": "original"}))
     authority = AsyncMock(side_effect=lambda *_args: {
-        "roles": principal["roles"], "is_system_admin": principal["is_system_admin"]})
+        "roles": principal["roles"], "is_system_admin": principal["is_system_admin"], "domain_id": "domain"})
     monkeypatch.setattr(auth, "resolve_project_authority", authority)
     application = FastAPI()
     application.include_router(router, prefix="/v1")
@@ -217,27 +217,28 @@ async def test_same_policy_revalidates_worker_and_key_issuance(operator_policy, 
     replace, _ = operator_policy
     lookup = AsyncMock(return_value={"roles": ["member"], "is_system_admin": False})
     monkeypatch.setattr(auth, "resolve_project_authority", lookup)
-    row, _raw = await api_key_store.prepare_key_record("owner", "project", "member only", ["native:tools:execute"])
-    assert row.scopes == ["native:tools:execute"]
+    scope = "compat:images:write"
+    row, _raw = await api_key_store.prepare_key_record("owner", "project", "member only", [scope])
+    assert row.scopes == [scope]
     await api_key_store.authorize_api_key_in_transaction(None, api_key_id=None,
-        user_id="owner", project_id="project", required_scopes=("native:tools:execute",))
-    replace('"native:tools:execute": "!"\n"native:keys:write": "!"')
+        user_id="owner", project_id="project", required_scopes=(scope,))
+    replace(f'"{scope}": "!"\n"native:keys:write": "!"')
     with pytest.raises(api_key_store.ApiKeyForbidden):
         await api_key_store.authorize_api_key_in_transaction(None, api_key_id=None,
-            user_id="owner", project_id="project", required_scopes=("native:tools:execute",))
+            user_id="owner", project_id="project", required_scopes=(scope,))
     with pytest.raises(api_key_store.ApiKeyForbidden):
-        await api_key_store.prepare_key_record("owner", "project", "denied", ["native:tools:execute"])
-    replace('"native:tools:execute": "role:custom_operator"\n"native:keys:write": "role:custom_operator"')
+        await api_key_store.prepare_key_record("owner", "project", "denied", [scope])
+    replace(f'"{scope}": "role:custom_operator"\n"native:keys:write": "role:custom_operator"')
     lookup.return_value = {"roles": ["member", "custom_operator"], "is_system_admin": False}
     await api_key_store.authorize_api_key_in_transaction(None, api_key_id=None,
-        user_id="owner", project_id="project", required_scopes=("native:tools:execute",))
-    row, _raw = await api_key_store.prepare_key_record("owner", "project", "operator restriction", ["native:tools:execute"])
-    assert row.scopes == ["native:tools:execute"]
-    assert {"lumen-tools_user", "lumen-keys_editor"} <= capabilities(actor(["member", "custom_operator"]))
+        user_id="owner", project_id="project", required_scopes=(scope,))
+    row, _raw = await api_key_store.prepare_key_record("owner", "project", "operator restriction", [scope])
+    assert row.scopes == [scope]
+    assert {"lumen-images_user", "lumen-keys_editor"} <= capabilities(actor(["member", "custom_operator"]))
     lookup.return_value = {"roles": ["member"], "is_system_admin": False}
     with pytest.raises(api_key_store.ApiKeyForbidden):
-        await api_key_store.prepare_key_record("owner", "project", "missing operator role", ["native:tools:execute"])
-    assert not policy.authorize("native:tools:execute", actor(["custom_operator"]))
+        await api_key_store.prepare_key_record("owner", "project", "missing operator role", [scope])
+    assert not policy.authorize(scope, actor(["custom_operator"]))
 
 
 async def test_allow_rule_cannot_bypass_key_foreign_target_or_owner_checks(operator_policy, monkeypatch):
@@ -246,6 +247,7 @@ async def test_allow_rule_cannot_bypass_key_foreign_target_or_owner_checks(opera
     replace, _ = operator_policy
     replace('"models:read": "@"\n"system:admin": "@"')
     monkeypatch.setattr(api_key_store, "verify_key", AsyncMock(return_value={
+        "credential_class": "claude_gateway",
         "user_id": "owner", "project_id": "project", "api_key_id": 7,
         "roles": ["admin"], "scopes": ("models:read",), "service_system_admin": True}))
     for header in (b"x-project-id", b"x-target-project-id"):
@@ -253,11 +255,15 @@ async def test_allow_rule_cannot_bypass_key_foreign_target_or_owner_checks(opera
         with pytest.raises(HTTPException) as error:
             await auth.get_principal(request)
         assert error.value.status_code == 403
-    row = SimpleNamespace(owner_user_id="someone-else", owner_project_id="project", is_active=True,
-        revoked_at=None, expires_at=None, scopes=["models:read"])
+    row = SimpleNamespace(id=7, owner_user_id="someone-else", owner_project_id="project", is_active=True,
+        key_kind="personal", credential_kind="api_key", revoked_at=None, expires_at=None, scopes=["models:read"],
+        created_by_user_id="someone-else")
+    monkeypatch.setattr(api_key_store, "_verify_model_key_owner", lambda **kwargs: None)
     session = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: row)))
     with pytest.raises(api_key_store.ApiKeyForbidden):
-        await api_key_store._active_key_scopes(session, api_key_id=7, user_id="owner", project_id="project")
+        await api_key_store._active_key_scopes(
+            session, api_key_id=7, user_id="owner", project_id=auth.model_key_storage_id(7),
+        )
 
 
 async def test_device_approval_requires_real_issuance_policy_before_state_change(operator_policy, monkeypatch):
@@ -307,7 +313,8 @@ async def test_real_engine_casefold_matching_cannot_accept_ambiguous_native_bind
 async def test_key_authentication_preserves_policy_503_and_corrected_file_recovery(operator_policy, monkeypatch):
     replace, _ = operator_policy
     row = SimpleNamespace(key_hash="digest", is_active=True, revoked_at=None, expires_at=None,
-        owner_user_id="owner", owner_project_id="project", id=7, scopes=["models:read"], credential_kind="api_key")
+        owner_user_id="owner", owner_project_id="project", id=7, scopes=["models:read"],
+        credential_kind="api_key", key_kind="personal", created_by_user_id="owner")
 
     class Session:
         commit = AsyncMock()
@@ -325,12 +332,12 @@ async def test_key_authentication_preserves_policy_503_and_corrected_file_recove
     monkeypatch.setattr(api_key_store, "_hash_key", lambda _raw: "digest")
     monkeypatch.setattr(api_key_store, "is_db_available", lambda: True)
     monkeypatch.setattr(api_key_store, "get_session_factory", lambda: Session)
-    monkeypatch.setattr(api_key_store, "_current_owner_authority", AsyncMock(return_value=actor(["member"])))
+    monkeypatch.setattr(api_key_store, "_verify_model_key_owner", lambda **kwargs: None)
     replace('"models:read": null')
     with pytest.raises(HTTPException) as error:
         await api_key_store.verify_key("sk-afgl-synthetic")
     assert error.value.status_code == 503
-    replace('"models:read": "role:member"')
+    replace('"models:read": "model_api_key:True"')
     info = await api_key_store.verify_key("sk-afgl-synthetic")
     assert info["scopes"] == ("models:read",)
 
@@ -372,7 +379,7 @@ async def test_operator_narrowed_key_scopes_keep_original_standard_role_ceiling(
     from lumen.api import api_keys
 
     replace, _ = operator_policy
-    replace('"native:tools:execute": "role:manager"')
+    replace('"compat:images:write": "role:manager"')
     catalog = [{"id": f"{role}-id", "name": role, "domain_id": None} for role in ("member", "manager")]
     assignments = [{"role": {"id": role["id"]}, "user": {"id": "owner"},
                     "scope": {"project": {"id": "project"}}} for role in catalog]
@@ -399,13 +406,14 @@ async def test_operator_narrowed_key_scopes_keep_original_standard_role_ceiling(
     caller = actor(issued_roles, credential_restricted=True, source_project_id="project",
                    source_system_scope="", issued_role_ids=[f"{role}-id" for role in issued_roles])
     response = await api_keys.get_api_key_issuance_policy(caller)
-    assert ("native:tools:execute" in response["allowed_scopes"]) is ("manager" in issued_roles)
+    assert ("compat:images:write" in response["allowed_scopes"]) is ("manager" in issued_roles)
     assert "models:read" in response["allowed_scopes"]
-    row = SimpleNamespace(owner_user_id="owner", owner_project_id="project", is_active=True,
-                          revoked_at=None, expires_at=None, scopes=["models:read", "native:tools:execute"])
+    row = SimpleNamespace(id=7, owner_user_id="owner", owner_project_id="project", is_active=True,
+                          key_kind="personal", credential_kind="claude_gateway", created_by_user_id="owner",
+                          revoked_at=None, expires_at=None, scopes=["models:read", "compat:images:write"])
     session = SimpleNamespace(execute=AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: row)))
     scopes = await api_key_store.current_api_key_scopes(
         session, api_key_id=7, user_id="owner", project_id="project",
         credential_authority=auth.credential_authority_snapshot(caller))
     assert scopes == (frozenset(row.scopes) if "manager" in issued_roles else frozenset({"models:read"}))
-    assert row.scopes == ["models:read", "native:tools:execute"]
+    assert row.scopes == ["models:read", "compat:images:write"]

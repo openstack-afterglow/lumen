@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from lumen.config import get_settings
 from lumen.crypto import encrypt_chat_content
+from lumen.models.billing import Payer
 from lumen.models.chat_assets import ChatAsset, ChatRunAsset
 from lumen.models.chat_runs import ChatModelCallReservation, ChatRun, ChatRunProvider, ChatRunSegment
 from lumen.services import assets, credit
@@ -45,6 +46,7 @@ from .errors import (
     DurableRunInputError,
     DurableRunNotFound,
     DurableRunProviderResultUnknown,
+    MediaModelAmbiguous,
 )
 from .lifecycle import _cancel_requested, _require_owned_running_lease
 from .media import (
@@ -56,7 +58,9 @@ from .media import (
     lock_media_run_for_io,
     lock_media_source_in_transaction,
     media_io_allowed,
+    prepare_media_dispatch,
     rejection_message,
+    require_media_dispatch_fresh,
     validate_batch_media_io_in_transaction,
 )
 
@@ -84,6 +88,8 @@ def _intent(request: dict) -> dict:
               "n": request.get("n", 1), "source_asset_id": request.get("source_asset_id", request.get("input_asset_id"))}
     # Added only when requested so every pre-existing request keeps its idempotency fingerprint.
     intent.update(image_transport.image_options(request))
+    if request.get("model_row_id") is not None:
+        intent["model_row_id"] = request["model_row_id"]
     ordered = request.get("input_asset_ids")
     if ordered is not None:
         if (not isinstance(ordered, list) or not 1 <= len(ordered) <= image_transport.MAX_OPENAI_IMAGE_INPUT_COUNT
@@ -116,6 +122,7 @@ class PreparedImageRun:
 
 async def prepare_image_run(request: dict, *, project_id: str, user_id: str,
                             source: str = "web", api_key_id: int | None = None,
+                            payer: Payer | None = None,
                             required_scopes: tuple[str, ...] | None = None,
                             credential_authority: dict | None = None) -> PreparedImageRun:
     """Freeze one finite image request without inference or source-byte I/O."""
@@ -130,23 +137,19 @@ async def prepare_image_run(request: dict, *, project_id: str, user_id: str,
         request = {**request, "model_id": request["model"],
                    "provider_id": request.get("provider_id") if request.get("provider") is None else request["provider"]}
     intent = _intent_with_credential_authority(_intent(request), credential_authority)
-    model_id = request.get("model_id")
-    provider_id = request.get("provider_id")
-    if (not isinstance(model_id, str) or not model_id or not isinstance(request.get("prompt"), str)
-            or not request["prompt"].strip() or len(request["prompt"]) > 32000):
+    model_id, model_row_id, provider_id = intent["model_id"], intent.get("model_row_id"), intent["provider_id"]
+    if ((model_id is not None and not isinstance(model_id, str)) or (not model_id and model_row_id is None)
+            or not isinstance(request.get("prompt"), str) or not request["prompt"].strip()
+            or len(request["prompt"]) > 32000):
         raise DurableRunInputError("image model and bounded prompt are required")
     if provider_id is not None and not isinstance(provider_id, (str, int)):
         raise DurableRunInputError("invalid image provider")
-    provider_number = int(provider_id) if provider_id is not None and str(provider_id).isdecimal() else None
-    api_provider = str(provider_id) if provider_id is not None and provider_number is None else None
     try:
-        route = (await routing.resolve_model_by_id(int(model_id), model_kind="image") if model_id.isdecimal()
-                 else await routing.resolve_api_model(model_id, provider=api_provider,
-                                                       provider_id=provider_number, model_kind="image"))
+        route = await routing.resolve_media_model(model_id, model_row_id=model_row_id, provider_id=provider_id,
+                                                  model_kind="image")
     except AmbiguousModelRouteError as exc:
-        raise DurableRunInputError("image provider selection is ambiguous") from exc
-    if (route is None or (provider_number is not None and provider_number != route["provider_id"])
-            or (api_provider is not None and api_provider != route["api_provider"])):
+        raise MediaModelAmbiguous("image provider selection is ambiguous") from exc
+    if route is None:
         raise DurableRunInputError("image provider or model is unavailable")
     source_asset_id = intent["source_asset_id"]
     inputs = image_input_ids(intent)
@@ -193,9 +196,9 @@ async def prepare_image_run(request: dict, *, project_id: str, user_id: str,
     if bound <= 0 or bound >= Decimal("10000000000"):
         raise DurableRunInputError("image credit reservation is outside the supported range")
     if basis == "tokens" and "reservation_usd" not in route["media_pricing"]:
-        await credit.precheck(user_id, project_id, api_key_id, bound=bound)
+        await credit.precheck(user_id, project_id, api_key_id, bound=bound, payer=payer)
     else:
-        await credit.precheck(user_id, project_id, api_key_id)
+        await credit.precheck(user_id, project_id, api_key_id, payer=payer)
     capability = _route_snapshot(route)
     if author_route is not None:
         capability["svg_author_route"] = _route_snapshot(author_route)
@@ -231,6 +234,7 @@ async def prepare_image_run(request: dict, *, project_id: str, user_id: str,
 async def persist_image_run_in_transaction(
     session: AsyncSession, prepared: PreparedImageRun, *, project_id: str, user_id: str,
     client_request_id: str, source: str = "web", api_key_id: int | None = None,
+    payer: Payer | None = None,
     workload_class: str | None = None, batch_id: str | None = None,
     allowed_scopes: frozenset[str] | None = None,
 ) -> ChatRun:
@@ -261,6 +265,7 @@ async def persist_image_run_in_transaction(
         credential_authority=capability.get("credential_authority"))
     run = ChatRun(id=str(uuid.uuid4()), run_scope="image", run_kind="image", project_id=project_id,
         user_id=user_id, model_name=capability["model_name"], source=source, api_key_id=api_key_id,
+        payer_domain_id=payer.domain_id if payer is not None else None,
         workload_class=route.workload_class, worker_pool_id=route.worker_pool_id, batch_id=batch_id,
         client_request_id=client_request_id, request_fingerprint=_fingerprint(intent), fingerprint_version=1,
         execution_protocol_version=1, capability_snapshot=capability, pricing_snapshot=pricing,
@@ -289,6 +294,7 @@ async def persist_image_run_in_transaction(
 
 async def admit_image_run(request: dict, *, project_id: str, user_id: str, client_request_id: str,
                           source: str = "web", api_key_id: int | None = None,
+                          payer: Payer | None = None,
                           required_scopes: tuple[str, ...] | None = None,
                           credential_authority: dict | None = None):
     """Preserve UUID idempotency before checks, then commit before the Redis hint."""
@@ -302,6 +308,7 @@ async def admit_image_run(request: dict, *, project_id: str, user_id: str, clien
         return previous
     prepared = await prepare_image_run(request, project_id=project_id, user_id=user_id, source=source,
                                        api_key_id=api_key_id, required_scopes=required_scopes,
+                                       payer=payer,
                                        credential_authority=credential_authority)
     try:
         async with _factory()() as session, session.begin():
@@ -309,7 +316,7 @@ async def admit_image_run(request: dict, *, project_id: str, user_id: str, clien
             # IntegrityError replay below returns the winner. Gap locks deadlocked concurrent admissions.
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
             run = await persist_image_run_in_transaction(session, prepared, project_id=project_id, user_id=user_id,
-                client_request_id=client_request_id, source=source, api_key_id=api_key_id)
+                client_request_id=client_request_id, source=source, api_key_id=api_key_id, payer=payer)
             created = descriptor(run)
     except IntegrityError:
         previous = await existing_run_for_intent(project_id=project_id, user_id=user_id,
@@ -324,9 +331,12 @@ async def admit_image_run(request: dict, *, project_id: str, user_id: str, clien
 async def _image_segment_start(run_id: str, *, owner: str, bound: Decimal) -> str:
     """Commit the hold and irrevocable I/O intent before entering provider transport."""
     factory = _factory()
+    approval = await prepare_media_dispatch(factory, run_id, owner=owner, segment_id=_SEGMENT)
+
     async def transaction():
         async with factory() as session, session.begin():
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
+            await credit.lock_run_payer(session, run_id)
             run, blocked = await lock_media_run_for_io(session, run_id, owner=owner)
             segment = await prepare_segment(session, run, segment_id=_SEGMENT, ordinal=1, endpoint="image_generation")
             await session.flush()
@@ -338,15 +348,18 @@ async def _image_segment_start(run_id: str, *, owner: str, bound: Decimal) -> st
                 return blocked
             if bound <= 0 or bound >= Decimal("10000000000") or bound != bound.quantize(Decimal("0.00000001")):
                 raise DurableRunInputError("image credit reservation is invalid")
-            await validate_batch_media_io_in_transaction(session, run)
+            verified = await validate_batch_media_io_in_transaction(session, run, approval)
             if "bound_credits" in run.pricing_snapshot and bound != Decimal(run.pricing_snapshot["bound_credits"]):
                 raise DurableRunInputError("image credit reservation changed")
+            payer = credit.run_payer(run)
             await credit.reserve_call_credit_in_transaction(session, user_id=run.user_id,
-                project_id=run.project_id, api_key_id=run.api_key_id, bound=bound)
+                project_id=run.project_id, api_key_id=run.api_key_id, bound=bound, payer=payer)
             reservation = ChatModelCallReservation(run_id=run.id, segment_id=_SEGMENT,
-                                                  bound_credits=bound, status="reserved")
+                                                  bound_credits=bound, status="reserved", **payer.columns())
             session.add(reservation)
+            await credit.refresh_domain_reserved(session, payer)
             run.reserved_credits = bound
+            require_media_dispatch_fresh(verified)
             begin_segment_io(segment)
             run.provider_started_at = _now()
             await append_event(session, run, _event(run, "run.stage.changed", {"stage": "model_request"}))
@@ -437,6 +450,8 @@ async def _settle_image(run_id: str, *, owner: str) -> None:
     factory = _factory()
     async def transaction():
         async with factory() as session, session.begin():
+            await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
+            await credit.lock_run_payer(session, run_id)
             run = (await session.execute(select(ChatRun).where(ChatRun.id == run_id)
                    .with_for_update().execution_options(populate_existing=True))).scalar_one()
             _require_owned_running_lease(run, owner)
@@ -485,8 +500,10 @@ async def _settle_image(run_id: str, *, owner: str) -> None:
                 Decimal(pricing["margin_multiplier"]), Decimal(pricing["credit_per_usd"]))
             if expected_credits > Decimal(str(reservation.bound_credits)):
                 raise DurableRunProviderResultUnknown("image token usage exceeds reserved credits")
+            payer = credit.run_payer(run)
             credited = await credit.apply_usage_in_transaction(session, event_id=f"run:{run.id}",
                         user_id=run.user_id, project_id=run.project_id, model_name=run.model_name,
+                        payer=payer,
                         provider=run.capability_snapshot["provider_name"], prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
                         usage_cost=usage_cost, breakdown=breakdown,
                         execution_route=run.capability_snapshot,
@@ -498,6 +515,7 @@ async def _settle_image(run_id: str, *, owner: str) -> None:
             reservation.actual_credits = credited
             reservation.status = "settled"
             reservation.settled_at = _now()
+            await credit.refresh_domain_reserved(session, payer)
             run.usage_reconciled_at = _now()
             await append_event(session, run, _event(run, "usage.updated", {"components": components,
                 "prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
@@ -658,6 +676,9 @@ async def _execute_image_run_inner(run_id: str, *, owner: str, payload: dict, ca
         canceled = await _cancel_requested(run_id)
         await _finish(run_id, status="canceled" if canceled else "completed", message_id=None, owner=owner,
                       error_code="canceled" if canceled else None, safe_message="image run canceled" if canceled else None)
+    except credit.QuotaExceeded as exc:
+        await _finish(run_id, status="failed", message_id=None, owner=owner,
+                      error_code=getattr(exc, "code", "quota_exceeded"), safe_message="credit quota is exhausted")
     except MediaAuthorizationRevoked:
         # Raised before any reservation or provider I/O committed: definite, not unknown.
         from .execution import logger

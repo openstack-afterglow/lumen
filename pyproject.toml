@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lumen"
-version = "0.6.20"
+version = "0.6.21"
 description = "Afterglow Lumen durable chat, LLM, and agent service"
 requires-python = ">=3.11"
 dependencies = []
@@ -55,6 +55,7 @@ service = [
 ]
 
 dev = [
+    "anthropic==0.125.0",
     "pytest>=9.0.3",
     "pytest-asyncio>=0.24",
     "fakeredis[lua]>=2.21",

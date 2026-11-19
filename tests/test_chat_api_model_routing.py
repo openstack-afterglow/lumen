@@ -169,6 +169,7 @@ def provider_db(monkeypatch):
         provider_id: int = 1,
         is_active: bool = True,
         sort_order: int = 0,
+        model_kind: str = "text",
     ):
         with sync_factory.begin() as session:
             session.add(
@@ -176,6 +177,7 @@ def provider_db(monkeypatch):
                     id=model_id,
                     provider_id=provider_id,
                     model_name=model_name,
+                    model_kind=model_kind,
                     sort_order=sort_order,
                     input_price=Decimal("0"),
                     output_price=Decimal("0"),
@@ -212,6 +214,8 @@ async def test_admin_prices_save_independently_and_preserve_null_zero_and_other_
             "model_kind": kind,
             field: "5.0001",
             "media_pricing": media,
+            # Image rows without an executable priced variant can only be saved inactive.
+            **({"is_active": False} if kind == "image" else {}),
         },
     )
     assert created.status_code == 201, created.text
@@ -515,6 +519,288 @@ async def test_catalog_image_registration_exposes_price_and_ready_options(provid
     assert unavailable["available_image_variants"] == [] and "image_output_formats" not in unavailable
 
 
+async def test_admin_image_leaf_override_merges_validates_and_clears(provider_db, admin_client, monkeypatch):
+    add_provider, _, _ = provider_db
+    add_provider(provider_type="openai")
+    monkeypatch.setattr(repository, "_model_public", pricing._model_public)
+    monkeypatch.setattr("lumen.services.assets.asset_pipeline_available", lambda: True)
+    path = "/v1/admin/models"
+    manual = {"override_mode": "leaf", "token_rates": {"image": {"output_per_million": "31"}}}
+    created = await admin_client.post(path, json={
+        "provider_id": 1, "model_name": "gpt-image-2.6-sunburst", "model_kind": "image",
+        "media_pricing": manual,
+    })
+    assert created.status_code == 201, created.text
+    model_id = created.json()["id"]
+    model_path = f"{path}/{model_id}"
+    # A PATCH without any media key must validate the stored sparse object against the catalog.
+    updated = await admin_client.patch(model_path, json={"input_price_per_million": "0"})
+    assert updated.status_code == 200, updated.text
+    listed = await admin_client.get(path)
+    assert listed.status_code == 200, listed.text
+    model = next(row for row in listed.json() if row["id"] == model_id)
+    assert model["media_pricing"] == manual
+    assert model["effective_media_pricing"] == {
+        "billing_basis": "tokens", "token_rates": {"image": {"input_per_million": "8.00", "output_per_million": "31"}},
+    }
+    assert model["effective_media_price_sources"] == {
+        "billing_basis": "catalog", "token_rates": {"image": {"input_per_million": "catalog", "output_per_million": "manual"}},
+    }
+    assert model["effective_text_price_sources"] == {
+        "input_price_per_million": "manual", "cache_read_price_per_million": "catalog",
+    }
+    assert model["catalog_entry"]["kind"] == "image"
+    assert model["catalog_entry"]["id"] == "gpt-image-2.6-sunburst"
+    assert model["catalog_entry"]["token_pricing"] == {"input": "5.00", "cache_read": "1.25"}
+    assert model["catalog_entry"]["media_pricing"] == {
+        "billing_basis": "tokens", "token_rates": {"image": {"input_per_million": "8.00", "output_per_million": "30.00"}},
+    }
+    assert model["effective_capabilities"]["feature_gates"]["image_output"]["available"]
+
+    # A manual image cache rate is valid because effective pricing has catalog image input.
+    updated = await admin_client.patch(model_path, json={"media_pricing": {
+        "reservation_usd": "0.25", "token_rates": {"image": {"cache_read_per_million": "2"}},
+    }})
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["media_pricing"] == {
+        "override_mode": "leaf", "reservation_usd": "0.25",
+        "token_rates": {"image": {"output_per_million": "31", "cache_read_per_million": "2"}},
+    }
+    assert updated.json()["effective_media_price_sources"]["reservation_usd"] == "manual"
+    # The target model name determines which catalog satisfies the cache-input dependency.
+    renamed = await admin_client.patch(model_path, json={"model_name": "no-matching-catalog"})
+    assert renamed.status_code == 400, renamed.text
+    rejected = await admin_client.patch(model_path, json={"media_pricing": {"billing_basis": "unit"}})
+    assert rejected.status_code == 400, rejected.text
+
+    cleared = await admin_client.patch(model_path, json={
+        "input_price_per_million": None,
+        "media_pricing": {"reservation_usd": None, "token_rates": {"image": {
+            "output_per_million": None, "cache_read_per_million": None,
+        }}},
+    })
+    assert cleared.status_code == 200, cleared.text
+    listed = await admin_client.get(path)
+    assert listed.status_code == 200, listed.text
+    model = next(row for row in listed.json() if row["id"] == model_id)
+    assert model["media_pricing"] == {"override_mode": "leaf"}
+    assert model["price_origin"] == "native_catalog" and model["price_source"] is None
+    assert model["catalog_entry"]["kind"] == "image"
+    assert model["catalog_entry"]["token_pricing"] == {"input": "5.00", "cache_read": "1.25"}
+    assert model["effective_media_pricing"] == model["catalog_entry"]["media_pricing"]
+    assert model["effective_media_price_sources"] == {
+        "billing_basis": "catalog", "token_rates": {"image": {"input_per_million": "catalog", "output_per_million": "catalog"}},
+    }
+    assert model["effective_text_price_sources"] == {
+        "input_price_per_million": "catalog", "cache_read_price_per_million": "catalog",
+    }
+    assert Decimal(model["effective_input_price_per_million"]) == 5
+
+
+@pytest.mark.parametrize("mode", [{}, {"override_mode": "replace"}])
+async def test_admin_image_replace_mode_preserves_wholesale_prices(provider_db, admin_client, monkeypatch, mode):
+    add_provider, _, _ = provider_db
+    add_provider(provider_type="openai")
+    monkeypatch.setattr(repository, "_model_public", pricing._model_public)
+    path = "/v1/admin/models"
+    created = await admin_client.post(path, json={
+        "provider_id": 1, "model_name": "gpt-image-2.6-sunburst", "model_kind": "image",
+        "media_pricing": {**mode, "image_per_unit": "0.04"}, "is_active": False,
+    })
+    assert created.status_code == 201, created.text
+    model = created.json()
+    assert model["media_pricing"] == {**mode, "image_per_unit": "0.04"}
+    assert model["effective_media_pricing"] == {"image_per_unit": "0.04"}
+    assert model["effective_media_price_sources"] == {"image_per_unit": "manual"}
+    model_path = f"{path}/{model['id']}"
+    converted = await admin_client.patch(model_path, json={"media_pricing": {"override_mode": "leaf"}})
+    assert converted.status_code == 200, converted.text
+    assert converted.json()["media_pricing"] == {"override_mode": "leaf", "image_per_unit": "0.04"}
+    assert converted.json()["effective_media_pricing"]["billing_basis"] == "tokens"
+    replaced = await admin_client.patch(model_path, json={"media_pricing": {"override_mode": "replace", "image_per_unit": "0.08"}})
+    assert replaced.status_code == 200, replaced.text
+    assert replaced.json()["effective_media_pricing"] == {"image_per_unit": "0.08"}
+    cleared = await admin_client.patch(model_path, json={"media_pricing": None})
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["media_pricing"] is None
+    assert cleared.json()["effective_media_pricing"]["billing_basis"] == "tokens"
+
+
+async def test_admin_image_leaf_variants_overlay_exact_keys(provider_db, admin_client, monkeypatch):
+    add_provider, _, _ = provider_db
+    add_provider(provider_type="gemini")
+    monkeypatch.setattr(repository, "_model_public", pricing._model_public)
+    path = "/v1/admin/models"
+    created = await admin_client.post(path, json={
+        "provider_id": 1, "model_name": "gemini-2.5-flash-image", "model_kind": "image",
+        "media_pricing": {"override_mode": "leaf", "image_variants": {"1024x1024:auto": "0", "1024x1024:high": "0.08"}},
+    })
+    assert created.status_code == 201, created.text
+    model = created.json()
+    expected = {**model["catalog_entry"]["media_pricing"]["image_variants"], "1024x1024:auto": "0", "1024x1024:high": "0.08"}
+    assert model["effective_media_pricing"]["image_variants"] == expected
+    assert model["effective_media_price_sources"]["image_variants"] == {
+        **dict.fromkeys(expected, "catalog"), "1024x1024:auto": "manual", "1024x1024:high": "manual",
+    }
+    cleared = await admin_client.patch(f"{path}/{model['id']}", json={
+        "media_pricing": {"image_variants": {"1024x1024:auto": None, "1024x1024:high": None}},
+    })
+    assert cleared.status_code == 200, cleared.text
+    model = cleared.json()
+    assert model["media_pricing"] == {"override_mode": "leaf"}
+    assert model["effective_media_pricing"] == model["catalog_entry"]["media_pricing"]
+
+
+async def test_admin_unit_image_readiness_requires_an_executable_variant(provider_db, admin_client, monkeypatch):
+    add_provider, _, _ = provider_db
+    add_provider(provider_type="openai")
+    monkeypatch.setattr(repository, "_model_public", pricing._model_public)
+    monkeypatch.setattr("lumen.services.assets.asset_pipeline_available", lambda: True)
+    path = "/v1/admin/models"
+
+    def image_gate(body):
+        return body["effective_capabilities"]["feature_gates"]["image_output"]
+
+    replace = await admin_client.post(path, json={
+        "provider_id": 1, "model_name": "gpt-image-2", "model_kind": "image",
+        "media_pricing": {"billing_basis": "unit", "image_per_unit": "0.04"}, "is_active": False,
+    })
+    assert replace.status_code == 201, replace.text
+    # The base rate stays stored, but no request can execute without an exact variant.
+    assert replace.json()["media_pricing"]["image_per_unit"] == "0.04"
+    assert image_gate(replace.json()) == {
+        "available": False, "mode": "none", "reason_code": "pricing_unavailable", "pricing_available": False,
+    }
+    assert replace.json()["image_pricing_readiness"] == {
+        "ready": False, "reason": "pricing_unavailable", "executable_variants": [], "unsupported_variants": [],
+        "supported_variants": replace.json()["image_pricing_readiness"]["supported_variants"],
+    }
+    assert "1024x1024:high" in replace.json()["image_pricing_readiness"]["supported_variants"]
+    with_variant = await admin_client.patch(f"{path}/{replace.json()['id']}", json={"media_pricing": {
+        "billing_basis": "unit", "image_per_unit": "0.04", "image_variants": {"1024x1024:high": "0.08"},
+    }})
+    assert with_variant.status_code == 200, with_variant.text
+    assert image_gate(with_variant.json())["available"] is True
+    assert with_variant.json()["image_pricing_readiness"]["ready"] is True
+    assert with_variant.json()["image_pricing_readiness"]["executable_variants"] == ["1024x1024:high"]
+
+    # Leaf mode: unit basis over a token-basis catalog has no variants until one is overlaid.
+    leaf = await admin_client.post(path, json={
+        "provider_id": 1, "model_name": "gpt-image-2.6-sunburst", "model_kind": "image",
+        "media_pricing": {"override_mode": "leaf", "billing_basis": "unit", "image_per_unit": "0.04"}, "is_active": False,
+    })
+    assert leaf.status_code == 201, leaf.text
+    assert image_gate(leaf.json())["reason_code"] == "pricing_unavailable"
+    overlaid = await admin_client.patch(f"{path}/{leaf.json()['id']}", json={"media_pricing": {
+        "image_variants": {"1024x1024:high": "0.08"},
+    }})
+    assert overlaid.status_code == 200, overlaid.text
+    assert overlaid.json()["effective_media_pricing"]["image_variants"] == {"1024x1024:high": "0.08"}
+    assert image_gate(overlaid.json())["available"] is True
+
+
+async def test_admin_unit_image_readiness_rejects_variants_the_model_cannot_execute(
+    provider_db, admin_client, monkeypatch,
+):
+    add_provider, _, _ = provider_db
+    add_provider(provider_type="gemini")
+    monkeypatch.setattr(repository, "_model_public", pricing._model_public)
+    monkeypatch.setattr("lumen.services.assets.asset_pipeline_available", lambda: True)
+    path = "/v1/admin/models"
+    # Gemini 2.5 accepts quality "auto" only; a syntactically valid high-quality key is not executable.
+    body = {
+        "provider_id": 1, "model_name": "gemini-2.5-flash-image", "model_kind": "image",
+        "media_pricing": {"billing_basis": "unit", "image_variants": {"1024x1024:high": "0.08"}},
+    }
+    for active in ({}, {"is_active": True}):
+        rejected = await admin_client.post(path, json={**body, **active})
+        assert rejected.status_code == 409, rejected.text
+        assert rejected.json()["detail"] == {
+            "code": "image_pricing_not_ready", "reason": "unsupported_image_variants",
+            "unsupported_variants": ["1024x1024:high"], "message": rejected.json()["detail"]["message"],
+        }
+    assert (await admin_client.get(path)).json() == []
+    created = await admin_client.post(path, json={**body, "is_active": False})
+    assert created.status_code == 201, created.text
+    model_path = f"{path}/{created.json()['id']}"
+    activate = await admin_client.patch(model_path, json={"is_active": True})
+    assert activate.status_code == 409, activate.text
+    assert activate.json()["detail"]["code"] == "image_pricing_not_ready"
+    assert (await admin_client.get(path)).json()[0]["is_active"] is False
+    readiness = created.json()["image_pricing_readiness"]
+    assert readiness["ready"] is False and readiness["reason"] == "unsupported_image_variants"
+    assert readiness["unsupported_variants"] == ["1024x1024:high"] and readiness["executable_variants"] == []
+    assert "1024x1024:high" not in readiness["supported_variants"]
+    assert "1024x1024:auto" in readiness["supported_variants"]
+    gate = created.json()["effective_capabilities"]["feature_gates"]["image_output"]
+    assert gate["available"] is False and gate["reason_code"] == "unsupported_image_variants"
+    assert created.json()["effective_price_source"] == "partial"
+    assert created.json()["price_origin"] is None
+
+    fixed = await admin_client.patch(model_path, json={"media_pricing": {
+        "billing_basis": "unit", "image_variants": {"1024x1024:high": "0.08", "1024x1024:auto": "0.039"},
+    }})
+    assert fixed.status_code == 200, fixed.text
+    readiness = fixed.json()["image_pricing_readiness"]
+    assert readiness["ready"] is True and readiness["reason"] is None
+    assert readiness["executable_variants"] == ["1024x1024:auto"]
+    assert readiness["unsupported_variants"] == ["1024x1024:high"]
+    assert fixed.json()["effective_capabilities"]["feature_gates"]["image_output"]["available"] is True
+    assert fixed.json()["effective_price_source"] == "manual" and fixed.json()["price_origin"] == "manual"
+    activated = await admin_client.patch(model_path, json={"is_active": True})
+    assert activated.status_code == 200, activated.text
+    assert activated.json()["is_active"] is True
+    # An active ready row cannot be edited into an unexecutable state; it is never auto-deactivated.
+    broken = await admin_client.patch(model_path, json={"media_pricing": {
+        "billing_basis": "unit", "image_variants": {"1024x1024:high": "0.08"},
+    }})
+    assert broken.status_code == 409, broken.text
+    assert broken.json()["detail"]["reason"] == "unsupported_image_variants"
+    listed = (await admin_client.get(path)).json()[0]
+    assert listed["is_active"] is True and listed["image_pricing_readiness"]["ready"] is True
+
+
+async def test_legacy_active_unready_image_stays_editable_but_cannot_be_reactivated(provider_db, admin_client, monkeypatch):
+    add_provider, _, _ = provider_db
+    add_provider(provider_type="openai")
+    monkeypatch.setattr(repository, "_model_public", pricing._model_public)
+    async with repository._require_db()() as session:
+        with session.sync.begin():
+            session.sync.add(LlmModel(id=20, provider_id=1, model_name="gpt-image-2", model_kind="image",
+                                      media_pricing={"image_per_unit": "0.04"}, is_active=True))
+    path = "/v1/admin/models/20"
+    renamed = await admin_client.patch(path, json={"display_name": "Legacy image"})
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["is_active"] is True and renamed.json()["image_pricing_readiness"]["ready"] is False
+    assert (await admin_client.patch(path, json={"is_active": False})).status_code == 200
+    reactivated = await admin_client.patch(path, json={"is_active": True})
+    assert reactivated.status_code == 409, reactivated.text
+    assert reactivated.json()["detail"]["reason"] == "pricing_unavailable"
+
+
+@pytest.mark.parametrize("model_name", ["no-matching-catalog", "gpt-4o"])
+async def test_admin_image_leaf_mode_starts_empty_without_matching_catalog(provider_db, admin_client, monkeypatch, model_name):
+    add_provider, _, _ = provider_db
+    add_provider(provider_type="openai")
+    monkeypatch.setattr(repository, "_model_public", pricing._model_public)
+    path = "/v1/admin/models"
+    prices = {"image_per_unit": "0.07"}
+    created = await admin_client.post(path, json={
+        "provider_id": 1, "model_name": model_name, "model_kind": "image",
+        "media_pricing": {"override_mode": "leaf", **prices}, "is_active": False,
+    })
+    assert created.status_code == 201, created.text
+    assert created.json()["effective_media_pricing"] == prices
+    assert "media_pricing" not in (created.json()["catalog_entry"] or {})
+    model_path = f"{path}/{created.json()['id']}"
+    for invalid in (
+        {"override_mode": "invalid"}, {"unknown": None}, {"token_rates": {"image": {"bad": None}}},
+        {"image_variants": {"bad": None}}, {"token_rates": None},
+    ):
+        rejected = await admin_client.patch(model_path, json={"media_pricing": invalid})
+        assert rejected.status_code == 400, rejected.text
+
+
 async def test_svg_author_requires_a_registered_unrestricted_route_on_the_image_credential(
     provider_db, admin_client, monkeypatch,
 ):
@@ -656,7 +942,7 @@ async def test_media_provider_cannot_switch_to_custom_base_or_subscription(provi
     add_provider(provider_type="openai")
     await repository.create_model(
         provider_id=1, model_name="gpt-image-2", model_kind="image",
-        media_pricing={"image_per_unit": "0.04"},
+        media_pricing={"image_variants": {"1024x1024:high": "0.04"}},
     )
     original = await routing.resolve_api_model("gpt-image-2", model_kind="image")
 
@@ -930,6 +1216,95 @@ async def test_ambiguous_native_admission_and_completion_fail_with_conflict(prov
     assert compat.value.message == "model_route_ambiguous"
 
 
+@pytest.mark.parametrize("kind", ["image", "tts", "stt", "realtime"])
+async def test_media_selector_exact_row_keeps_legacy_decimal_and_checks_assertions(provider_db, kind):
+    add_provider, add_model, _ = provider_db
+    for provider_id in (1, 2):
+        add_provider(provider_id=provider_id, provider_type="openai", api_provider=f"endpoint-{provider_id}")
+        add_model("duplicate-model", provider_id=provider_id, model_id=provider_id + 10, model_kind=kind)
+    add_model("wrong-kind", model_id=13)
+    with pytest.raises(routing.AmbiguousModelRouteError):
+        await routing.resolve_media_model("duplicate-model", model_kind=kind)
+    for legacy in (None, "duplicate-model", "12", "lumen/2/12"):
+        selected = await routing.resolve_media_model(
+            legacy, model_row_id=12, provider_id="endpoint-2", model_kind=kind,
+        )
+        assert (selected["model_id"], selected["provider_id"]) == (12, 2)
+    for legacy, provider in (("wrong", 2), ("11", 2), ("lumen/1/11", 2), (None, 1), (None, "endpoint-1")):
+        with pytest.raises(ProviderValidationError, match="model_selection_mismatch"):
+            await routing.resolve_media_model(legacy, model_row_id=12, provider_id=provider, model_kind=kind)
+    for legacy, provider in (("12", None), ("duplicate-model", 2)):
+        selected = await routing.resolve_media_model(legacy, provider_id=provider, model_kind=kind)
+        assert (selected["model_id"], selected["provider_id"]) == (12, 2)
+    assert await routing.resolve_media_model(None, model_row_id=13, model_kind=kind) is None
+
+
+@pytest.mark.parametrize("provider_type,stored_name,selector", [
+    ("openai", "shared-model", "perplexity/shared-model"),
+    ("perplexity", "perplexity/perplexity/search", "search"),
+    ("gemini", "gemini/shared-model", "shared-model"),
+])
+async def test_legacy_selector_and_exact_row_accept_same_alias(provider_db, provider_type, stored_name, selector):
+    add_provider, add_model, _ = provider_db
+    add_provider(provider_type=provider_type)
+    add_model(stored_name, model_id=12)
+    route = await routing.resolve_api_model(selector)
+    assert route["model_id"] == 12
+    assert routing.matches_api_model_selector(route, selector)
+
+
+async def test_root_agent_model_requires_exact_or_unambiguous_selection(provider_db):
+    from fastapi import HTTPException
+
+    from lumen.services.chat_admission import _resolve_run_model
+
+    add_provider, add_model, _ = provider_db
+    for provider_id in (1, 2):
+        add_provider(provider_id=provider_id, provider_type="openai")
+        add_model("duplicate-model", provider_id=provider_id, model_id=provider_id + 10)
+    add_model("unique-model", model_id=13)
+    pinned = {"model_name": "duplicate-model", "model_row_id": 12}
+    for name, row_id in ((None, None), ("duplicate-model", None), (None, 12)):
+        route = await _resolve_run_model(name, row_id, pinned)
+        assert (route["model_id"], route["provider_id"]) == (12, 2)
+    for name, row_id in (("unique-model", None), (None, 11)):
+        with pytest.raises(HTTPException) as conflict:
+            await _resolve_run_model(name, row_id, pinned)
+        assert conflict.value.status_code == 422
+    with pytest.raises(HTTPException) as ambiguous:
+        await _resolve_run_model(None, None, {"model_name": "duplicate-model"})
+    assert (ambiguous.value.status_code, ambiguous.value.detail) == (409, "model_route_ambiguous")
+    assert (await _resolve_run_model(None, None, {"model_name": "unique-model"}))["model_id"] == 13
+    for legacy_default in ("duplicate-model", "unavailable"):
+        agent = {"model_name": legacy_default}
+        assert (await _resolve_run_model("unique-model", None, agent))["model_id"] == 13
+        assert (await _resolve_run_model(None, 12, agent))["provider_id"] == 2
+
+
+@pytest.mark.parametrize("kind,provider_type,name", [
+    ("text", "openai", "gpt-6-luna"), ("decision", "gemini", "gemini/gemini-decision-1"),
+])
+async def test_decisions_select_exact_catalog_model_kind_and_keep_name_routing(provider_db, kind, provider_type, name):
+    from lumen.services import decisions
+
+    add_provider, add_model, _ = provider_db
+    for provider_id in (1, 2):
+        add_provider(provider_id=provider_id, provider_type=provider_type)
+        add_model(name, provider_id=provider_id, model_id=provider_id + 10, model_kind=kind)
+    add_model("wrong-kind", model_id=13, model_kind="image")
+    with pytest.raises(decisions.DecisionError) as ambiguous:
+        await decisions.resolve(name)
+    assert ambiguous.value.status_code == 409
+    selected = await decisions.resolve(name, model_row_id=12, provider_type=provider_type)
+    assert (selected["model_id"], selected["provider_id"]) == (12, 2)
+    with pytest.raises(decisions.DecisionError) as mismatch:
+        await decisions.resolve("wrong", model_row_id=12)
+    assert mismatch.value.status_code == 422
+    with pytest.raises(decisions.DecisionError) as wrong_kind:
+        await decisions.resolve(None, model_row_id=13)
+    assert wrong_kind.value.status_code == 404
+
+
 async def test_renamed_api_selector_is_independent_of_existing_gemini_model_prefix(provider_db):
     from lumen.services import completion_api
 
@@ -1189,6 +1564,11 @@ async def test_kind_correction_preserves_identity_and_moves_only_to_target_catal
     assert await routing.list_api_models(model_kind="text") == []
     assert await routing.list_api_models(model_kind=kind) == []
     activated = await admin_client.patch(f"/v1/admin/models/{model_id}", json={"is_active": True})
+    if kind == "image":
+        # An unsupported image model has no executable choice, so activation is refused.
+        assert activated.status_code == 409, activated.text
+        assert activated.json()["detail"]["reason"] == "route_unavailable"
+        return
     assert activated.status_code == 200, activated.text
     assert await routing.list_api_models(model_kind="text") == []
     assert [row["api_model_name"] for row in await routing.list_api_models(model_kind=kind)] == [saved["api_model_name"]]

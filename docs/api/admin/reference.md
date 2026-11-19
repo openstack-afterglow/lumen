@@ -41,4 +41,5 @@
 | GET | `/v1/admin/providers/{provider_id}/available-models` | Available Models | Keystone (X-Auth-Token), Keystone (Bearer) | — | — | 200 | `available_models_v1_admin_providers__provider_id__available_models_get` |
 | GET | `/v1/admin/runtime-pools` | List Runtime Pools | Keystone (X-Auth-Token), Keystone (Bearer) | — | — | 200 | `list_runtime_pools_v1_admin_runtime_pools_get` |
 | GET | `/v1/admin/runtime-resources` | List Runtime Resources | Keystone (X-Auth-Token), Keystone (Bearer) | — | — | 200 | `list_runtime_resources_v1_admin_runtime_resources_get` |
+| GET | `/v1/admin/title-model` | Get Title Model | Keystone (X-Auth-Token), Keystone (Bearer) | — | — | 200 | `get_title_model_v1_admin_title_model_get` |
 | PUT | `/v1/admin/title-model` | Set Title Model | Keystone (X-Auth-Token), Keystone (Bearer) | — | [TitleModelRequest](schemas.md#titlemodelrequest) | 204 | `set_title_model_v1_admin_title_model_put` |

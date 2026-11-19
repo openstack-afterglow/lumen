@@ -28,6 +28,7 @@ from typing import Any, Literal, NoReturn
 import anyio
 
 from lumen.config import get_settings
+from lumen.models.billing import Payer
 from lumen.services import (
     context_manager,
     credit,
@@ -39,7 +40,7 @@ from lumen.services import (
 )
 from lumen.services.api_key_store import ApiKeyAuthorityUnavailable, ApiKeyForbidden
 from lumen.services.capabilities import reasoning_can_be_disabled
-from lumen.services.inference_authority import authorize_new_io, completion_scopes
+from lumen.services.inference_authority import authorize_new_io, completion_scopes, model_required_scopes
 from lumen.services.provider_errors import BadRequestError, OpenAIServiceTierMismatch, OpenAIUsageInvalid, ProviderError
 from lumen.services.providers import errors
 from lumen.services.providers import routing as ps
@@ -76,6 +77,15 @@ class CompletionError(Exception):
 
 async def _authorize_completion(user_id: str, project_id: str, api_key_id: int | None, request: dict, resolved: dict) -> None:
     try:
+        intrinsic = model_required_scopes(resolved)
+        if intrinsic:
+            # Built-in server tools (Perplexity Sonar search) are a model property,
+            # not a request option; model-only keys can never hold that scope.
+            try:
+                await authorize_new_io(user_id=user_id, project_id=project_id, api_key_id=api_key_id,
+                                       required_scopes=intrinsic)
+            except ApiKeyForbidden as exc:
+                raise CompletionError(403, "model_requires_server_tools", code="model_requires_server_tools") from exc
         await authorize_new_io(user_id=user_id, project_id=project_id, api_key_id=api_key_id,
                                required_scopes=completion_scopes(request, resolved=resolved))
     except ApiKeyForbidden as exc:
@@ -114,12 +124,12 @@ async def resolve_api(model: str, *, provider: str | None = None, operation: str
     return resolved
 
 
-async def precheck(user_id: str, project_id: str, api_key_id: int | None = None) -> None:
+async def precheck(user_id: str, project_id: str, api_key_id: int | None = None, *, payer: Payer | None = None) -> None:
     """쿼터 fail-closed. 초과 429, 저장소 장애 503."""
     try:
-        await credit.precheck(user_id, project_id, api_key_id=api_key_id)
+        await credit.precheck(user_id, project_id, api_key_id=api_key_id, payer=payer)
     except credit.QuotaExceeded as exc:
-        raise CompletionError(429, str(exc)) from exc
+        raise CompletionError(429, str(exc), code=getattr(exc, "code", None)) from exc
     except credit.ChatStorageUnavailable as exc:
         raise CompletionError(503, "일시적으로 사용할 수 없습니다") from exc
 
@@ -305,6 +315,7 @@ class _OnlineReservation:
     credit_per_usd: Decimal
     input_bound: int
     output_bound: int
+    payer: Payer | None = None
     dispatched: bool = False
     settled: bool = False
     settling: bool = False
@@ -312,7 +323,7 @@ class _OnlineReservation:
     async def aclose(self) -> None:
         if not self.settled:
             with anyio.CancelScope(shield=True):
-                await stateless_credit.finish(self.event_id, uncertain=self.dispatched)
+                await stateless_credit.finish(self.event_id, uncertain=self.dispatched, payer=self.payer)
             self.settled = True
 
 
@@ -326,24 +337,38 @@ def _provider_rejected(hold: _OnlineReservation | None, exc: Exception) -> None:
 async def _reserve_online(
     route: dict, *, messages: list[dict], tools: list[dict] | None, max_output: int,
     user_id: str, project_id: str, api_key_id: int | None,
+    payer: Payer | None = None,
     tool_bound_usd: Decimal = Decimal("0"),
     prompt_options: dict | None = None,
 ) -> _OnlineReservation | None:
     model = _bounded_openai_model(route)
-    if not model:
-        if tool_bound_usd:
-            raise CompletionError(422, "Hosted tool pricing requires a bounded model.", code="pricing_unavailable")
+    if model:
+        input_bound, may_write_long = _request_input_bound(
+            route, model, messages=messages, tools=tools, max_output=max_output,
+            prompt_options=prompt_options or {}, content_growth=bool(tool_bound_usd),
+        )
+    elif payer is not None and not tool_bound_usd:
+        # Outside the bounded OpenAI contract, reserve the entire configured
+        # model context. A local tokenizer estimate is not a funding envelope.
+        capabilities = route.get("capabilities") or {}
+        input_bound = capabilities.get("context_limit")
+        if (type(input_bound) is not int or input_bound <= 0 or max_output <= 0
+                or capabilities.get("output_budget_enforced") is False):
+            raise CompletionError(422, "Model context or output bound unavailable.", code="pricing_unavailable")
+        max_allowed_output = capabilities.get("max_output_tokens")
+        if type(max_allowed_output) is int and max_output > max_allowed_output:
+            raise CompletionError(422, "Output token budget exceeds the model limit.", code="max_output_tokens_exceeded")
+        may_write_long = True
+    elif tool_bound_usd:
+        raise CompletionError(422, "Hosted tool pricing requires a bounded model.", code="pricing_unavailable")
+    else:
         return None
-    input_bound, may_write_long = _request_input_bound(
-        route, model, messages=messages, tools=tools, max_output=max_output,
-        prompt_options=prompt_options or {}, content_growth=bool(tool_bound_usd),
-    )
     pricing = frozen_token_pricing(route)
     if pricing["input_price_per_token"] is None or pricing["output_price_per_token"] is None:
         raise CompletionError(422, "Model pricing unavailable.", code="pricing_unavailable")
     if input_bound <= pricing["long_context_threshold_tokens"]:
         pricing = {key: value for key, value in pricing.items() if not key.endswith("_above_200k")}
-    if (model.get("token_pricing") or {}).get("cache_write_long_ttl") == "12h" and not may_write_long:
+    if model and (model.get("token_pricing") or {}).get("cache_write_long_ttl") == "12h" and not may_write_long:
         pricing.pop("cache_write_1h_price_per_token", None)
         pricing.pop("cache_write_1h_price_per_token_above_200k", None)
     conversion = Decimal(str(get_settings().chat_credit_per_usd))
@@ -356,13 +381,14 @@ async def _reserve_online(
         bound += (tool_bound_usd * Decimal(str(route["margin_multiplier"])) * conversion).quantize(
             Decimal("0.00000001"), rounding=ROUND_CEILING,
         )
-    hold = _OnlineReservation(str(uuid.uuid4()), conversion, input_bound, max_output)
+    hold = _OnlineReservation(str(uuid.uuid4()), conversion, input_bound, max_output, payer=payer)
     try:
         await stateless_credit.reserve(
             event_id=hold.event_id, user_id=user_id, project_id=project_id, api_key_id=api_key_id, bound=bound,
+            payer=payer,
         )
     except credit.QuotaExceeded as exc:
-        raise CompletionError(429, str(exc)) from exc
+        raise CompletionError(429, str(exc), code=getattr(exc, "code", None)) from exc
     except credit.ChatStorageUnavailable as exc:
         raise CompletionError(503, "Credit reservation unavailable.") from exc
     return hold
@@ -417,7 +443,7 @@ def billing_route(
     route["required_token_modalities"] = required
     reporting = (
         MODALITY_INPUT_REPORTING_PROVIDERS.get(str(route.get("provider_type") or ""), frozenset())
-        if protocol == "chat" and (route.get("provider_auth") or {}).get("auth_mode", "api_key") == "api_key"
+        if protocol in {"chat", "gemini"} and (route.get("provider_auth") or {}).get("auth_mode", "api_key") == "api_key"
         else frozenset()
     )
     for item in required:
@@ -510,7 +536,7 @@ async def _bill(
     pt, ct = breakdown.input_tokens, breakdown.output_tokens
     if hold is not None:
         logger.info(
-            "OpenAI held usage reservation_id=%s input_tokens=%d input_bound=%d output_tokens=%d output_bound=%d",
+            "Held usage reservation_id=%s input_tokens=%d input_bound=%d output_tokens=%d output_bound=%d",
             hold.event_id, pt, hold.input_bound, ct, hold.output_bound,
         )
         if pt > hold.input_bound or ct > hold.output_bound:
@@ -578,7 +604,7 @@ async def _bill(
                 api_key_id=api_key_id,
                 execution_route=resolved,
                 breakdown=breakdown,
-                **({"credit_per_usd": hold.credit_per_usd} if hold is not None else {}),
+                **({"credit_per_usd": hold.credit_per_usd, "payer": hold.payer} if hold is not None else {}),
             )
     except stateless_credit.ChargeExceedsReservation as exc:
         raise CompletionError(502, "charge_exceeds_reservation", code="provider_result_unknown") from exc
@@ -609,6 +635,15 @@ def _norm_tool_calls(raw: Any) -> list[dict] | None:
             }
         )
     return out
+
+
+def _completion_provider_options(
+    options: dict | None, *, resolved: dict, translated_options: bool,
+) -> dict:
+    if translated_options and not _official_openai(resolved):
+        # The Gemini adapter closed-validates and translates the option vocabulary.
+        return options or {}
+    return chat_provider_options(options or {}, resolved=resolved)
 
 
 def _reasoning_effort(explicit: str | None, resolved: dict | None = None) -> str | None:
@@ -695,20 +730,25 @@ async def complete_once(
     user_id: str,
     project_id: str,
     api_key_id: int | None,
+    payer: Payer | None = None,
     max_tokens: int | None,
     temperature: float | None,
     tools: list[dict] | None = None,
     tool_choice: Any = None,
     options: dict | None = None,
+    translated_options: bool = False,
 ) -> dict:
     """비스트리밍 완료 — 전체 응답 반환 + 과금. tool_calls 는 릴레이(서버 미실행)."""
     resolved = billing_route(resolved, messages, protocol="chat", options={"tools": tools})
     await _authorize_completion(user_id, project_id, api_key_id, {"tools": tools}, resolved)
-    options = chat_provider_options(options or {}, resolved=resolved)
+    options = _completion_provider_options(options, resolved=resolved, translated_options=translated_options)
     max_output = _chat_wire_budget(resolved, max_tokens)
+    if payer is not None and max_output is None:
+        max_output = _chat_hold_output_budget(resolved, None)
     hold = await _reserve_online(
         resolved, messages=messages, tools=tools, max_output=_chat_hold_output_budget(resolved, max_output),
         user_id=user_id, project_id=project_id, api_key_id=api_key_id,
+        payer=payer,
         prompt_options={**options, "tool_choice": tool_choice},
     )
     try:
@@ -759,20 +799,25 @@ async def complete_stream(
     user_id: str,
     project_id: str,
     api_key_id: int | None,
+    payer: Payer | None = None,
     max_tokens: int | None,
     temperature: float | None,
     tools: list[dict] | None = None,
     tool_choice: Any = None,
     options: dict | None = None,
+    translated_options: bool = False,
 ) -> AsyncIterator[dict]:
     """Validate/freeze before HTTP streaming starts, then return the completion iterator."""
     resolved = billing_route(resolved, messages, protocol="chat", options={"tools": tools})
-    options = chat_provider_options(options or {}, resolved=resolved)
+    options = _completion_provider_options(options, resolved=resolved, translated_options=translated_options)
     max_output = _chat_wire_budget(resolved, max_tokens)
+    if payer is not None and max_output is None:
+        max_output = _chat_hold_output_budget(resolved, None)
     await _authorize_completion(user_id, project_id, api_key_id, {"tools": tools}, resolved)
     hold = await _reserve_online(
         resolved, messages=messages, tools=tools, max_output=_chat_hold_output_budget(resolved, max_output),
         user_id=user_id, project_id=project_id, api_key_id=api_key_id,
+        payer=payer,
         prompt_options={**options, "tool_choice": tool_choice},
     )
     events = _complete_stream(
@@ -1191,6 +1236,7 @@ async def complete_responses(
     user_id: str,
     project_id: str,
     api_key_id: int | None,
+    payer: Payer | None = None,
     options: dict[str, Any],
 ) -> dict | AsyncIterator[dict]:
     """Execute the native Responses protocol and preserve every upstream item/event."""
@@ -1218,10 +1264,14 @@ async def complete_responses(
         messages = [{"role": "system", "content": options["instructions"]}, *messages]
     resolved = billing_route(resolved, messages, protocol="responses", options=options)
     await _authorize_completion(user_id, project_id, api_key_id, options, resolved)
+    max_output = options.get("max_output_tokens") or catalog.get("max_output_tokens") or _DEFAULT_MAX_TOKENS
+    if payer is not None:
+        options["max_output_tokens"] = max_output
     hold = await _reserve_online(
         resolved, messages=messages, tools=options.get("tools"),
-        max_output=options.get("max_output_tokens") or catalog.get("max_output_tokens") or _DEFAULT_MAX_TOKENS,
+        max_output=max_output,
         user_id=user_id, project_id=project_id, api_key_id=api_key_id,
+        payer=payer,
         tool_bound_usd=meter.bound_usd if meter is not None else Decimal("0"), prompt_options=options,
     )
     event_id = hold.event_id if hold is not None else str(uuid.uuid4())
@@ -1338,14 +1388,21 @@ async def complete_anthropic(
     user_id: str,
     project_id: str,
     api_key_id: int | None,
+    payer: Payer | None = None,
     options: dict[str, Any],
 ) -> dict | AsyncIterator[dict]:
     """Execute the native Anthropic protocol without lossy OpenAI conversion."""
     resolved = billing_route(resolved, messages, protocol="anthropic", options=options)
-    event_id = str(uuid.uuid4())
     options = _with_passthrough_compaction(options, resolved=resolved, protocol="anthropic")
     await _authorize_completion(user_id, project_id, api_key_id, options, resolved)
+    hold = await _reserve_online(
+        resolved, messages=messages, tools=options.get("tools"), max_output=max_tokens,
+        user_id=user_id, project_id=project_id, api_key_id=api_key_id, payer=payer, prompt_options=options,
+    ) if payer is not None else None
+    event_id = hold.event_id if hold else str(uuid.uuid4())
     try:
+        if hold is not None:
+            hold.dispatched = True
         response = await provider_client.aanthropic_messages(
             model=resolved["model_name"],
             messages=messages,
@@ -1358,24 +1415,37 @@ async def complete_anthropic(
             **options,
         )
     except errors.ProviderSubscriptionError as exc:
+        _provider_rejected(hold, exc)
+        if hold is not None:
+            await hold.aclose()
         raise CompletionError(exc.status_code, exc.message) from None
-    except Exception as exc:
+    except BaseException as exc:
+        _provider_rejected(hold, exc)
+        if hold is not None:
+            await hold.aclose()
+        if not isinstance(exc, Exception):
+            raise
         logger.warning("Anthropic upstream request failed model=%s", resolved.get("model_name"), exc_info=True)
         raise CompletionError(502, "upstream model error") from exc
 
     if not stream:
-        payload = _native_dict(response)
-        await _bill(
-            resolved,
-            messages,
-            _native_text(payload.get("content", [])),
-            _native_usage(payload, protocol="anthropic", strict=bool(resolved.get("token_rates"))),
-            event_id=event_id,
-            user_id=user_id,
-            project_id=project_id,
-            api_key_id=api_key_id,
-        )
-        return payload
+        try:
+            payload = _native_dict(response)
+            await _bill(
+                resolved,
+                messages,
+                _native_text(payload.get("content", [])),
+                _native_usage(payload, protocol="anthropic", strict=bool(resolved.get("token_rates"))),
+                event_id=event_id,
+                user_id=user_id,
+                project_id=project_id,
+                api_key_id=api_key_id,
+                hold=hold,
+            )
+            return payload
+        finally:
+            if hold is not None:
+                await hold.aclose()
 
     # Start the provider chain before HTTP 200: LiteLLM's Anthropic byte stream
     # releases its pooled connection on close only after it was iterated.
@@ -1388,6 +1458,9 @@ async def complete_anthropic(
         # The ASGI resource owner is registered only after this function returns.
         with anyio.CancelScope(shield=True):
             await _close_provider_stream(upstream)
+            _provider_rejected(hold, exc)
+            if hold is not None:
+                await hold.aclose()
         if isinstance(exc, errors.ProviderSubscriptionError):
             raise CompletionError(exc.status_code, exc.message) from None
         if not isinstance(exc, Exception):
@@ -1443,6 +1516,7 @@ async def complete_anthropic(
                         user_id=user_id,
                         project_id=project_id,
                         api_key_id=api_key_id,
+                        hold=hold,
                     )
                     charged = True
                 yield event
@@ -1450,7 +1524,7 @@ async def complete_anthropic(
             # Stop upstream generation first; close failures are logged, never skip billing.
             await _close_provider_stream(response)
             if (
-                not charged and text_parts and not resolved.get("required_token_modalities")
+                hold is None and not charged and text_parts and not resolved.get("required_token_modalities")
                 and not (resolved.get("token_rates") and settlement_attempted)
             ):
                 try:
@@ -1500,7 +1574,83 @@ async def complete_anthropic(
                 except Exception:
                     logger.warning("Anthropic partial-stream accounting failed", exc_info=True)
 
-    return _ProviderEvents(events(), upstream)
+    return _ProviderEvents(events(), upstream, hold)
+
+
+async def _bill_gemini(
+    resolved: dict, messages: list[dict], usage: Any, *,
+    user_id: str, project_id: str, api_key_id: int | None, hold: _OnlineReservation | None,
+) -> None:
+    breakdown = UsageBreakdown.from_gemini(usage)
+    if breakdown is None or breakdown.modality_usage_invalid:
+        raise CompletionError(502, "gemini_usage_invalid", code="provider_result_unknown")
+    await _bill(
+        resolved, messages, "", breakdown.as_usage_dict(),
+        event_id=hold.event_id if hold else str(uuid.uuid4()), user_id=user_id, project_id=project_id,
+        api_key_id=api_key_id, hold=hold,
+    )
+
+
+@receipt_owner
+async def complete_gemini(
+    *, resolved: dict, payload: dict, messages: list[dict], max_tokens: int, stream: bool,
+    user_id: str, project_id: str, api_key_id: int | None, payer: Payer | None = None,
+) -> dict | AsyncIterator[dict]:
+    """Keep native Gemini parts/usage intact while using the normal stateless ledger."""
+    resolved = billing_route(resolved, messages, protocol="gemini")
+    # Only client functions are allowed in this closed request. Intrinsic server
+    # tools still require their own scope even when no tool declarations are sent.
+    await _authorize_completion(user_id, project_id, api_key_id, {}, resolved)
+    hold = await _reserve_online(
+        resolved, messages=messages, tools=None, max_output=max_tokens, user_id=user_id,
+        project_id=project_id, api_key_id=api_key_id, payer=payer,
+    )
+    try:
+        if hold is not None:
+            hold.dispatched = True
+        response = await provider_client.agemini_generate(
+            model=resolved["model_name"], payload=payload, stream=stream,
+            api_base=resolved.get("api_base"), api_key=resolved.get("api_key"),
+            provider_auth=resolved.get("provider_auth"),
+        )
+        if not stream:
+            await _bill_gemini(
+                resolved, messages, response.get("usageMetadata"), user_id=user_id,
+                project_id=project_id, api_key_id=api_key_id, hold=hold,
+            )
+            return response
+    except BaseException as exc:
+        if isinstance(exc, Exception):
+            _provider_rejected(hold, exc)
+        if hold is not None:
+            await hold.aclose()
+        raise
+    finally:
+        if not stream and hold is not None:
+            await hold.aclose()
+
+    async def events() -> AsyncIterator[dict]:
+        # Hold one frame back so usage (cumulative in every Gemini frame) rides on
+        # the final candidate frame only after settlement succeeded.
+        usage = held = None
+        try:
+            async for frame in response:
+                if "usageMetadata" in frame:
+                    usage = frame.pop("usageMetadata")
+                if not frame:
+                    continue
+                if held is not None:
+                    yield held
+                held = frame
+            await _bill_gemini(
+                resolved, messages, usage, user_id=user_id, project_id=project_id, api_key_id=api_key_id, hold=hold,
+            )
+            yield {**(held or {}), "usageMetadata": usage}
+        finally:
+            if hold is not None:
+                await hold.aclose()
+
+    return _ProviderEvents(events(), response, hold)
 
 
 async def count_anthropic_tokens(

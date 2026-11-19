@@ -1,4 +1,5 @@
 """Synthetic HTTP and pre-I/O fences; no Keystone, provider, DB, or worker credentials."""
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ from lumen.api.compat import anthropic, openai, responses
 from lumen.auth import ensure_scopes, get_principal
 from lumen.models.chat_contracts import ChatFeatureOptions, ChatRunDescriptor, ToolPolicy
 from lumen.models.chat_db import ChatApiKey
+from lumen.models.chat_runs import ChatRunSegment
 from lumen.services import api_key_store, chat_admission, completion_api, inference_authority
 from lumen.services.durable_runs import execution
 from lumen.services.durable_runs.errors import DurableRunInputError
@@ -26,9 +28,14 @@ def principal(role="member", *, key=False, scopes=("compat:completions:write", "
             "source": "api" if key else "web", "is_system_admin": False, "scopes": scopes}
 
 
-def active_key(*scopes):
-    return SimpleNamespace(owner_user_id="owner", owner_project_id="project", is_active=True,
-                           revoked_at=None, expires_at=None, scopes=list(scopes))
+def active_key(*scopes, **fields):
+    # A personal Claude Gateway key keeps the owner/project identity and live owner
+    # roles. Like every key, its stored scopes only ever count inside the model allowlist.
+    return SimpleNamespace(**{"id": 7, "key_kind": "personal", "credential_kind": "claude_gateway",
+                              "owner_user_id": "owner", "owner_project_id": "project", "owner_domain_id": None,
+                              "created_by_user_id": "owner",
+                              "is_active": True, "revoked_at": None, "expires_at": None,
+                              "scopes": list(scopes), **fields})
 
 
 @pytest.mark.parametrize(("path", "body"), [
@@ -67,12 +74,12 @@ def test_member_admits_native_images_without_service_role(monkeypatch):
 
 @pytest.mark.parametrize(("router", "path", "body"), [
     (openai.router, "/chat/completions", {"model": "model", "messages": [{"role": "user", "content": "hi"}],
-        "tools": [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]}),
+        "web_search_options": {}}),
     (responses.router, "/responses", {"model": "model", "input": "hi", "tools": [{"type": "web_search"}]}),
     (anthropic.router, "/messages", {"model": "model", "max_tokens": 20,
         "messages": [{"role": "user", "content": "hi"}], "tools": [{"type": "web_search_20250305", "name": "web_search"}]}),
 ])
-def test_completion_key_denies_compat_tools_before_resolution(monkeypatch, router, path, body):
+def test_completion_key_denies_hosted_tools_before_resolution(monkeypatch, router, path, body):
     app = FastAPI()
     app.include_router(router)
     app.dependency_overrides[get_principal] = lambda: principal(key=True)
@@ -81,6 +88,7 @@ def test_completion_key_denies_compat_tools_before_resolution(monkeypatch, route
     with TestClient(app) as client:
         response = client.post(path, json=body)
     assert response.status_code == 403
+    assert "server_tool_not_allowed_for_key" in response.text
     resolve.assert_not_awaited()
 
 
@@ -150,21 +158,33 @@ def test_compat_generated_modalities_are_independent(modalities, scope):
         ensure_scopes(principal(key=True), *scopes)
 
 
+def dispatch_run(**fields):
+    return SimpleNamespace(**{"agent_id": None, "payer_domain_id": None, "request_fingerprint": "fingerprint",
+                              "cancel_requested_at": None, **fields})
+
+
 class Session:
-    def __init__(self, value, *, key=None):
+    def __init__(self, value, *, key=None, run=None, segment=None):
         self.value = value
         self.key = key
+        self.run = run
+        self.segment = segment
     async def __aenter__(self):
         return self
     async def __aexit__(self, *args):
         return False
     def begin(self):
         return self
+    async def get(self, model, key):
+        if model is ChatRunSegment:
+            return self.segment
+        return self.run if self.run is not None else self.value
     async def execute(self, statement, *args, **kwargs):
         value = self.key if self.key is not None and any(
             item.get("entity") is ChatApiKey for item in getattr(statement, "column_descriptions", ())
         ) else self.value
-        return SimpleNamespace(scalar_one=lambda: value, scalar_one_or_none=lambda: value)
+        # one_or_none is only the run-payer lookup; these fences test authority, not billing locks.
+        return SimpleNamespace(scalar_one=lambda: value, scalar_one_or_none=lambda: value, one_or_none=lambda: None)
 
 
 @pytest.mark.parametrize("api_key_id", [None, 7])
@@ -190,17 +210,17 @@ async def test_revoked_key_denied_before_new_io(monkeypatch):
 @pytest.mark.parametrize("state", ["prepared", "completed", "provider_started"])
 async def test_durable_authority_only_checked_for_new_io(monkeypatch, state):
     metadata = reduced_authority()
-    run = SimpleNamespace(id="run", user_id="owner", project_id="project", api_key_id=None, agent_id=None,
-                          capability_snapshot={"credential_authority": metadata})
+    run = dispatch_run(id="run", user_id="owner", project_id="project", api_key_id=None, run_scope="temp",
+                       capability_snapshot={"credential_authority": metadata})
     segment = SimpleNamespace(status=state, result_payload="{}", usage_payload="{}")
-    monkeypatch.setattr(execution, "_factory", lambda: lambda: Session(run))
+    monkeypatch.setattr(execution, "_factory", lambda: lambda: Session(run, segment=segment))
     monkeypatch.setattr(execution, "_require_owned_running_lease", lambda *args: None)
     monkeypatch.setattr(execution, "prepare_segment", AsyncMock(return_value=segment))
     monkeypatch.setattr(execution, "_payload", lambda _: {"features": {"tool_policy": {"mode": "none"}}})
     monkeypatch.setattr(execution, "load_segment_payload", lambda _: {})
     monkeypatch.setattr(execution, "fail_unresolved_segment", lambda *args, **kwargs: None)
     authorization = AsyncMock(side_effect=api_key_store.ApiKeyForbidden("downgraded"))
-    monkeypatch.setattr(execution, "authorize_api_key_in_transaction", authorization)
+    monkeypatch.setattr(inference_authority, "authorize_api_key_in_transaction", authorization)
     hooks = execution._DurableExecutionHooks(run_id="run", owner="worker-authority")
     if state == "prepared":
         with pytest.raises(DurableRunInputError, match="inference_authority_revoked"):
@@ -296,8 +316,8 @@ async def test_compat_realtime_checks_current_project_writer_not_only_key_scope(
     monkeypatch.setattr(realtime, "get_settings", lambda: SimpleNamespace(chat_api_hosts=""))
     monkeypatch.setattr(realtime, "origin_allowed", lambda _: True)
     monkeypatch.setattr(realtime.api_key_store, "verify_key", AsyncMock(return_value={
-        **principal("reader", key=True), "scopes": ["compat:realtime:write"]}))
-    websocket = SimpleNamespace(headers={"authorization": "Bearer sk-afgl-synthetic"})
+        **principal("reader", key=True), "credential_class": "claude_gateway", "scopes": ["compat:realtime:write"]}))
+    websocket = SimpleNamespace(scope={}, headers={"authorization": "Bearer sk-afgl-synthetic"})
     assert await realtime._principal(websocket) is None
 
 
@@ -363,7 +383,9 @@ async def test_automatic_memory_generation_denies_current_downgraded_owner(monke
     monkeypatch.setattr(memory_extract.cs, "list_messages_for_run", AsyncMock(return_value=[{"role": "user", "content": "remember"}]))
     provider = AsyncMock(side_effect=AssertionError("memory provider started after downgrade"))
     monkeypatch.setattr(memory_extract.provider_client, "acompletion", provider)
-    assert await memory_extract.generate_memory_if_applicable(conversation_id="conv", project_id="project", run_id="run", user_id="owner") is None
+    assert await memory_extract.generate_memory_if_applicable(
+        conversation_id="conv", project_id="project", run_id="run", user_id="owner", domain_id="domain",
+    ) is None
     provider.assert_not_awaited()
 
 
@@ -377,26 +399,22 @@ async def test_auxiliary_generation_does_not_require_old_selected_tools(monkeypa
 
 
 @pytest.mark.parametrize("required", [False, True])
-@pytest.mark.parametrize("tools_scope", [False, True])
-async def test_auxiliary_model_uses_its_own_intrinsic_key_scope(monkeypatch, required, tools_scope):
+async def test_key_backed_runs_never_authorize_auxiliary_generation(monkeypatch, required):
+    # Model keys never hold native generation, history or tool scopes, even as legacy stored scopes.
     monkeypatch.setattr(auth, "resolve_project_authority", AsyncMock(return_value={"roles": ["member"], "is_system_admin": False}))
     run = SimpleNamespace(user_id="owner", project_id="project", api_key_id=7, source="api",
                           run_scope="persistent", conversation_id="conv", capability_snapshot={})
-    session = Session(active_key("native:runs:write", "native:conversations:read",
-                                 *(("native:tools:execute",) if tools_scope else ())))
-    resolved = {"capabilities": {"web_search_required": required}}
-    if required and not tools_scope:
-        with pytest.raises(api_key_store.ApiKeyForbidden):
-            await inference_authority.authorize_run_generation(session, run, resolved=resolved)
-    else:
-        await inference_authority.authorize_run_generation(session, run, resolved=resolved)
+    session = Session(active_key("compat:completions:write", "native:runs:write", "native:conversations:read",
+                                 "native:tools:execute"))
+    with pytest.raises(api_key_store.ApiKeyForbidden):
+        await inference_authority.authorize_run_generation(
+            session, run, resolved={"capabilities": {"web_search_required": required}})
 
 
 async def test_auxiliary_intrinsic_search_preserves_key_scope_attenuation(monkeypatch):
     monkeypatch.setattr(auth, "resolve_project_authority", AsyncMock(return_value={
         "roles": ["member"], "is_system_admin": False}))
-    key = SimpleNamespace(owner_user_id="owner", owner_project_id="project", is_active=True, revoked_at=None,
-                          expires_at=None, scopes=["native:runs:write", "native:conversations:read"])
+    key = active_key("native:runs:write", "native:conversations:read")
     run = SimpleNamespace(user_id="owner", project_id="project", api_key_id=7, source="api",
                           run_scope="persistent", conversation_id="conv", capability_snapshot={})
     with pytest.raises(api_key_store.ApiKeyForbidden):
@@ -463,7 +481,8 @@ async def test_denied_intrinsic_memory_completes_optional_job_without_mutating_c
     monkeypatch.setattr(memory_extract.provider_client, "acompletion", provider)
     monkeypatch.setattr(memory_jobs.ms, "apply_automatic_ops_in_transaction", apply)
     monkeypatch.setattr(memory_jobs, "_retry", retry)
-    assert await memory_jobs._process_claimed(("job", "run", "conv", "project", "owner"), owner="worker")
+    monkeypatch.setattr(memory_jobs, "revalidate", AsyncMock())
+    assert await memory_jobs._process_claimed(("job", "run", "conv", "project", "owner", "domain"), owner="worker")
     assert job.status == "completed" and job.progress == {"applied": {"add": 0, "update": 0, "delete": 0}}
     assert run.status == "completed" and messages[-1]["content"] == "already delivered answer"
     auth.resolve_project_authority.assert_awaited_once_with("owner", "project")
@@ -478,11 +497,11 @@ async def test_intrinsic_compaction_fences_only_new_intent_including_old_snapsho
     summary = {"model_name": "administrator-selected-model", "provider_id": 1, "model_id": 2}
     if not legacy:
         summary["capabilities"] = {"web_search_required": True}
-    run = SimpleNamespace(id="run", user_id="owner", project_id="project", api_key_id=7, agent_id=None,
+    run = dispatch_run(id="run", user_id="owner", project_id="project", api_key_id=7,
                           source="api", run_scope="persistent", conversation_id="conv", capability_snapshot={"summary_route": summary})
     segment = SimpleNamespace(status=segment_state, result_payload="{}", usage_payload="{}")
     monkeypatch.setattr(execution, "_factory", lambda: lambda: Session(
-        run, key=active_key("native:runs:write", "native:conversations:read")))
+        run, key=active_key("native:runs:write", "native:conversations:read"), segment=segment))
     monkeypatch.setattr(execution, "_require_owned_running_lease", lambda *_args: None)
     monkeypatch.setattr(execution, "prepare_segment", AsyncMock(return_value=segment))
     monkeypatch.setattr(execution, "_payload", lambda _: {"features": {"tool_policy": {"mode": "none"}}})
@@ -507,8 +526,8 @@ async def test_intrinsic_compaction_fences_only_new_intent_including_old_snapsho
 async def test_denied_automatic_intrinsic_compaction_preserves_safe_plain_chat_input(monkeypatch):
     summary = {"model_name": "administrator-selected-model", "context_limit": 4000,
                "capabilities": {"web_search_required": True}}
-    run = SimpleNamespace(id="run", status="running", user_id="owner", project_id="project", api_key_id=7,
-        agent_id=None, source="api", run_scope="persistent", conversation_id="conv", temp_thread_id=None,
+    run = dispatch_run(id="run", status="running", user_id="owner", project_id="project", api_key_id=7,
+        source="api", run_scope="persistent", conversation_id="conv", temp_thread_id=None,
         model_name="ordinary-chat", capability_snapshot={"capabilities": {"context_limit": 1000}, "summary_route": summary},
         pricing_snapshot={"summary_route": {"token_rates": {}}})
     segment = SimpleNamespace(status="prepared")
@@ -548,16 +567,15 @@ async def test_queued_key_expiration_rejects_new_tool_intent_before_provider_sta
     roles = ["member"]
     monkeypatch.setattr(auth, "resolve_project_authority", AsyncMock(return_value={
         "roles": roles, "is_system_admin": False}))
-    key = SimpleNamespace(owner_user_id="owner", owner_project_id="project", is_active=True,
-                          revoked_at=None, expires_at=datetime.now(UTC) + timedelta(days=1),
-                          scopes=["native:runs:write", "native:tools:execute"])
+    key = active_key("compat:completions:write", "native:runs:write", "native:tools:execute",
+                     expires_at=datetime.now(UTC) + timedelta(days=1))
     # Key is valid when work is admitted, but expires while waiting for a worker.
     await api_key_store.authorize_api_key_in_transaction(
         Session(key), user_id="owner", project_id="project", api_key_id=7,
-        required_scopes=("native:runs:write", "native:tools:execute"))
+        required_scopes=("compat:completions:write",))
     key.expires_at = datetime.now(UTC) - timedelta(seconds=1)
-    run = SimpleNamespace(id="run", user_id="owner", project_id="project", api_key_id=7,
-                          agent_id=None, capability_snapshot={})
+    run = dispatch_run(id="run", user_id="owner", project_id="project", api_key_id=7, run_scope="temp",
+                       capability_snapshot={})
     segment = SimpleNamespace(status="prepared")
 
     class QueuedSession(Session):
@@ -660,7 +678,7 @@ async def test_finite_media_fresh_gate_keeps_original_ceiling_before_source_or_h
 
     metadata = reduced_authority()
     state, lookup = retained_admin_with_reduced_membership(monkeypatch, metadata)
-    run = SimpleNamespace(id="run", user_id="owner", project_id="project", api_key_id=None,
+    run = dispatch_run(id="run", user_id="owner", project_id="project", api_key_id=None,
         run_kind=kind, model_name="synthetic", capability_snapshot={"credential_authority": metadata}, pricing_snapshot={})
     monkeypatch.setattr("lumen.services.durable_runs.admission._lock_run_configurations", AsyncMock())
     monkeypatch.setattr(media, "_payload", lambda _: {"required_scopes": [scope],
@@ -670,12 +688,16 @@ async def test_finite_media_fresh_gate_keeps_original_ceiling_before_source_or_h
     monkeypatch.setattr(media, "lock_media_source_in_transaction", source)
     session = Session(None)
     session.execute = AsyncMock(side_effect=AssertionError("denied media gate reached SQL"))
-    await media.validate_batch_media_io_in_transaction(session, run)
+    approval = await inference_authority.preflight_dispatch(session, run, (scope,))
+    assert await media.validate_batch_media_io_in_transaction(session, run, approval) is approval
     source.assert_awaited_once()
     source.reset_mock()
     state.revoked = True
-    with pytest.raises(media.MediaAuthorizationRevoked):
-        await media.validate_batch_media_io_in_transaction(session, run)
+    with pytest.raises(api_key_store.ApiKeyForbidden):
+        await inference_authority.preflight_dispatch(session, run, (scope,))
+    for stale in (None, replace(approval, expires_at=0)):
+        with pytest.raises(media.MediaAuthorizationRevoked):
+            await media.validate_batch_media_io_in_transaction(session, run, stale)
     lookup.assert_awaited_with("owner", "project", credential_authority=metadata)
     source.assert_not_awaited()
     session.execute.assert_not_awaited()
@@ -686,11 +708,11 @@ async def test_realtime_fresh_gate_retains_original_ceiling_before_hold_and_prov
 
     metadata = reduced_authority()
     state, lookup = retained_admin_with_reduced_membership(monkeypatch, metadata)
-    run = SimpleNamespace(id="run", user_id="owner", project_id="project", api_key_id=None, source="web",
+    run = dispatch_run(id="run", user_id="owner", project_id="project", api_key_id=None, source="web",
         lease_owner="worker", last_seq=0, capability_snapshot={"credential_authority": metadata},
         pricing_snapshot={"bound_credits": "1"}, provider_started_at=None)
     segment = SimpleNamespace(status="prepared")
-    session = Session(None)
+    session = Session(None, run=run, segment=segment)
     session.flush = AsyncMock()
     reservations = []
     session.add = reservations.append
@@ -731,16 +753,17 @@ async def test_finite_media_ceiling_fences_hold_but_not_committed_checkpoint(mon
     metadata = reduced_authority()
     state, lookup = retained_admin_with_reduced_membership(monkeypatch, metadata)
     scope = "native:images:write" if kind == "image" else "native:audio:write"
-    run = SimpleNamespace(id="run", user_id="owner", project_id="project", api_key_id=None, source="web",
+    run = dispatch_run(id="run", user_id="owner", project_id="project", api_key_id=None, source="web",
         run_kind=kind, model_name="synthetic", last_seq=0,
         capability_snapshot={"credential_authority": metadata}, pricing_snapshot={"bound_credits": "1"},
         provider_started_at=None)
     segment = SimpleNamespace(status=segment_state)
-    session = Session(None)
+    session = Session(None, run=run, segment=segment)
     session.flush = AsyncMock()
     reservations = []
     session.add = reservations.append
     monkeypatch.setattr(module, "_factory", lambda: lambda: session)
+    monkeypatch.setattr(media, "_require_owned_running_lease", lambda *_args: None)
     monkeypatch.setattr(module, "lock_media_run_for_io", AsyncMock(return_value=(run, None)))
     monkeypatch.setattr(module, "prepare_segment", AsyncMock(return_value=segment))
     monkeypatch.setattr("lumen.services.durable_runs.admission._lock_run_configurations", AsyncMock())
@@ -783,11 +806,11 @@ async def test_api_generation_segment_keeps_ceiling_before_hold_without_reauthor
 
     metadata = reduced_authority()
     state, lookup = retained_admin_with_reduced_membership(monkeypatch, metadata)
-    run = SimpleNamespace(id="run", user_id="owner", project_id="project", api_key_id=None, batch_id="batch",
-        model_name="synthetic", last_seq=0, cancel_requested_at=None, provider_started_at=None,
+    run = dispatch_run(id="run", user_id="owner", project_id="project", api_key_id=None, batch_id="batch",
+        model_name="synthetic", last_seq=0, provider_started_at=None,
         capability_snapshot={"credential_authority": metadata})
     segment = SimpleNamespace(status=segment_state)
-    session = Session(run)
+    session = Session(run, segment=segment)
     session.scalar = AsyncMock(return_value="batch")
     session.flush = AsyncMock()
     reservations = []

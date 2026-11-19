@@ -395,6 +395,7 @@ async def test_compat_gateways_route_by_wire_transport_not_renamed_selector(monk
 
     async def verify_key(_key):
         return {"user_id": user_id, "project_id": project_id, "api_key_id": None,
+                "auth_type": "api_key", "credential_class": "claude_gateway",
                 "scopes": ["compat:realtime:write"], "roles": ["member", "lumen-audio_user"],
                 "is_system_admin": False}
 

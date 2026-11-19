@@ -1,17 +1,16 @@
-"""System tests for native and OpenAI-compatible batches over the real process stack.
+"""System tests for Keystone Native Batch and model-key compatibility denials.
 
 The API, the online worker and the batch-only worker run as separate processes on an
 internal network. Text routes reach the fake provider over HTTP; image/audio transports
 keep their official ``https://api.openai.com`` endpoints, which resolve to the fake
 provider's TLS listener through compose aliases and a test-only CA bundle. Every check
-here consumes the public wire (Lumen SDK sync/async, OpenAI Python SDK) and then reads
-the MariaDB ledger the processes actually wrote; nothing is mocked in-process.
+here consumes the public wire (native Lumen SDK and compatibility endpoints).
+Native tests also read the MariaDB ledger that the processes actually wrote.
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
 import hashlib
 import io
 import json
@@ -30,10 +29,9 @@ from typing import TYPE_CHECKING, Any
 
 import certifi
 import httpx
-import openai
 import pytest
 from PIL import Image
-from system.fake_keystone import OWNER_TOKEN, PROJECT_ID
+from system.fake_keystone import OWNER_TOKEN
 
 if TYPE_CHECKING:
     # The SDK is installed only in the system test image; host contract runs only collect.
@@ -364,7 +362,7 @@ def _assert_settled_once(ledger: dict[str, Any], run: Any, raw_cost: Decimal) ->
     assert usage.credited_cost > 0
     assert hold.actual_credits == usage.credited_cost
     assert hold.actual_credits <= hold.bound_credits
-    assert usage.source == run.source == "api"
+    assert usage.source == run.source == "web"
     assert usage.api_key_id == run.api_key_id == ledger["batch"].api_key_id
     assert usage.project_id == run.project_id == ledger["batch"].project_id
     assert usage.user_id == run.user_id == ledger["batch"].user_id
@@ -498,7 +496,7 @@ def _assert_native_ledger(
     assert batch.status == "completed" and batch.completed_at is not None
     assert (batch.request_total, batch.request_completed, batch.request_failed) == (8, 8, 0)
     assert (batch.request_cancelled, batch.request_expired, batch.request_unknown) == (0, 0, 0)
-    assert batch.api_key_id is not None
+    assert batch.api_key_id is None
     assert batch.idempotency_key_hash is not None
     assert batch.input_file_id is None and batch.output_file_id is None and batch.error_file_id is None
 
@@ -610,7 +608,8 @@ def test_native_mixed_batch_sync_sdk_six_operations() -> None:
     png, wav = _png_fixture(), _wav_fixture()
     metadata = {"suite": "system", "client": "sync"}
 
-    with Client(conn["api_base_url"], conn["api_key"], timeout=60.0) as client:
+    # The fixture token is project scoped; the SDK sends it via Authorization: Bearer.
+    with Client(conn["api_base_url"], OWNER_TOKEN, timeout=60.0) as client:
         png_asset = client.upload_asset(file=("source.png", png, "image/png"))
         wav_asset = client.upload_asset(file=("speech.wav", wav, "audio/wav"))
         _assert_uploaded_asset(png_asset, png, "image/png")
@@ -673,7 +672,7 @@ async def test_native_mixed_batch_async_sdk_six_operations() -> None:
     png, wav = _png_fixture(), _wav_fixture()
     metadata = {"suite": "system", "client": "async"}
 
-    async with AsyncClient(conn["api_base_url"], conn["api_key"], timeout=60.0) as client:
+    async with AsyncClient(conn["api_base_url"], OWNER_TOKEN, timeout=60.0) as client:
         png_asset = await client.upload_asset(file=("source.png", png, "image/png"))
         wav_asset = await client.upload_asset(file=("speech.wav", wav, "audio/wav"))
         _assert_uploaded_asset(png_asset, png, "image/png")
@@ -712,312 +711,72 @@ async def test_native_mixed_batch_async_sdk_six_operations() -> None:
 # ============================================================================
 
 
-def _openai_client(conn: dict[str, str]) -> openai.OpenAI:
-    return openai.OpenAI(api_key=conn["api_key"], base_url=conn["compat_base_url"], max_retries=0, timeout=60.0)
-
-
-def _jsonl(rows: list[dict[str, Any]]) -> bytes:
-    return "".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rows).encode()
-
-
-def _parse_jsonl(data: bytes) -> list[dict[str, Any]]:
-    rows = [json.loads(line) for line in data.decode("utf-8").splitlines() if line.strip()]
-    for row in rows:
-        assert set(row) == {"id", "custom_id", "response", "error"}, row
-        assert row["id"].startswith("batch_req_")
-    return rows
-
-
-def _poll_openai(client: openai.OpenAI, batch_id: str, *, timeout: float = 240.0) -> Any:
-    deadline = time.monotonic() + timeout
-    last: Any = None
-    while time.monotonic() < deadline:
-        last = client.batches.retrieve(batch_id)
-        if last.status in TERMINAL_BATCH_STATUSES:
-            return last
-        time.sleep(0.5)
-    raise TimeoutError(f"OpenAI batch {batch_id} did not finish within {timeout}s: {last}")
-
-
-def _internal_id(prefix: str, public_id: str) -> str:
-    assert public_id.startswith(prefix)
-    return str(uuid.UUID(hex=public_id[len(prefix):]))
-
-
-def _submit_openai_batch(
-    client: openai.OpenAI, endpoint: str, rows: list[dict[str, Any]], name: str
-) -> tuple[Any, Any, bytes]:
-    payload = _jsonl(rows)
-    uploaded = client.files.create(file=(f"{name}.jsonl", payload, "application/jsonl"), purpose="batch")
-    assert uploaded.id.startswith("file-")
-    assert uploaded.object == "file" and uploaded.purpose == "batch"
-    assert uploaded.status == "processed"
-    assert uploaded.bytes == len(payload)
-    assert client.files.retrieve(uploaded.id).id == uploaded.id
-    assert client.files.content(uploaded.id).content == payload
-    created = client.batches.create(
-        input_file_id=uploaded.id, endpoint=endpoint, completion_window="24h",
-        metadata={"suite": "system", "name": name},
-    )
-    assert created.id.startswith("batch_")
-    assert created.object == "batch" and created.endpoint == endpoint
-    assert created.input_file_id == uploaded.id and created.completion_window == "24h"
-    assert created.metadata == {"suite": "system", "name": name}
-    return uploaded, created, payload
-
-
-def _download_results(
-    client: openai.OpenAI, batch: Any
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, bytes]]:
-    raw: dict[str, bytes] = {}
-    output: list[dict[str, Any]] = []
-    errors: list[dict[str, Any]] = []
-    for file_id, sink in ((batch.output_file_id, output), (batch.error_file_id, errors)):
-        if file_id is None:
-            continue
-        meta = client.files.retrieve(file_id)
-        assert meta.purpose == "batch_output" and meta.status == "processed"
-        raw[file_id] = client.files.content(file_id).content
-        assert meta.bytes == len(raw[file_id]) > 0
-        sink.extend(_parse_jsonl(raw[file_id]))
-    return output, errors, raw
-
-
-def _assert_result_files(ledger: dict[str, Any], batch: Any, raw: dict[str, bytes], input_payload: bytes) -> None:
-    row = ledger["batch"]
-    assert row.contract == "openai"
-    assert row.input_file_id == _internal_id("file-", batch.input_file_id)
-    input_file = ledger["files"][row.input_file_id]
-    assert input_file.purpose == "batch"
-    assert input_file.sha256 == hashlib.sha256(input_payload).hexdigest()
-    assert input_file.size_bytes == len(input_payload)
-    for public_id, field in ((batch.output_file_id, row.output_file_id), (batch.error_file_id, row.error_file_id)):
-        if public_id is None:
-            assert field is None
-            continue
-        assert field == _internal_id("file-", public_id)
-        stored = ledger["files"][field]
-        assert stored.purpose == "batch_output" and stored.state == "processed"
-        assert (stored.project_id, stored.user_id) == (row.project_id, row.user_id)
-        assert stored.size_bytes == len(raw[public_id])
-        assert stored.sha256 == hashlib.sha256(raw[public_id]).hexdigest()
-
-
-def test_openai_sdk_files_and_batches_chat_responses_images() -> None:
+@pytest.mark.parametrize(("method", "path", "kwargs"), [
+    ("GET", "/files", {}),
+    ("POST", "/files", {"files": {"file": ("input.jsonl", b"{}\n")}, "data": {"purpose": "batch"}}),
+    ("GET", "/files/file-fixture", {}),
+    ("DELETE", "/files/file-fixture", {}),
+    ("GET", "/files/file-fixture/content", {}),
+    ("GET", "/batches", {}),
+    ("POST", "/batches", {"json": {"input_file_id": "file-fixture", "endpoint": "/v1/chat/completions",
+                                  "completion_window": "24h"}}),
+    ("GET", "/batches/batch_fixture", {}),
+    ("POST", "/batches/batch_fixture/cancel", {}),
+])
+def test_model_key_cannot_access_compat_files_or_batches(method, path, kwargs):
     conn = _connection()
-    models = asyncio.run(_media_models())
-    image_model = models["image"]["model_name"]
-    _reset_fake(conn["fake_provider_url"])
-    client = _openai_client(conn)
-
-    chat_rows = [
-        {"custom_id": "chat-ok", "method": "POST", "url": "/v1/chat/completions", "body": {
-            "model": conn["model"], "max_tokens": 64,
-            "messages": [{"role": "user", "content": "compat batch chat"}]}},
-        {"custom_id": "chat-tool", "method": "POST", "url": "/v1/chat/completions", "body": {
-            "model": conn["model"], "max_tokens": 64, "tools": [CHAT_TOOL],
-            "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
-            "messages": [{"role": "user", "content": "compat weather in Seoul?"}]}},
-        {"custom_id": "chat-rejected", "method": "POST", "url": "/v1/chat/completions", "body": {
-            "model": conn["model"], "max_tokens": 64,
-            "messages": [{"role": "user", "content": f"compat {BATCH_ERROR_SENTINEL}"}]}},
-    ]
-    responses_rows = [
-        {"custom_id": "resp-ok", "method": "POST", "url": "/v1/responses", "body": {
-            "model": conn["model"], "max_output_tokens": 64, "input": "compat batch responses"}},
-        {"custom_id": "resp-tool", "method": "POST", "url": "/v1/responses", "body": {
-            "model": conn["model"], "max_output_tokens": 64, "tools": [RESPONSES_TOOL],
-            "tool_choice": {"type": "function", "name": "get_weather"},
-            "input": [{"role": "user", "content": [{"type": "input_text", "text": "compat weather in Seoul?"}]}]}},
-    ]
-    image_rows = [
-        {"custom_id": "image-1", "method": "POST", "url": "/v1/images/generations", "body": {
-            "model": image_model, "prompt": "compat batch cobalt cube", "size": "1024x1024",
-            "quality": "high", "n": 1}},
-    ]
-
-    submitted = {
-        "chat": _submit_openai_batch(client, "/v1/chat/completions", chat_rows, "chat"),
-        "responses": _submit_openai_batch(client, "/v1/responses", responses_rows, "responses"),
-        "images": _submit_openai_batch(client, "/v1/images/generations", image_rows, "images"),
-    }
-    listed_batches = {batch.id for batch in client.batches.list(limit=100)}
-    listed_files = {item.id for item in client.files.list(purpose="batch", limit=100)}
-    for uploaded, created, _ in submitted.values():
-        assert created.id in listed_batches
-        assert uploaded.id in listed_files
-
-    finals = {name: _poll_openai(client, created.id) for name, (_, created, _) in submitted.items()}
-    for final in finals.values():
-        assert final.status == "completed", final
-        assert final.completed_at is not None and final.in_progress_at is not None
-        assert final.errors is None or not final.errors.data
-
-    # Chat: two successes in the output file, the confirmed upstream 400 in the error file.
-    chat = finals["chat"]
-    assert (chat.request_counts.total, chat.request_counts.completed, chat.request_counts.failed) == (3, 2, 1)
-    chat_output, chat_errors, chat_raw = _download_results(client, chat)
-    assert sorted(row["custom_id"] for row in chat_output) == ["chat-ok", "chat-tool"]
-    assert [row["custom_id"] for row in chat_errors] == ["chat-rejected"]
-    chat_by_id = {row["custom_id"]: row for row in chat_output}
-    for row in chat_output:
-        assert row["error"] is None and row["response"]["status_code"] == 200
-    ok_body = chat_by_id["chat-ok"]["response"]["body"]
-    assert ok_body["choices"][0]["message"]["content"] == FAKE_TEXT
-    tool_body = chat_by_id["chat-tool"]["response"]["body"]
-    assert tool_body["choices"][0]["finish_reason"] == "tool_calls"
-    tool_call = tool_body["choices"][0]["message"]["tool_calls"][0]
-    assert tool_call["id"] == FAKE_TOOL_CALL_ID and tool_call["function"]["name"] == "get_weather"
-    assert json.loads(tool_call["function"]["arguments"]) == FAKE_TOOL_ARGUMENTS
-    rejected = chat_errors[0]["response"]
-    assert rejected["status_code"] == 400
-    assert rejected["body"]["error"]["code"] == "provider_rejected"
-    assert FAKE_ERROR_MESSAGE not in json.dumps(chat_errors[0]), "upstream error body must be sanitized"
-
-    # Responses: plain text and a function_call item.
-    responses = finals["responses"]
-    responses_counts = responses.request_counts
-    assert (responses_counts.total, responses_counts.completed, responses_counts.failed) == (2, 2, 0)
-    responses_output, responses_errors, responses_raw = _download_results(client, responses)
-    assert responses.error_file_id is None and responses_errors == []
-    responses_by_id = {row["custom_id"]: row for row in responses_output}
-    assert set(responses_by_id) == {"resp-ok", "resp-tool"}
-    text_body = responses_by_id["resp-ok"]["response"]["body"]
-    assert text_body["object"] == "response" and text_body["status"] == "completed"
-    assert [part["text"] for item in text_body["output"] if item["type"] == "message"
-            for part in item["content"] if part["type"] == "output_text"] == [FAKE_TEXT]
-    function_call = [item for item in responses_by_id["resp-tool"]["response"]["body"]["output"]
-                     if item["type"] == "function_call"]
-    assert len(function_call) == 1 and function_call[0]["call_id"] == FAKE_TOOL_CALL_ID
-    assert json.loads(function_call[0]["arguments"]) == FAKE_TOOL_ARGUMENTS
-
-    # Images: decoded PNG bytes inside the output JSONL.
-    images = finals["images"]
-    assert (images.request_counts.total, images.request_counts.completed, images.request_counts.failed) == (1, 1, 0)
-    image_output, image_errors, image_raw = _download_results(client, images)
-    assert images.error_file_id is None and image_errors == []
-    assert [row["custom_id"] for row in image_output] == ["image-1"]
-    image_data = image_output[0]["response"]["body"]["data"]
-    assert len(image_data) == 1
-    _assert_png(base64.b64decode(image_data[0]["b64_json"]))
-
-    # MariaDB: exactly-once settlement per durable run, zero-cost release for the rejection.
-    raws = {"chat": chat_raw, "responses": responses_raw, "images": image_raw}
-    outputs = {"chat": chat_output + chat_errors, "responses": responses_output, "images": image_output}
-    for name, final in finals.items():
-        ledger = asyncio.run(_batch_ledger(_internal_id("batch_", final.id)))
-        _assert_result_files(ledger, final, raws[name], submitted[name][2])
-        assert ledger["batch"].endpoint == final.endpoint
-        assert len(ledger["runs"]) == final.request_counts.total
-        result_rows = {row["custom_id"]: row for row in outputs[name]}
-        for item in ledger["items"]:
-            run = ledger["runs"][item.run_id]
-            assert result_rows[item.custom_id]["response"]["request_id"] == run.id
-            assert run.client_request_id == str(uuid.uuid5(uuid.UUID(ledger["batch"].id), item.custom_id))
-            _assert_batch_only_worker(ledger, run)
-            if item.custom_id == "chat-rejected":
-                assert item.state == "failed" and item.http_status == 400
-                assert run.status == "failed" and run.run_kind == "api_completion"
-                holds = ledger["by_run"][run.id]["reservations"]
-                assert len(holds) == 1 and holds[0].status == "settled" and holds[0].actual_credits == 0
-                assert ledger["by_run"][run.id]["ledgers"] == []
-                continue
-            assert item.state == "completed" and item.settlement_status == "settled"
-            expected = IMAGE_RAW_COST if name == "images" else TEXT_RAW_COST
-            assert run.run_kind == ("image" if name == "images" else "api_completion")
-            _assert_settled_once(ledger, run, expected)
-
-    _assert_provider_calls(
-        _fake_stats(conn["fake_provider_url"]),
-        {"chat.completions": 3, "responses": 2, "images.generations": 1},
-        models={"chat.completions": conn["model"], "responses": conn["model"],
-                "images.generations": _api_model_name(image_model)},
-        statuses={"chat.completions": Counter({200: 2, 400: 1}), "responses": Counter({200: 2}),
-                  "images.generations": Counter({200: 1})},
-    )
-
-    # Editor/write scopes cannot delete; use an explicitly attenuated destructive key.
-    chat_input = submitted["chat"][0]
-    with pytest.raises(openai.PermissionDeniedError):
-        client.files.delete(chat_input.id)
-    assert client.files.retrieve(chat_input.id).id == chat_input.id
-    owner_headers = {"X-Auth-Token": OWNER_TOKEN, "X-Project-Id": PROJECT_ID}
-    with httpx.Client(base_url=conn["api_base_url"], timeout=30.0, trust_env=False) as owner:
-        issue = owner.post("/v1/api-keys", headers=owner_headers,
-                           json={"name": "system file delete", "scopes": ["compat:files:delete"]})
-        assert issue.status_code == 201, issue.text
-        issued = issue.json()
-        try:
-            with _openai_client({**conn, "api_key": issued["key"]}) as destructive:
-                deleted = destructive.files.delete(chat_input.id)
-                assert deleted.id == chat_input.id and deleted.deleted is True
-        finally:
-            revoked = owner.delete(f"/v1/api-keys/{issued['id']}", headers=owner_headers)
-            assert revoked.status_code in {200, 204}, revoked.text
-    with pytest.raises(openai.NotFoundError):
-        client.files.retrieve(chat_input.id)
+    with httpx.Client(timeout=30.0, trust_env=False) as client:
+        response = client.request(method, conn["compat_base_url"] + path,
+                                  headers={"Authorization": "Bearer " + conn["api_key"]}, **kwargs)
+        assert response.status_code == 403, response.text
 
 
-def test_openai_sdk_batch_cancel_releases_unstarted_items() -> None:
+def test_native_batch_cancel_releases_unstarted_items():
+    from lumen_sdk import Client
+
     conn = _connection()
     _reset_fake(conn["fake_provider_url"])
     configured = _fake_control(conn["fake_provider_url"], "/_control/configure", {"pause_seconds": 3.0})
     assert configured["state"]["pause_seconds"] == 3.0
-    client = _openai_client(conn)
-    rows = [
-        {"custom_id": f"slow-{index:02d}", "method": "POST", "url": "/v1/chat/completions", "body": {
+    items = [
+        {"custom_id": f"slow-{index:02d}", "operation": "chat.completions", "body": {
             "model": conn["model"], "max_tokens": 32,
             "messages": [{"role": "user", "content": f"__TRIGGER_PAUSE__ cancel row {index}"}]}}
         for index in range(24)
     ]
     try:
-        uploaded, created, payload = _submit_openai_batch(client, "/v1/chat/completions", rows, "cancel")
-        # Cancel while executing: validation must finish (all 24 items exist) and the batch-only
-        # worker must have started at least one paused provider call before the cancel commits.
-        deadline = time.monotonic() + 120.0
-        while client.batches.retrieve(created.id).status != "in_progress" or not _fake_stats(
-            conn["fake_provider_url"]
-        )["calls"]:
-            assert time.monotonic() < deadline, "batch never started executing"
-            time.sleep(0.2)
-        cancelling = client.batches.cancel(created.id)
-        assert cancelling.id == created.id
-        assert cancelling.status in {"cancelling", "cancelled"}
-        assert cancelling.cancelling_at is not None
-        final = _poll_openai(client, created.id)
+        with Client(conn["api_base_url"], OWNER_TOKEN, timeout=60.0) as client:
+            created = client.create_batch(idempotency_key=f"system-cancel-{uuid.uuid4()}", items=items)
+            batch_id = created["id"]
+            deadline = time.monotonic() + 120.0
+            while client.get_batch(batch_id)["status"] != "in_progress" or not _fake_stats(conn["fake_provider_url"])["calls"]:
+                assert time.monotonic() < deadline, "batch never started executing"
+                time.sleep(0.2)
+            cancelling = client.cancel_batch(batch_id)
+            assert cancelling["id"] == batch_id
+            assert cancelling["status"] in {"cancelling", "cancelled"}
+            final = _poll_native(client, batch_id)
+            rows = client.list_batch_items(batch_id, limit=1000)["items"]
     finally:
         _fake_control(conn["fake_provider_url"], "/_control/configure", {"pause_seconds": 2.0})
 
-    assert final.status == "cancelled", final
-    assert final.cancelling_at is not None and final.cancelled_at is not None
-    counts = final.request_counts
-    assert counts.total == 24 and counts.completed + counts.failed == 24
-    assert counts.failed >= 1, "cancel during execution must stop unstarted items"
-    assert counts.completed >= 1, "provider calls already started must finish inside the cancel grace"
-    output, errors, raw = _download_results(client, final)
-    assert len(output) == counts.completed and len(errors) == counts.failed
-    assert {row["custom_id"] for row in output} | {row["custom_id"] for row in errors} == {
-        row["custom_id"] for row in rows
-    }
-    for row in output:
-        assert row["error"] is None and row["response"]["status_code"] == 200
-        assert row["response"]["body"]["choices"][0]["message"]["content"] == FAKE_TEXT
-    for row in errors:
-        assert row["response"] is None
-        assert isinstance(row["error"]["code"], str) and row["error"]["code"]
-        assert isinstance(row["error"]["message"], str)
+    assert final["status"] == "cancelled", final
+    counts = final["request_counts"]
+    assert counts["total"] == 24 and counts["completed"] + counts["cancelled"] == 24
+    assert counts["cancelled"] >= 1 and counts["completed"] >= 1
+    assert {row["custom_id"] for row in rows} == {item["custom_id"] for item in items}
+    for row in rows:
+        if row["status"] == "completed":
+            assert row["response"]["choices"][0]["message"]["content"] == FAKE_TEXT
+        else:
+            assert row["status"] == "cancelled" and row["response"] is None
 
-    ledger = asyncio.run(_batch_ledger(_internal_id("batch_", final.id)))
-    _assert_result_files(ledger, final, raw, payload)
+    ledger = asyncio.run(_batch_ledger(batch_id))
     batch = ledger["batch"]
     assert batch.status == "cancelled" and batch.final_target_status == "cancelled"
     assert batch.cancelling_at is not None and batch.cancelled_at is not None
-    assert batch.request_completed == counts.completed and batch.request_failed == counts.failed
+    assert batch.request_completed == counts["completed"] and batch.request_cancelled == counts["cancelled"]
     assert batch.request_unknown == 0
-    states = Counter(item.state for item in ledger["items"])
-    assert set(states) <= {"completed", "cancelled"}
-    assert states["completed"] == counts.completed and states["cancelled"] == counts.failed
-
     started = 0
     for item in ledger["items"]:
         if item.state == "completed":
@@ -1025,22 +784,17 @@ def test_openai_sdk_batch_cancel_releases_unstarted_items() -> None:
             _assert_batch_only_worker(ledger, run)
             _assert_settled_once(ledger, run, TEXT_RAW_COST)
             started += 1
-            continue
-        if item.run_id is None:
-            continue
-        run = ledger["runs"][item.run_id]
-        # Cancelled before provider I/O: no hold, no ledger row, no provider call.
-        assert run.status == "canceled"
-        assert ledger["by_run"][run.id]["reservations"] == []
-        assert ledger["by_run"][run.id]["ledgers"] == []
+        elif item.run_id is not None:
+            run = ledger["runs"][item.run_id]
+            assert run.status == "canceled"
+            assert ledger["by_run"][run.id]["reservations"] == []
+            assert ledger["by_run"][run.id]["ledgers"] == []
     for run_id, rows_by_kind in ledger["by_run"].items():
         assert all(hold.status != "reserved" for hold in rows_by_kind["reservations"]), run_id
     holds = sum(len(entry["reservations"]) for entry in ledger["by_run"].values())
     assert holds == started
-
-    stats = _fake_stats(conn["fake_provider_url"])
-    _assert_provider_calls(stats, {"chat.completions": started}, models={"chat.completions": conn["model"]},
-                           statuses={"chat.completions": Counter({200: started})} if started else {})
+    _assert_provider_calls(_fake_stats(conn["fake_provider_url"]), {"chat.completions": started},
+                           models={"chat.completions": conn["model"]})
 
 
 # ============================================================================

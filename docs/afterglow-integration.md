@@ -12,12 +12,12 @@ Lumen은 목적과 권한 수준에 따라 3가지 연동 프로필을 제공합
 
 | 프로필 | 주요 용도 | 주요 엔드포인트 | 인증 및 Scope |
 | --- | --- | --- | --- |
-| **OpenAI Compatible** | `model="lumen"`: Lumen backend durable execution; provider model ID: stateless Chat Completions or Responses | `POST /v1/chat/completions`<br>`POST /v1/responses`<br>`GET /v1/models` | `models:read`<br>`compat:completions:write` (API Key 전용) |
+| **OpenAI Compatible** | provider model ID로 stateless Chat Completions 또는 Responses 중계(개인·서비스 키의 `model="lumen"`은 403 `model_not_allowed_for_key`) | `POST /v1/chat/completions`<br>`POST /v1/responses`<br>`GET /v1/models` | `models:read`<br>`compat:completions:write` (API Key 전용) |
 | **Anthropic Native** | Anthropic SDK와 Claude Code direct API-key Messages request/response/SSE, tool continuation, token counting | `POST /v1/messages`<br>`POST /v1/messages/count_tokens` | `models:read`<br>`compat:completions:write` (ordinary API Key 전용) |
 | **Legacy Lumen Device API** | Lumen custom one-time device grant 뒤 24시간 project-bound credential로 Anthropic-native 호출 | configured `/v1/claude-gateway` base의 OAuth/device, Messages, models, managed settings | Custom device credential 전용; current Claude Apps Gateway login과 호환되지 않음 |
-| **Native Durable** | Afterglow 영속 대화, 서버 관리형 Tool/Skill/Memory, Replay, 승인 및 사용량 추적 | `POST /v1/conversations/{id}/completions`<br>`POST /v1/temp-completions`<br>`GET /v1/runs/{id}/events` | Native least-privilege scope (Keystone Token 또는 Scoped API Key) |
+| **Native Durable** | Afterglow 영속 대화, 서버 관리형 Tool/Skill/Memory, Replay, 승인 및 사용량 추적 | `POST /v1/conversations/{id}/completions`<br>`POST /v1/temp-completions`<br>`GET /v1/runs/{id}/events` | Native least-privilege scope (Keystone Token 전용; 0.6.21 API 키는 모델 API 전용) |
 
-> **선택 기준**: `model="lumen"`은 OpenAI SDK 포맷으로 백엔드 durable worker 실행과 대화하며, 특정 provider model ID 지칭 시 stateless completion 중계로 동작합니다. 대화 이력 영속화, 서버 관리형 도구/스킬/메모리, 중단-승인(Human-in-the-loop) 및 복구가 필요한 경우 Native Durable 프로필을 사용합니다.
+> **선택 기준**: API 키로는 특정 provider model ID를 지정해 stateless completion 중계를 사용합니다. 가상 `model="lumen"`(백엔드 durable worker)은 0.6.21부터 개인·서비스 키에서 거절되고 legacy Claude Gateway 자격 증명만 사용할 수 있습니다. 대화 이력 영속화, 서버 관리형 도구/스킬/메모리, 중단-승인(Human-in-the-loop) 및 복구가 필요한 경우 Keystone 세션으로 Native Durable 프로필을 사용합니다.
 
 ### Current private transport/account cutover (0.6.10 candidate, unverified integration)
 

@@ -1,21 +1,26 @@
 """빌트인 AI 채팅 사용량 집계 — chat_usage_logs 원장에서 사용자별 요약.
 
-로그인 사용자 본인의 누적/이번달 토큰·크레딧·요청 수 + 월 쿼터(user_wallets)를 반환한다.
-대화가 프로젝트 무관(user_id 소유)이므로 사용량도 user_id 기준으로 집계한다.
-source="system"(제목 요약 등 시스템 부담)은 사용자 사용량에서 제외한다.
+Two views exist. The default ``self`` view is the caller's own usage across every payer: legacy
+rows from before migration 037 (no payer columns), personal and Claude Gateway key usage billed to
+the caller's wallet, and the caller's domain-paid dashboard usage. The ``domain`` view is the
+domain pool's usage; callers must have proven live domain-manager authority before using it, and
+other members' identifiers stay masked. Every row and aggregate carries ``billing_scope``
+(``user`` or ``domain``). source="system"(제목 요약 등 시스템 부담)은 사용자 사용량에서 제외한다.
 저장소 장애 시에도 found=False 로 안전 반환(항상 200).
 """
 
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, or_, select
 
 from lumen.db import get_session_factory, is_db_available
+from lumen.models.billing import DomainCreditLedger, DomainCreditPool
 from lumen.models.chat_contracts import UsageRecord, UsageRecordPage
 from lumen.models.chat_db import ChatUsageLog
-from lumen.services import quota_policy
+from lumen.services import domain_credit, quota_policy
 from lumen.services.quota_periods import month_start, week_start
 
 logger = logging.getLogger(__name__)
@@ -46,20 +51,55 @@ _SUMS = (
 )
 
 
-async def user_usage_summary(user_id: str, project_id: str = "", api_key_id: int | None = None) -> dict:
-    """본인 누적/이번달·이번주 사용량과 기간별 쿼터. 실패 시 빈 요약(found=False).
+@dataclass(frozen=True)
+class UsageView:
+    """Which ledger rows a dashboard caller sees; ``domain_id`` is set only for a proven manager."""
 
-    project_id 인자는 하위호환용으로 받되 사용하지 않는다(사용량은 user_id 기준, 프로젝트 무관).
+    user_id: str
+    domain_id: str | None = None
+
+    @property
+    def scope(self) -> str:
+        return "domain" if self.domain_id is not None else "self"
+
+    def predicate(self):
+        if self.domain_id is not None:
+            return ChatUsageLog.payer_domain_id == self.domain_id
+        # The actor of legacy and domain-paid rows, or the user wallet that paid a key call.
+        return or_(ChatUsageLog.user_id == self.user_id, ChatUsageLog.payer_user_id == self.user_id)
+
+
+# Legacy rows (both payer columns NULL) were billed to the user wallet.
+BILLING_SCOPE = case((ChatUsageLog.payer_domain_id.is_not(None), "domain"), else_="user")
+
+
+def _domain_pool(pool: DomainCreditPool | None, domain_id: str) -> dict:
+    """Read-only aggregates of the caller's domain pool; never other members' rows."""
+    public = domain_credit.public(pool, domain_id)
+    return {
+        "domain_id": domain_id,
+        "exists": pool is not None,
+        "funded": pool is not None and pool.is_active and pool.balance_credits > 0,
+        **{key: public[key] for key in (
+            "balance_credits", "reserved_credits", "monthly_used_credits", "effective_monthly_limit_credits",
+        )},
+    }
+
+
+async def user_usage_summary(view: UsageView, *, member_domain_id: str | None = None) -> dict:
+    """Return the view's usage totals, with a per-payer breakdown.
+
+    ``member_domain_id`` is the Keystone session's verified domain; its pool aggregates are added as
+    ``domain_pool`` for any member, independently of the view.
     """
     if not is_db_available():
         return dict(_EMPTY)
     factory = get_session_factory()
     if factory is None:
         return dict(_EMPTY)
+    user_id = view.user_id
     try:
-        base = [ChatUsageLog.user_id == user_id, ChatUsageLog.source != "system"]
-        if api_key_id is not None:
-            base.append(ChatUsageLog.api_key_id == api_key_id)
+        base = [ChatUsageLog.source != "system", view.predicate()]
         async with factory() as session:
             total = (await session.execute(select(*_SUMS).where(*base))).one()
             month = (
@@ -70,6 +110,9 @@ async def user_usage_summary(user_id: str, project_id: str = "", api_key_id: int
                     )
                 )
             ).one()
+            payer_rows = (await session.execute(
+                select(BILLING_SCOPE, *_SUMS).where(*base).group_by(BILLING_SCOPE)
+            )).all()
             week_credited = (
                 await session.execute(
                     select(_SUMS[0]).where(
@@ -90,12 +133,38 @@ async def user_usage_summary(user_id: str, project_id: str = "", api_key_id: int
                     .group_by(ChatUsageLog.source)
                 )
             ).all()
-            system_quota = await quota_policy.get_system_quota(session, user_id)
-        tc, tp, tct, tcount = total
-        mc, mp, mct, mcount = month
+            tc, tp, tct, tcount = total
+            mc, mp, mct, mcount = month
+            domain_id = view.domain_id
+            if domain_id is None:
+                system_quota = await quota_policy.get_system_quota(session, user_id)
+                quota_max, quota_weekly_max = float(system_quota.monthly), float(system_quota.weekly)
+                pool_summary = {}
+            else:
+                pool = await session.get(DomainCreditPool, domain_id)
+                pool_summary = domain_credit.public(pool, domain_id)
+                quota_max = float(pool_summary["effective_monthly_limit_credits"] or 0)
+                quota_weekly_max = 0.0
+                ledger = DomainCreditLedger
+                charged = -ledger.amount_credits
+                tc, mc, week_credited = (await session.execute(select(
+                    func.sum(charged),
+                    func.sum(case((ledger.created_at >= month_start(), charged), else_=0)),
+                    func.sum(case((ledger.created_at >= week_start(), charged), else_=0)),
+                ).where(ledger.domain_id == domain_id, ledger.kind == "charge"))).one()
+            domain_pool = None
+            if member_domain_id is not None:
+                member_pool = (pool if member_domain_id == domain_id
+                               else await session.get(DomainCreditPool, member_domain_id))
+                domain_pool = _domain_pool(member_pool, member_domain_id)
         by_source = [
             {"source": s or "web", "tokens": int(t or 0), "credited_cost": float(c or 0), "request_count": int(n or 0)}
             for s, t, c, n in src_rows
+        ]
+        by_payer = [
+            {"billing_scope": scope, "credited_cost": float(c or 0), "prompt_tokens": int(p or 0),
+             "completion_tokens": int(ct or 0), "request_count": int(n or 0)}
+            for scope, c, p, ct, n in sorted(payer_rows, key=lambda row: row[0])
         ]
         return {
             "found": tcount > 0,
@@ -108,10 +177,17 @@ async def user_usage_summary(user_id: str, project_id: str = "", api_key_id: int
             "month_prompt_tokens": int(mp or 0),
             "month_completion_tokens": int(mct or 0),
             "month_request_count": int(mcount or 0),
-            "quota_used": float(mc or 0),
-            "quota_max": float(system_quota.monthly),
-            "quota_weekly_max": float(system_quota.weekly),
+            "view": view.scope,
+            "billing_scope": "domain" if domain_id is not None else "user",
+            "payer_user_id": None if domain_id is not None else user_id,
+            "payer_domain_id": domain_id,
+            "quota_used": float(pool_summary.get("monthly_used_credits", mc) or 0),
+            "quota_max": quota_max,
+            "quota_weekly_max": quota_weekly_max,
+            **pool_summary,
             "by_source": by_source,
+            "by_payer": by_payer,
+            **({"domain_pool": domain_pool} if member_domain_id is not None else {}),
         }
     except Exception:
         logger.warning("빌트인 채팅 사용량 집계 실패", exc_info=True)
@@ -120,8 +196,7 @@ async def user_usage_summary(user_id: str, project_id: str = "", api_key_id: int
 
 async def list_usage_records(
     *,
-    user_id: str,
-    api_key_id: int | None,
+    view: UsageView,
     source: str | None,
     before_id: int | None,
     limit: int,
@@ -129,9 +204,8 @@ async def list_usage_records(
     """Return a cursor page of user-safe usage ledger fields, excluding system rows."""
     if not is_db_available() or (factory := get_session_factory()) is None:
         return UsageRecordPage(records=[])
-    predicates = [ChatUsageLog.user_id == user_id, ChatUsageLog.source.in_(("web", "api"))]
-    if api_key_id is not None:
-        predicates.append(ChatUsageLog.api_key_id == api_key_id)
+    user_id = view.user_id
+    predicates = [ChatUsageLog.source.in_(("web", "api")), view.predicate()]
     if source is not None:
         predicates.append(ChatUsageLog.source == source)
     if before_id is not None:
@@ -170,9 +244,11 @@ async def list_usage_records(
                 cache_creation_1h_input_tokens=row.cache_creation_1h_input_tokens,
                 credited_cost=format(row.credited_cost, "f"),
                 source=row.source,
-                api_key_id=row.api_key_id,
-                conversation_id=row.conversation_id,
-                run_id=row.run_id,
+                billing_scope="domain" if row.payer_domain_id is not None else "user",
+                # The domain view masks other members' identifiers; the self view holds only the caller's rows.
+                api_key_id=row.api_key_id if view.domain_id is None or row.user_id == user_id else None,
+                conversation_id=row.conversation_id if view.domain_id is None or row.user_id == user_id else None,
+                run_id=row.run_id if view.domain_id is None or row.user_id == user_id else None,
                 pricing_status=row.pricing_status,
             )
             for row in rows[:limit]

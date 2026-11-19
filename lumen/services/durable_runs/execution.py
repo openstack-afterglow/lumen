@@ -5,20 +5,21 @@ import json
 import logging
 import re
 from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import replace
 from decimal import ROUND_CEILING, ROUND_HALF_EVEN, Decimal, InvalidOperation
 from time import monotonic
 from typing import Any
 
 from lumen_plugin_api.contracts import Namespace, PluginError
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import SQLAlchemyError
 
 from lumen.config import get_settings
 from lumen.crypto import decrypt_chat_content, encrypt_chat_content
 from lumen.models.chat_db import ChatConversation, ChatMessage, ChatUsageLog
 from lumen.models.chat_infrastructure import ChatWorkerRegistration
-from lumen.models.chat_runs import ChatRun, ChatRunSegment, ChatRunTurn, ChatTempThread
+from lumen.models.chat_runs import ChatModelCallReservation, ChatRun, ChatRunSegment, ChatRunTurn, ChatTempThread
 from lumen.plugins import bindings as plugin_bindings
 from lumen.plugins import skills_host
 from lumen.services import (
@@ -35,8 +36,15 @@ from lumen.services import (
     worker_routing,
 )
 from lumen.services import conversation_store as cs
-from lumen.services.api_key_store import ApiKeyAuthorityUnavailable, ApiKeyForbidden, authorize_api_key_in_transaction
-from lumen.services.inference_authority import authorize_run_generation, model_required_scopes, native_run_scopes
+from lumen.services.api_key_store import ApiKeyAuthorityUnavailable, ApiKeyForbidden
+from lumen.services.inference_authority import (
+    check_dispatch,
+    model_required_scopes,
+    native_run_scopes,
+    preflight_dispatch,
+    read_dispatch_candidate,
+    run_generation_scopes,
+)
 from lumen.services.memory_jobs import enqueue_completed_run_in_transaction
 from lumen.services.message_graph import MessageGraphError, reachable_message_clause, register_message
 from lumen.services.providers import routing as ps
@@ -322,11 +330,14 @@ async def _finish_transaction(
     order = budgets.LockOrder()
     wake_parent: str | None = None
     async with factory() as session, session.begin():
-        # Global lock order: project quota for code roots or lineages -> conversation/temp ->
-        # root -> ancestors -> children -> ledgers -> resources.
+        await worker_routing.use_read_committed(session)
         unlocked_run = (await session.execute(select(ChatRun).where(ChatRun.id == run_id))).scalar_one_or_none()
         if unlocked_run is None:
             return False, None
+        payer = credit.run_payer(unlocked_run)
+        if payer.domain_id is not None or usage_record is not None:
+            await credit.lock_payer(session, payer, user_id=unlocked_run.user_id,
+                                    project_id=unlocked_run.project_id, api_key_id=unlocked_run.api_key_id)
         quota = None
         root = None
         has_children = (
@@ -359,8 +370,6 @@ async def _finish_transaction(
         if run.status not in NONTERMINAL:
             return False, None
         if run.run_kind in {"image", "tts", "stt", "realtime", "api_completion"}:
-            from lumen.models.chat_runs import ChatModelCallReservation
-
             reservation = (
                 await session.execute(
                     select(ChatModelCallReservation)
@@ -388,19 +397,39 @@ async def _finish_transaction(
                     reservation.status = "settled"
                     reservation.settled_at = _now()
                     run.usage_reconciled_at = reservation.settled_at
+                    await credit.release_domain_in_transaction(
+                        session, payer=payer, reference=f"run:{run.id}",
+                        user_id=credit.actor_id(run.user_id, run.api_key_id),
+                    )
                 else:
                     if segment.status == "provider_started":
                         fail_unresolved_segment(segment, error_code="provider_result_unknown")
                     reservation.status = "unknown"
                     reservation.settled_at = _now()
+        elif payer.domain_id is not None and status != "completed":
+            await session.execute(update(ChatModelCallReservation).where(
+                ChatModelCallReservation.run_id == run.id,
+                ChatModelCallReservation.status == "reserved",
+            ).values(status="unknown", settled_at=_now()))
         await append_event(session, run, _event(run, "run.stage.changed", {"stage": "finalizing"}))
         run.status = "finalizing"
         if usage_record is not None:
+            settled_credits = None
+            if payer.domain_id is not None:
+                settled_credits = await session.scalar(
+                    select(func.coalesce(func.sum(ChatModelCallReservation.actual_credits), 0))
+                    .join(ChatRunSegment, (ChatRunSegment.run_id == ChatModelCallReservation.run_id)
+                          & (ChatRunSegment.segment_id == ChatModelCallReservation.segment_id))
+                    .where(ChatModelCallReservation.run_id == run.id, ChatRunSegment.endpoint != "context_compaction")
+                )
             credited = await credit.apply_usage_in_transaction(
                 session,
                 event_id=f"run:{run.id}",
                 user_id=run.user_id,
                 project_id=run.project_id,
+                payer=payer,
+                charge_wallet=payer.scope == "user",
+                settled_credits=settled_credits,
                 model_name=usage_record["model_name"],
                 provider=usage_record["provider_name"],
                 prompt_tokens=usage_record["prompt_tokens"],
@@ -866,11 +895,16 @@ class _DurableExecutionHooks:
                     "provider_id": route.get("provider_id"),
                 },
             )
+            settled_credits = None
+            if run.payer_domain_id is not None:
+                hold = await session.get(ChatModelCallReservation, (run.id, segment_id))
+                settled_credits = hold.actual_credits if hold and hold.actual_credits is not None else Decimal(0)
             await credit.apply_usage_in_transaction(
                 session,
                 event_id=event_id,
                 user_id=run.user_id,
                 project_id=run.project_id,
+                payer=credit.run_payer(run),
                 model_name=str(route.get("model_name") or run.model_name),
                 provider=route.get("provider_name"),
                 prompt_tokens=prompt_tokens,
@@ -879,10 +913,11 @@ class _DurableExecutionHooks:
                 margin_multiplier=root_pricing.get("margin_multiplier", "1"),
                 credit_per_usd=root_pricing.get("chat_credit_per_usd"),
                 conversation_id=run.conversation_id,
-                source="system",
+                source=run.source if run.payer_domain_id is not None else "system",
                 api_key_id=getattr(run, "api_key_id", None),
                 run_id=str(run.id),
                 charge_wallet=False,
+                settled_credits=settled_credits,
                 execution_route=route,
                 usage_components=components,
                 breakdown=breakdown,
@@ -910,7 +945,8 @@ class _DurableExecutionHooks:
         factory = _factory()
         async with factory() as session:
             run = (await session.execute(select(ChatRun).where(ChatRun.id == self.run_id))).scalar_one()
-            await credit.precheck(run.user_id, run.project_id, api_key_id=getattr(run, "api_key_id", None))
+            if run.payer_domain_id is None:
+                await credit.precheck(run.user_id, run.project_id, api_key_id=getattr(run, "api_key_id", None))
         summary_run_context = context.get("run_context")
         summary_run_context = summary_run_context if isinstance(summary_run_context, dict) else {}
         system_prompt = str(summary_run_context.get("summary_system_prompt") or context_manager._SUMMARY_SYSTEM)
@@ -1472,11 +1508,15 @@ class _DurableExecutionHooks:
             run.assistant_message_id = turn.assistant_message_id
 
     async def _credit_lineage(self, session):
-        """Acquire quota and lineage before the segment ledger, including on completion."""
+        """Acquire payer, quota and lineage before the segment ledger."""
         # Delta/heartbeat writers can commit after the identity read. A stale
         # REPEATABLE READ view makes MariaDB reject the later locking read (1020).
         await worker_routing.use_read_committed(session)
         identity = (await session.execute(select(ChatRun).where(ChatRun.id == self.run_id))).scalar_one()
+        payer = credit.run_payer(identity)
+        if payer.domain_id is not None:
+            await credit.lock_payer(session, payer, user_id=identity.user_id,
+                                    project_id=identity.project_id, api_key_id=identity.api_key_id)
         order = budgets.LockOrder()
         quota, root, _ancestors = await children._lock_lineage(session, identity, order)
         run = (
@@ -1536,6 +1576,40 @@ class _DurableExecutionHooks:
         credit_bound: Callable[[ChatRun], Decimal] | None = None,
     ) -> dict[str, Any] | None:
         factory = _factory()
+        approval = None
+        agent_domain = None
+        async with factory() as read_session:
+            candidate = await read_dispatch_candidate(read_session, self.run_id, segment_id)
+            if candidate is not None:
+                _require_owned_running_lease(candidate, self.owner)
+                snapshot = candidate.capability_snapshot or {}
+                if endpoint == "context_compaction":
+                    summary = snapshot.get("summary_route") or snapshot
+                    # Old summary snapshots lack intrinsic capability metadata.
+                    if (
+                        "web_search_required" not in (summary.get("capabilities") or {})
+                        and isinstance(summary.get("provider_id"), int)
+                        and isinstance(summary.get("model_id"), int)
+                    ):
+                        summary = await ps.resolve_model_snapshot(summary)
+                        if summary is None:
+                            raise DurableRunError("context compaction route is unavailable")
+                    scopes = run_generation_scopes(candidate, resolved=summary)
+                else:
+                    required = set(native_run_scopes(_payload(candidate), agent_id=candidate.agent_id))
+                    required.update(snapshot.get("required_scopes") or ())
+                    required.update(model_required_scopes(snapshot))
+                    if endpoint.startswith("tool") or call_id is not None:
+                        required.add("native:tools:execute")
+                    scopes = tuple(sorted(required))
+                try:
+                    approval = await preflight_dispatch(read_session, candidate, scopes)
+                except ApiKeyForbidden as exc:
+                    raise DurableRunInputError("inference_authority_revoked") from exc
+                except ApiKeyAuthorityUnavailable as exc:
+                    raise DurableRunError("inference_authority_unavailable") from exc
+                if candidate.agent_id is not None and candidate.run_scope == "child":
+                    agent_domain = await children.current_agent_domain(candidate)
         async with factory() as session, session.begin():
             if self.requires_credit_reservation:
                 quota, root, run = await self._credit_lineage(session)
@@ -1574,46 +1648,26 @@ class _DurableExecutionHooks:
                 return {"_boundary_abort": "provider_result_unknown"}
             if segment.status == "failed":
                 return {"_boundary_abort": "provider_result_unknown"}
-            # Replay/settlement above preserves committed I/O. Only new intent is authorized.
-            scopes = set(native_run_scopes(_payload(run), agent_id=run.agent_id))
-            scopes.update((run.capability_snapshot or {}).get("required_scopes") or ())
-            scopes.update(model_required_scopes(run.capability_snapshot))
-            if endpoint.startswith("tool") or call_id is not None:
-                scopes.add("native:tools:execute")
+            # Only new work needs a short-lived approval. Replays above never
+            # make external authorization calls or invalidate committed I/O.
+            if run.cancel_requested_at is not None:
+                # The unlocked preflight skipped a canceled run; the handler records the stop as canceled.
+                raise DurableRunError("chat run canceled before provider start")
             try:
-                if endpoint == "context_compaction":
-                    snapshot = run.capability_snapshot or {}
-                    summary = snapshot.get("summary_route") or snapshot
-                    # Older admitted summary snapshots omitted intrinsic capability metadata.
-                    # Resolve it only for a new intent; committed replay above remains unchanged.
-                    if (
-                        "web_search_required" not in (summary.get("capabilities") or {})
-                        and isinstance(summary.get("provider_id"), int)
-                        and isinstance(summary.get("model_id"), int)
-                    ):
-                        summary = await ps.resolve_model_snapshot(summary)
-                        if summary is None:
-                            raise DurableRunError("context compaction route is unavailable")
-                    await authorize_run_generation(session, run, resolved=summary)
-                else:
-                    await authorize_api_key_in_transaction(
-                        session,
-                        api_key_id=run.api_key_id,
-                        user_id=run.user_id,
-                        project_id=run.project_id,
-                        required_scopes=tuple(sorted(scopes)),
-                        credential_authority=(run.capability_snapshot or {}).get("credential_authority"),
-                    )
+                verified = await check_dispatch(session, run, approval)
             except ApiKeyForbidden as exc:
                 raise DurableRunInputError("inference_authority_revoked") from exc
-            except ApiKeyAuthorityUnavailable as exc:
-                raise DurableRunError("inference_authority_unavailable") from exc
+            await children.require_frozen_agent(session, run, domain_id=agent_domain)
             if self.requires_credit_reservation:
                 if credit_bound is None:
                     raise DurableRunError("v2 call is missing its bounded credit estimate")
                 await budgets.reserve_call_credit(
                     session, run=run, root=root, quota=quota, segment=segment, amount=credit_bound(run)
                 )
+            try:
+                verified.require_fresh()
+            except ApiKeyForbidden as exc:
+                raise DurableRunInputError("inference_authority_revoked") from exc
             begin_segment_io(segment)
             if journal_started is not None:
                 event_type, payload = journal_started
@@ -2568,9 +2622,17 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
             await _set_stage(run_id, "response_writing", owner=owner)
             response_writing = True
 
+    extension_actor = ExitStack()
     try:
         if not _validate_run_protocol_payload(run, payload):
             raise DurableRunProtocolMismatch("run execution protocol does not match this worker")
+        extension_domain = capability_snapshot.get("history_domain_id")
+        extension_actor.enter_context(extensions_store.actor_scope(
+            human=False, mode="run",
+            owner=(user_id, project_id, extension_domain)
+            if isinstance(extension_domain, str) and extension_domain and getattr(run, "api_key_id", None) is None
+            else None,
+        ))
         await _set_stage(run_id, "model_request", owner=owner)
         resolved = await ps.resolve_model_snapshot(capability_snapshot)
         if resolved is None:
@@ -2635,11 +2697,11 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
         execution_hooks = _DurableExecutionHooks(
             run_id=run_id,
             owner=owner,
-            # Approval-capable chat is not implicitly a managed agent allocation.
-            # Ordinary chat retains wallet precheck/settlement; explicit agent
-            # budgets and every child still enforce project/root call ceilings.
-            credit_bounded=run.execution_protocol_version == 2
-            and (run.parent_run_id is not None or run.execution_mode != "chat" or run.credit_ceiling is not None),
+            # Domain calls always need a prepaid bound, even for ordinary chat.
+            credit_bounded=run.payer_domain_id is not None or (
+                run.execution_protocol_version == 2
+                and (run.parent_run_id is not None or run.execution_mode != "chat" or run.credit_ceiling is not None)
+            ),
             skill_snapshots=skill_snapshot,
             user_id=user_id,
             project_id=project_id,
@@ -2663,6 +2725,9 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
         )
         resume = await _v2_resume(run_id=run_id, owner=owner) if run.execution_protocol_version == 2 else None
         delegation_enabled = _delegation_enabled(run, payload)
+        from lumen.services.vault_store import frozen_run_domain
+
+        vault_domain_id = frozen_run_domain(run)
         sandbox_lease = None
         if run.execution_protocol_version == 2:
             try:
@@ -2682,7 +2747,8 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
             pending_first_at = None
             hydrated_turn_ordinal = message_turn_ordinal
 
-        await credit.precheck(user_id, project_id, api_key_id=getattr(run, "api_key_id", None))
+        if run.payer_domain_id is None:
+            await credit.precheck(user_id, project_id, api_key_id=getattr(run, "api_key_id", None))
         engine_iterator = engine.stream(
             model=resolved["model_name"],
             max_tool_calls=int(payload.get("v2_max_tool_calls", _V2_DEFAULT_MAX_TOOL_CALLS)),
@@ -2733,6 +2799,7 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
             delegation_enabled=delegation_enabled,
             sandbox_lease=sandbox_lease,
             sandbox_tools=sandbox_tools,
+            vault_domain_id=vault_domain_id,
         ).__aiter__()
         next_event_task = asyncio.create_task(anext(engine_iterator))
         lease_lost_wait_task = asyncio.create_task(lease_lost.wait())
@@ -3161,6 +3228,11 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
             error_code="provider_result_unknown",
             safe_message="이전 모델 호출 결과를 안전하게 확인할 수 없습니다",
         )
+    except credit.QuotaExceeded as exc:
+        await _finish(
+            run_id, status="failed", message_id=message_id, owner=owner,
+            error_code=getattr(exc, "code", "quota_exceeded"), safe_message="credit quota is exhausted",
+        )
     except DurableRunProtocolMismatch:
         await _finish(
             run_id,
@@ -3199,23 +3271,27 @@ async def execute_queued_run(run_id: str, *, owner: str, registration_id: str) -
             await flush_deltas(check_cancel=False)
         except Exception:
             logger.warning("failed to persist buffered chat deltas run_id=%s", _safe_log_token(run_id))
-        if isinstance(exc, DurableRunEventValidationError):
-            error_code, safe_message = "internal_validation_failed", "chat run event validation failed"
+        if not isinstance(exc, SQLAlchemyError) and await _cancel_requested(run_id):
+            # A stop that reached a dispatch boundary first is the user's intent, not a provider failure.
+            status, error_code, safe_message = "canceled", "canceled", "chat run canceled"
+        elif isinstance(exc, DurableRunEventValidationError):
+            status, error_code, safe_message = "failed", "internal_validation_failed", "chat run event validation failed"
         elif isinstance(exc, MessageGraphError):
-            error_code, safe_message = "internal_graph_error", "chat conversation graph update failed"
+            status, error_code, safe_message = "failed", "internal_graph_error", "chat conversation graph update failed"
         elif isinstance(exc, SQLAlchemyError):
-            error_code, safe_message = "persistence_failed", "chat run persistence failed"
+            status, error_code, safe_message = "failed", "persistence_failed", "chat run persistence failed"
         else:
-            error_code, safe_message = "provider_failed", "chat provider failed"
+            status, error_code, safe_message = "failed", "provider_failed", "chat provider failed"
         await _finish(
             run_id,
-            status="failed",
+            status=status,
             message_id=message_id,
             owner=owner,
             error_code=error_code,
             safe_message=safe_message,
         )
     finally:
+        extension_actor.close()
         if deadline_task is not None:
             deadline_task.cancel()
             await asyncio.gather(deadline_task, return_exceptions=True)

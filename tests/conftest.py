@@ -85,6 +85,10 @@ def _block_live_provider_requests(monkeypatch):
 @pytest.fixture(autouse=True)
 async def _reset_lumen_state(monkeypatch):
     """Keep settings and Redis state isolated without a live infrastructure dependency."""
+    # `client` clears overrides at teardown, but a test's monkeypatch.setitem on
+    # app.dependency_overrides is undone afterwards and restores the fixture's
+    # Keystone principal into the next test. Start every test without overrides.
+    app.dependency_overrides.clear()
     get_settings.cache_clear()
     fake = fakeredis.aioredis.FakeRedis(decode_responses=False)
     monkeypatch.setattr("lumen.cache._client", fake)
@@ -121,13 +125,14 @@ def _token_info(*, is_system_admin: bool) -> dict[str, object]:
         "user_id": "test-user-123",
         "username": "testuser",
         "project_id": "test-project-123",
+        "domain_id": "test-domain-123",
         "project_name": "test-project",
         "roles": ["admin", "member"] if is_system_admin else ["member"],
         "is_system_admin": is_system_admin,
     }
 
 
-async def _client_for(mock_conn, *, is_system_admin: bool):
+async def _client_for(mock_conn, monkeypatch, *, is_system_admin: bool):
     async def token_override():
         return _token_info(is_system_admin=is_system_admin)
 
@@ -138,14 +143,20 @@ async def _client_for(mock_conn, *, is_system_admin: bool):
             "api_key_id": None,
             "scopes": (),
             "source": "web",
+            "ingress_verified": True,
         }
 
     async def conn_override():
         yield mock_conn
 
-    app.dependency_overrides[require_token] = token_override
-    app.dependency_overrides[get_os_conn] = conn_override
-    app.dependency_overrides[get_principal] = principal_override
+    # Install through the test's monkeypatch, not clear() in teardown: a test that later
+    # monkeypatches the same override records this one as its prior value, and the
+    # monkeypatch undo runs after this generator. clear() then let that undo resurrect
+    # the Keystone principal for every following test. LIFO undo restores the original.
+    before = dict(app.dependency_overrides)
+    monkeypatch.setitem(app.dependency_overrides, require_token, token_override)
+    monkeypatch.setitem(app.dependency_overrides, get_os_conn, conn_override)
+    monkeypatch.setitem(app.dependency_overrides, get_principal, principal_override)
     try:
         async with AsyncClient(
             transport=ASGITransport(_LegacyChatPathAdapter(app)),
@@ -154,7 +165,9 @@ async def _client_for(mock_conn, *, is_system_admin: bool):
         ) as client:
             yield client
     finally:
+        # Also drop direct (unrecorded) override writes made by the test body.
         app.dependency_overrides.clear()
+        app.dependency_overrides.update(before)
 
 
 @pytest.fixture
@@ -164,25 +177,25 @@ def current_project_authority(monkeypatch):
     Opt-in only: authority contract tests exercise the real resolver separately.
     Credential scopes and production action checks are never bypassed.
     """
-    lookup = AsyncMock(return_value={"roles": ["member"], "is_system_admin": False})
+    lookup = AsyncMock(return_value={"roles": ["member"], "is_system_admin": False, "domain_id": "test-domain-123"})
     monkeypatch.setattr("lumen.auth.resolve_project_authority", lookup)
     monkeypatch.setattr("lumen.services.mcp_oauth.resolve_project_authority", lookup)
     return lookup
 
 
 @pytest.fixture
-async def client(mock_conn, current_project_authority):
-    async for result in _client_for(mock_conn, is_system_admin=False):
+async def client(mock_conn, current_project_authority, monkeypatch):
+    async for result in _client_for(mock_conn, monkeypatch, is_system_admin=False):
         yield result
 
 
 @pytest.fixture
-async def admin_client(mock_conn, current_project_authority):
-    async for result in _client_for(mock_conn, is_system_admin=True):
+async def admin_client(mock_conn, current_project_authority, monkeypatch):
+    async for result in _client_for(mock_conn, monkeypatch, is_system_admin=True):
         yield result
 
 
 @pytest.fixture
-async def non_admin_client(mock_conn, current_project_authority):
-    async for result in _client_for(mock_conn, is_system_admin=False):
+async def non_admin_client(mock_conn, current_project_authority, monkeypatch):
+    async for result in _client_for(mock_conn, monkeypatch, is_system_admin=False):
         yield result

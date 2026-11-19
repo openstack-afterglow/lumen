@@ -13,6 +13,7 @@ from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBea
 from starlette.concurrency import run_in_threadpool
 
 from lumen.config import get_settings
+from lumen.models.billing import Payer
 
 keystone_token_scheme = APIKeyHeader(name="X-Auth-Token", auto_error=False, scheme_name="KeystoneToken")
 keystone_bearer_scheme = HTTPBearer(auto_error=False, scheme_name="KeystoneBearer")
@@ -23,8 +24,16 @@ x_api_key_scheme = APIKeyHeader(name="x-api-key", auto_error=False, scheme_name=
 _logger = logging.getLogger(__name__)
 
 
+def model_key_storage_id(api_key_id: int) -> str:
+    """Non-Keystone partition for run and media storage that requires actor IDs."""
+    return f"lumen:key:{api_key_id}"
+
+
 class Principal(TypedDict):
     auth_type: Literal["keystone", "api_key"]
+    credential_class: Literal["keystone", "personal_key", "service_key", "claude_gateway"]
+    domain_id: str | None
+    payer: Payer
     user_id: str
     project_id: str
     connection_project_id: NotRequired[str]
@@ -42,6 +51,7 @@ class Principal(TypedDict):
     credential_kind: NotRequired[str]
     expires_at: NotRequired[object]
     token: NotRequired[str]
+    ingress_verified: NotRequired[bool]
 
 
 @dataclass
@@ -271,7 +281,7 @@ def _resolve_project_authority(
             raise ValueError("Assigned Keystone role ID absent from current catalog")
         reached = role_ids if issued_role_ids is None else role_ids.intersection(issued_role_ids)
         roles = sorted(name for name, rid in global_ids.items() if rid in reached)
-        return {"roles": roles, "is_system_admin": is_system_admin}
+        return {"roles": roles, "is_system_admin": is_system_admin, "domain_id": project.domain_id}
     except HTTPException:
         raise
     except Exception as exc:
@@ -426,6 +436,9 @@ def validate_token(token: str, project_id: str = "", target_project_id: str = ""
 def _keystone_principal(info: dict, token: str) -> Principal:
     return {
         "auth_type": "keystone",
+        "credential_class": "keystone",
+        "domain_id": info["domain_id"],
+        "payer": info["payer"],
         "user_id": info["user_id"],
         "project_id": info["project_id"],
         "connection_project_id": info.get("connection_project_id", info["project_id"]),
@@ -461,6 +474,24 @@ async def _refresh_token_authority(info: dict) -> None:
     if info["project_id"] != connection_project_id and not authority["is_system_admin"]:
         raise HTTPException(status_code=403, detail="Target project override requires system admin privileges")
     info.update(authority)
+    domain_id = authority.get("domain_id")
+    if not isinstance(domain_id, str) or not domain_id:
+        raise HTTPException(503, "Current Keystone project domain unavailable")
+    info["credential_class"] = "keystone"
+    info["domain_id"] = domain_id
+    info["payer"] = Payer("domain", None, domain_id)
+
+
+def ensure_model_key_route(principal: Principal, method: str, route: str | None) -> None:
+    """Authorize the exact model surface, independently of dynamic request scopes."""
+    if principal["credential_class"] not in {"personal_key", "service_key"}:
+        return
+    from lumen.service_authority import MODEL_API_KEY_ROUTE_SCOPES
+
+    scope = MODEL_API_KEY_ROUTE_SCOPES.get((method, route))
+    if scope is None:
+        raise HTTPException(403, "Model API keys cannot access this endpoint")
+    ensure_scopes(principal, scope)
 
 
 async def get_principal(
@@ -472,6 +503,7 @@ async def get_principal(
 ) -> Principal:
     """Resolve exactly one Keystone or scoped API-key credential for user routes."""
     from lumen.services import api_key_store as aks
+    from lumen.services.afterglow_ingress import verify as verify_afterglow_ingress
 
     del _keystone_token, _keystone_bearer, _api_key_bearer, _x_api_key
 
@@ -513,32 +545,16 @@ async def get_principal(
         raise HTTPException(status_code=401, detail="유효한 Bearer 인증 credential이 필요합니다")
 
     if raw_api_key is not None:
-        info = await aks.verify_key(raw_api_key)
-        if info is None:
+        principal = await aks.verify_key(raw_api_key)
+        if principal is None:
             raise HTTPException(status_code=401, detail="유효하지 않은 API 키입니다")
-        requested_project = (request.headers.get("X-Project-Id") or "").strip()
-        if requested_project and requested_project != info["project_id"]:
-            raise HTTPException(status_code=403, detail="API 키 프로젝트와 X-Project-Id가 일치하지 않습니다")
-        requested_target = (request.headers.get("X-Target-Project-Id") or "").strip()
-        if requested_target and requested_target != info["project_id"]:
-            raise HTTPException(status_code=403, detail="API 키 프로젝트와 X-Target-Project-Id가 일치하지 않습니다")
-        scopes = info.get("scopes")
-        if not isinstance(scopes, tuple):
-            raise HTTPException(status_code=401, detail="유효하지 않은 API 키입니다")
-        principal: Principal = {
-            "auth_type": "api_key",
-            "user_id": info["user_id"],
-            "project_id": info["project_id"],
-            "connection_project_id": info["project_id"],
-            "api_key_id": info["api_key_id"],
-            "scopes": scopes,
-            "source": "api",
-            "roles": list(info.get("roles", ())),
-            "credential_kind": info.get("credential_kind", "api_key"),
-            "expires_at": info.get("expires_at"),
-            "is_system_admin": False,
-            "service_system_admin": bool(info.get("service_system_admin", False)),
-        }
+        if principal["credential_class"] == "claude_gateway":
+            for header in ("X-Project-Id", "X-Target-Project-Id"):
+                requested = (request.headers.get(header) or "").strip()
+                if requested and requested != principal["project_id"]:
+                    raise HTTPException(403, f"API 키 프로젝트와 {header}가 일치하지 않습니다")
+        else:
+            ensure_model_key_route(principal, request.method, getattr(request.scope.get("route"), "path", None))
     else:
         assert keystone_token is not None
         x_proj = (request.headers.get("X-Project-Id") or "").strip()
@@ -547,16 +563,15 @@ async def get_principal(
             val_kwargs = {"project_id": x_proj}
             if x_target_proj:
                 val_kwargs["target_project_id"] = x_target_proj
-            principal = _keystone_principal(
-                await run_in_threadpool(validate_token, keystone_token, **val_kwargs),
-                keystone_token,
-            )
-            await _refresh_token_authority(principal)
+            info = await run_in_threadpool(validate_token, keystone_token, **val_kwargs)
+            await _refresh_token_authority(info)
+            principal = _keystone_principal(info, keystone_token)
         except HTTPException:
             raise
         except Exception as exc:
             raise HTTPException(status_code=401, detail="인증 실패") from exc
 
+    principal["ingress_verified"] = verify_afterglow_ingress(request, keystone_token=keystone_token)
     request.state.token_info = principal
     return principal
 
@@ -600,6 +615,8 @@ async def require_token(
         token = bearer.credentials.strip()
     if not token:
         raise HTTPException(status_code=401, detail="X-Auth-Token 또는 Bearer 토큰이 필요합니다")
+    if token.startswith("sk-afgl-"):
+        raise HTTPException(status_code=401, detail="Keystone token required")
 
     proj_id = x_project_id if isinstance(x_project_id, str) else ""
     target_proj_id = x_target_project_id if isinstance(x_target_project_id, str) else ""

@@ -9,7 +9,7 @@ Each section lists the fields of one component schema referenced by this group's
 | Field | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
 | `name` | string \| null | no | `""` | Name |
-| `scopes` | array of enum: `compat:audio:write`, `compat:batches:read`, `compat:batches:write`, `compat:completions:write`, `compat:files:delete`, `compat:files:read`, `compat:files:write`, `compat:images:write`, `compat:realtime:write`, `models:read`, `native:agents:delete`, `native:agents:read`, `native:agents:use`, `native:agents:write`, `native:assets:delete`, `native:assets:read`, `native:assets:write`, `native:audio:write`, `native:batches:read`, `native:batches:write`, `native:conversations:delete`, `native:conversations:read`, `native:conversations:write`, `native:extensions:delete`, `native:extensions:read`, `native:extensions:write`, `native:images:write`, `native:mcp:write`, `native:memory:delete`, `native:memory:read`, `native:memory:write`, `native:realtime:write`, `native:runs:read`, `native:runs:write`, `native:tools:execute`, `usage:read` | no | — | Scopes (max 36 items) |
+| `scopes` | array of enum: `compat:audio:write`, `compat:completions:write`, `compat:images:write`, `compat:realtime:write`, `decisions:write`, `embeddings:write`, `models:read`, `native:audio:write` | no | — | Scopes (max 8 items) |
 | `monthly_credit_limit` | number \| string \| null | no | — | Monthly Credit Limit |
 | `weekly_credit_limit` | number \| string \| null | no | — | Weekly Credit Limit |
 | `expires_at` | string (date-time) \| null | no | — | Expires At |

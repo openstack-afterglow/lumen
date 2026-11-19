@@ -165,13 +165,12 @@ def test_compat_endpoint_scopes():
     assert batch_item_scopes("images.generations", contract="openai") == ("compat:images:write",)
 
 
-def test_batch_scopes_are_issuable_but_not_default():
+def test_batch_scopes_cannot_be_issued_to_model_keys():
     from lumen.services import api_key_store as aks
 
     batch_scopes = {"native:batches:read", "native:batches:write", "compat:batches:read", "compat:batches:write",
                     "compat:files:read", "compat:files:write"}
-    assert batch_scopes <= aks.API_KEY_SCOPES
-    assert batch_scopes.isdisjoint(aks.DEFAULT_API_KEY_SCOPES)
+    assert batch_scopes.isdisjoint(aks.API_KEY_SCOPES)
 
 
 # ── Routes ─────────────────────────────────────────────────────────────────────

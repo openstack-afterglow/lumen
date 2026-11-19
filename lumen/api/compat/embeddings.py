@@ -6,15 +6,16 @@ import base64
 import struct
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field, StrictStr, ValidationError
 
+from lumen.api.compat.google import GoogleModelRoute
 from lumen.api.compat.openai import openai_error_response
 from lumen.auth import Principal, require_api_key_scopes
 from lumen.services import embeddings
 
 router = APIRouter()
-google_router = APIRouter()
+google_router = APIRouter(route_class=GoogleModelRoute)
 
 
 class OpenAIEmbeddingRequest(BaseModel):
@@ -65,7 +66,8 @@ async def _run(model: str, inputs: list[str], *, principal: Principal, dimension
         route = await embeddings.resolve(model.removeprefix("models/"), provider=provider, provider_type=provider_type)
         return await embeddings.embed(
             route=route, inputs=inputs, user_id=principal["user_id"], project_id=principal["project_id"],
-            api_key_id=principal.get("api_key_id"), required_scopes=("compat:completions:write",),
+            api_key_id=principal.get("api_key_id"), required_scopes=("embeddings:write",),
+            payer=principal.get("payer"),
             dimensions=dimensions, task_type=task_type, title=title,
         )
     except embeddings.EmbeddingError as exc:
@@ -74,7 +76,7 @@ async def _run(model: str, inputs: list[str], *, principal: Principal, dimension
 
 @router.post("/embeddings", openapi_extra={"security": [{"APIKeyBearer": []}, {"XApiKey": []}]})
 async def openai_embeddings(body: OpenAIEmbeddingRequest,
-        principal: Principal = Depends(require_api_key_scopes("compat:completions:write"))):
+        principal: Principal = Depends(require_api_key_scopes("embeddings:write"))):
     try:
         inputs = [body.input] if isinstance(body.input, str) else body.input
         if not isinstance(inputs, list) or not all(isinstance(item, str) for item in inputs):
@@ -82,24 +84,32 @@ async def openai_embeddings(body: OpenAIEmbeddingRequest,
         result = await _run(body.model, inputs, principal=principal, dimensions=body.dimensions,
                             max_inputs=2048, provider=body.provider)
     except HTTPException as exc:
-        return openai_error_response(exc.status_code, str(exc.detail), code="embedding_error")
+        return openai_error_response(
+            exc.status_code, str(exc.detail),
+            code="domain_credit_insufficient" if exc.detail == "domain_credit_insufficient" else "embedding_error",
+        )
     return {"object": "list", "data": _openai_vectors(result["embeddings"], body.encoding_format),
             "model": result["model"], "usage": {"prompt_tokens": result["usage"]["prompt_tokens"],
             "total_tokens": result["usage"]["total_tokens"]}}
 
 
-@google_router.post("/v1beta/models/{model}:embedContent")
+@google_router.post("/v1beta/models/{model:path}:embedContent")
 async def gemini_embed(model: str, body: GeminiEmbedRequest,
-        principal: Principal = Depends(require_api_key_scopes("compat:completions:write"))):
+        x_lumen_provider: str | None = Header(default=None, alias="X-Lumen-Provider", min_length=1, max_length=40,
+                                              pattern=r"^[a-z0-9][a-z0-9_-]*$"),
+        principal: Principal = Depends(require_api_key_scopes("embeddings:write"))):
     result = await _run(model, [body.content.parts[0].text], principal=principal,
                         dimensions=body.outputDimensionality, max_inputs=1, provider_type="gemini",
+                        provider=x_lumen_provider,
                         task_type=body.taskType if "taskType" in body.model_fields_set else None, title=body.title)
     return {"embedding": {"values": result["embeddings"][0]["embedding"]}}
 
 
-@google_router.post("/v1beta/models/{model}:batchEmbedContents")
+@google_router.post("/v1beta/models/{model:path}:batchEmbedContents")
 async def gemini_batch_embed(model: str, request: Request,
-        principal: Principal = Depends(require_api_key_scopes("compat:completions:write"))):
+        x_lumen_provider: str | None = Header(default=None, alias="X-Lumen-Provider", min_length=1, max_length=40,
+                                              pattern=r"^[a-z0-9][a-z0-9_-]*$"),
+        principal: Principal = Depends(require_api_key_scopes("embeddings:write"))):
     try:
         payload: Any = await request.json()
         requests = [GeminiEmbedRequest.model_validate(row) for row in payload["requests"]]
@@ -116,5 +126,6 @@ async def gemini_batch_embed(model: str, request: Request,
     except (KeyError, TypeError, ValueError, ValidationError) as exc:
         raise HTTPException(status_code=400, detail="invalid Gemini embedding request") from exc
     result = await _run(model, inputs, principal=principal, dimensions=next(iter(dimensions)), max_inputs=100,
-                        provider_type="gemini", task_type=next(iter(task_types)), title=next(iter(titles)))
+                        provider_type="gemini", provider=x_lumen_provider,
+                        task_type=next(iter(task_types)), title=next(iter(titles)))
     return {"embeddings": [{"values": item["embedding"]} for item in result["embeddings"]]}

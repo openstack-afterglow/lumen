@@ -23,7 +23,7 @@ from system.test_process_stack import _poll_run_until_terminal
 pytestmark = pytest.mark.system
 
 
-def test_system_admin_target_key_cannot_substitute_tenant_scope():
+def test_system_admin_personal_key_has_no_project_authority():
     api_url = os.environ.get("LUMEN_API_BASE_URL", "http://localhost:8012")
     directory_url = os.environ.get("LUMEN_FAKE_KEYSTONE_URL", "http://fake-keystone:5000")
     owner_headers = {
@@ -59,7 +59,8 @@ def test_system_admin_target_key_cannot_substitute_tenant_scope():
                     own = api.get("/v1/models", headers={**key_headers, header: PROJECT_ID})
                     assert own.status_code == 200, own.text
                     foreign = api.get("/v1/models", headers={**key_headers, header: DIRECTORY_PROJECT_ID})
-                    assert foreign.status_code == 403, foreign.text
+                    assert foreign.status_code == 200, foreign.text
+                assert api.get("/v1/api-keys", headers=key_headers).status_code == 401
         finally:
             assert directory.post("/_control/reset", headers=control_headers, json={}).status_code == 200
             if created_id is not None:
@@ -74,7 +75,7 @@ def test_current_assignment_downgrade_at_native_and_compat_http_boundaries():
     model = os.environ.get("LUMEN_MODEL_NAME", "fake-gpt-4")
     owner_headers = {"X-Auth-Token": OWNER_TOKEN, "X-Project-Id": PROJECT_ID}
     control_headers = {"X-Test-Control-Token": CONTROL_TOKEN}
-    scopes = ["models:read", "compat:completions:write", "native:runs:write", "native:runs:read"]
+    scopes = ["models:read", "compat:completions:write"]
     created_id = None
     member_key_id = None
     with httpx.Client(base_url=api_url, timeout=60, trust_env=False) as api, \
@@ -83,6 +84,9 @@ def test_current_assignment_downgrade_at_native_and_compat_http_boundaries():
         reset = directory.post("/_control/reset", headers=control_headers, json={})
         assert reset.status_code == 200, reset.text
         try:
+            removed_scope = api.post("/v1/api-keys", headers=owner_headers,
+                json={"name": "native scopes cannot be issued", "scopes": [*scopes, "native:runs:write", "native:runs:read"]})
+            assert removed_scope.status_code == 422, removed_scope.text
             issue = api.post("/v1/api-keys", headers=owner_headers, json={"name": "current-graph HTTP", "scopes": scopes})
             assert issue.status_code == 201, issue.text
             issued = issue.json()
@@ -113,11 +117,11 @@ def test_current_assignment_downgrade_at_native_and_compat_http_boundaries():
             assert denied_issue.status_code == 403, denied_issue.text
             denied_delete = api.delete(f"/v1/api-keys/{created_id}", headers=owner_headers)
             assert denied_delete.status_code == 403, denied_delete.text
-            before = _provider_stats(provider)
             denied_marker = "SENTINEL_ROLE_DENIED_" + uuid4().hex
             compat = api.post("/v1/chat/completions", headers=key_headers,
-                json={"model": model, "messages": [{"role": "user", "content": denied_marker}]})
-            assert compat.status_code == 403, compat.text
+                json={"model": model, "messages": [{"role": "user", "content": "Personal key survives role downgrade"}]})
+            assert compat.status_code == 200, compat.text
+            before = _provider_stats(provider)
             native = api.post("/v1/temp-completions", headers={**key_headers, "Idempotency-Key": str(uuid4())},
                 json={"model_id": model, "parts": [{"type": "text", "text": denied_marker}],
                       "features": {"memory": False, "tool_policy": {"mode": "none"}}})
@@ -125,6 +129,9 @@ def test_current_assignment_downgrade_at_native_and_compat_http_boundaries():
             _assert_no_provider_io(provider, before, [denied_marker])
             removed = directory.post("/_control/configure", headers=control_headers, json={"owner_roles": []})
             assert removed.status_code == 200, removed.text
+            assert api.get("/v1/models", headers=key_headers).status_code == 200
+            disabled = directory.post("/_control/configure", headers=control_headers, json={"owner_enabled": False})
+            assert disabled.status_code == 200, disabled.text
             assert api.get("/v1/models", headers=key_headers).status_code == 401
         finally:
             restored = directory.post("/_control/reset", headers=control_headers, json={})
@@ -217,15 +224,12 @@ def test_member_cancel_is_owner_bound_and_idempotent_in_persistent_store(text_pr
 _OWNER_HEADERS = {"X-Auth-Token": OWNER_TOKEN, "X-Project-Id": PROJECT_ID}
 _CONTROL_HEADERS = {"X-Test-Control-Token": CONTROL_TOKEN}
 _ACTION_SCOPES = {
-    "chat": ("native:runs:write", "compat:completions:write"),
-    "images": ("native:images:write", "compat:images:write"),
+    "chat": ("compat:completions:write",),
+    "images": ("compat:images:write",),
     "audio": ("native:audio:write", "compat:audio:write"),
-    "tools": ("native:tools:execute",),
+    "tools": (),
 }
-_BROAD_SCOPES = [
-    "models:read", "native:runs:read", "native:extensions:read",
-    *(scope for scopes in _ACTION_SCOPES.values() for scope in scopes),
-]
+_BROAD_SCOPES = ["models:read", *(scope for scopes in _ACTION_SCOPES.values() for scope in scopes)]
 
 
 def _directory_change(directory, payload):
@@ -378,29 +382,38 @@ def test_member_api_key_action_scopes_at_native_and_compat_http(authority_http, 
     for boundary in ("native", "compat"):
         marker = "SENTINEL_AUTHORITY_DENIED_" + uuid4().hex
         denied_markers.append(marker)
+        if removed_action == "tools" and boundary == "compat":
+            # Provider-executed tools are refused for every key; client tools are forwarded below.
+            path, payload = _authority_payload("chat", boundary, marker)
+            denied = api.post(path, headers={**headers, "Idempotency-Key": str(uuid4())},
+                              json={**payload, "web_search_options": {}})
+            assert denied.status_code == 403, denied.text
+            assert denied.json()["error"]["code"] == "server_tool_not_allowed_for_key", denied.text
+            continue
         denied = _authority_post(api, headers, removed_action, boundary, marker)
         assert denied.status_code == 403, (removed_action, boundary, denied.text)
     _assert_no_provider_io(provider, before, denied_markers)
 
-    # Current membership allows every modality; only this key's scopes attenuate
-    # the request. Tool-bearing chat still needs chat and tool scopes together.
-    for action in _ACTION_SCOPES:
+    if removed_action == "tools":
+        # A client-declared function is forwarded, never executed by Lumen.
+        before = _provider_stats(provider)
+        forwarded = _authority_post(api, headers, "tools", "compat", "SENTINEL_CLIENT_TOOL_" + uuid4().hex)
+        _assert_positive_response(api, headers, "tools", "compat", forwarded)
+        after = _provider_stats(provider)
+        assert after["request_count"] > before["request_count"], (before, after)
+
+    # Only compatible synchronous model endpoints and native speech may proceed.
+    for action in ("chat", "images", "audio"):
         if action == removed_action:
-            continue
-        if action == "tools" and removed_action == "chat":
-            before = _provider_stats(provider)
-            markers = []
-            for boundary in ("native", "compat"):
-                marker = "SENTINEL_TOOLS_WITHOUT_CHAT_DENIED_" + uuid4().hex
-                markers.append(marker)
-                denied = _authority_post(api, headers, action, boundary, marker)
-                assert denied.status_code == 403, denied.text
-            _assert_no_provider_io(provider, before, markers)
             continue
         for boundary in ("native", "compat"):
             before = _provider_stats(provider)
             response = _authority_post(api, headers, action, boundary,
                                        "SENTINEL_AUTHORITY_ALLOWED_" + uuid4().hex)
+            if boundary == "native" and action != "audio":
+                assert response.status_code == 403, response.text
+                _assert_no_provider_io(provider, before, [])
+                continue
             _assert_positive_response(api, headers, action, boundary, response)
             after = _provider_stats(provider)
             assert after["request_count"] > before["request_count"], (action, boundary, before, after)
@@ -410,26 +423,20 @@ def test_member_api_key_action_scopes_at_native_and_compat_http(authority_http, 
                 call = after["calls"][-1]
                 assert call["operation"] == operation and call["status"] == 200, call
                 assert call["host"] == "api.openai.com" and call["tls"] is True, call
-    _assert_no_provider_io(provider, _provider_stats(provider), denied_markers)
 
 
 @pytest.mark.parametrize("roles", [["reader"], ["lumen_admin"], []],
                          ids=["reader", "legacy-grade-only", "no-membership"])
-@pytest.mark.parametrize("credential", ["web", "key"])
-def test_reader_legacy_and_absent_membership_fence_every_provider_boundary(authority_http, roles, credential):
-    api, directory, provider, created_ids = authority_http
-    _, key_headers = _issue_owned_key(api, created_ids, _BROAD_SCOPES)
-    headers = _OWNER_HEADERS if credential == "web" else key_headers
+def test_reader_legacy_and_absent_membership_fence_native_provider_actions(authority_http, roles):
+    api, directory, provider, _ = authority_http
     _directory_change(directory, {"owner_roles": roles})
     before = _provider_stats(provider)
     markers = []
     for action in _ACTION_SCOPES:
-        for boundary in ("native", "compat"):
-            marker = "SENTINEL_READER_OR_NO_MEMBERSHIP_DENIED_" + uuid4().hex
-            markers.append(marker)
-            denied = _authority_post(api, headers, action, boundary, marker)
-            expected = 401 if not roles and credential == "key" else 403
-            assert denied.status_code == expected, (roles, credential, action, boundary, denied.text)
+        marker = "SENTINEL_READER_OR_NO_MEMBERSHIP_DENIED_" + uuid4().hex
+        markers.append(marker)
+        denied = _authority_post(api, _OWNER_HEADERS, action, "native", marker)
+        assert denied.status_code == 403, (roles, action, denied.text)
     _assert_no_provider_io(provider, before, markers)
 
 
@@ -451,18 +458,16 @@ def test_revoked_key_is_denied_before_provider_at_all_native_and_compat_boundari
     _assert_no_provider_io(provider, before, markers)
 
 
-@pytest.mark.parametrize("loss", ["assignment", "revocation"])
-def test_queued_media_worker_revalidates_current_authority_before_new_io(authority_http, loss):
+def test_queued_media_worker_revalidates_current_authority_before_new_io(authority_http):
     """A copied frozen HTTP image request, not a mocked worker/admission, is released."""
     from urllib.parse import unquote, urlsplit
 
     import pymysql
     from system.fake_keystone import OWNER_ID
 
-    api, directory, provider, created_ids = authority_http
-    key_id, headers = _issue_owned_key(api, created_ids, _BROAD_SCOPES)
-    response = _authority_post(api, headers, "images", "native", "SENTINEL_QUEUED_MEDIA_" + uuid4().hex)
-    source_id = _assert_positive_response(api, headers, "images", "native", response)
+    api, directory, provider, _ = authority_http
+    response = _authority_post(api, _OWNER_HEADERS, "images", "native", "SENTINEL_QUEUED_MEDIA_" + uuid4().hex)
+    source_id = _assert_positive_response(api, _OWNER_HEADERS, "images", "native", response)
     before = _provider_stats(provider)
     assert before["operation_counts"]["images.generations"] == 1, before
     database = urlsplit(os.environ["DATABASE_URL"])
@@ -493,12 +498,7 @@ def test_queued_media_worker_revalidates_current_authority_before_new_io(authori
         db.commit()
         queued = api.get(f"/v1/runs/{queued_id}", headers=_OWNER_HEADERS)
         assert queued.status_code == 200 and queued.json()["status"] == "queued", queued.text
-        if loss == "assignment":
-            _directory_change(directory, {"owner_roles": ["reader"]})
-        else:
-            revoked = api.delete(f"/v1/api-keys/{key_id}", headers=_OWNER_HEADERS)
-            assert revoked.status_code in {200, 204}, revoked.text
-            created_ids.remove(key_id)
+        _directory_change(directory, {"owner_roles": ["reader"]})
         with db.cursor() as cursor:
             cursor.execute("""UPDATE chat_runs SET worker_pool_id=NULL
                 WHERE id=%s AND status='queued' AND worker_pool_id=%s""", (queued_id, pool_id))

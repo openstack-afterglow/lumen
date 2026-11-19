@@ -4,6 +4,13 @@
 
 Each section lists the fields of one component schema referenced by this group's operations, with type, required flag, default and the description from the OpenAPI model. Nested models link to their own section.
 
+### AdminPatch
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `admin_ceiling_credits` | number \| string \| null | no | — | Admin Ceiling Credits |
+| `is_active` | boolean | no | `true` | Is Active |
+
 ### DefaultQuotaBody
 
 | Field | Type | Required | Default | Notes |
@@ -15,6 +22,19 @@ Each section lists the fields of one component schema referenced by this group's
 | Field | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
 | `detail` | array of [ValidationError](#validationerror) | no | — | Detail |
+
+### ManagerPatch
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `manager_monthly_limit_credits` | number \| string \| null | yes | — | Manager Monthly Limit Credits |
+
+### TopUp
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `amount_credits` | number \| string | yes | — | Amount Credits |
+| `note` | string \| null | no | — | Note |
 
 ### UsageRecord
 
@@ -33,6 +53,7 @@ Each section lists the fields of one component schema referenced by this group's
 | `cache_creation_1h_input_tokens` | integer | yes | — | Cache Creation 1H Input Tokens (numeric lower bound) |
 | `credited_cost` | string | yes | — | Credited Cost |
 | `source` | enum: `web`, `api` | yes | — | Source |
+| `billing_scope` | enum: `user`, `domain` | no | `"user"` | Billing Scope |
 | `api_key_id` | integer \| null | no | — | Api Key Id |
 | `conversation_id` | string \| null | no | — | Conversation Id |
 | `run_id` | string \| null | no | — | Run Id |

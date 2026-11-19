@@ -28,6 +28,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from lumen.config import get_settings
 from lumen.crypto import encrypt_chat_content
 from lumen.models.api_requests import OpenAIChatRequest, ResponsesRequest
+from lumen.models.billing import Payer
 from lumen.models.chat_runs import ChatModelCallReservation, ChatRun, ChatRunProvider, ChatRunSegment
 from lumen.services import (
     completion_api,
@@ -39,7 +40,12 @@ from lumen.services import (
 )
 from lumen.services.api_key_store import ApiKeyAuthorityUnavailable, ApiKeyForbidden, authorize_api_key_in_transaction
 from lumen.services.completion_format import nonstream_response
-from lumen.services.inference_authority import completion_scopes
+from lumen.services.inference_authority import (
+    check_dispatch,
+    completion_scopes,
+    preflight_dispatch,
+    read_dispatch_candidate,
+)
 from lumen.services.providers import routing
 from lumen.services.providers.credentials import execution_identity
 from lumen.services.providers.errors import ProviderSubscriptionError
@@ -139,6 +145,7 @@ async def prepare_api_completion_run(
     user_id: str,
     source: str = "api",
     api_key_id: int | None = None,
+    payer: Payer | None = None,
     required_scopes: tuple[str, ...] | None = None,
 ) -> PreparedApiCompletion:
     """Validate and freeze one stateless chat/Responses request; never invokes a provider.
@@ -147,7 +154,7 @@ async def prepare_api_completion_run(
     bound covers the full context window at the highest frozen input/cache/media
     rate plus the explicit (default 4096) output budget at the highest output rate.
     """
-    del source, api_key_id
+    del source
     if operation not in _ENDPOINTS:
         raise DurableRunInputError("unsupported_operation")
     if not isinstance(request, dict):
@@ -265,6 +272,8 @@ async def prepare_api_completion_run(
     if bound >= _MAX_BOUND:
         raise DurableRunInputError("credit_bound_too_large")
     pricing["bound_credits"] = format(bound, "f")
+    if payer is not None and payer.domain_id is not None:
+        await credit.precheck(user_id, project_id, api_key_id, payer=payer, bound=bound)
     capability = {key: route[key] for key in (
         "provider_id", "model_id", "provider_name", "provider_type", "model_name", "model_kind",
         "api_model_name", "config_version_hash",
@@ -292,6 +301,7 @@ async def persist_api_completion_run_in_transaction(
     client_request_id: str,
     source: str = "api",
     api_key_id: int | None = None,
+    payer: Payer | None = None,
     workload_class: str | None = "batch",
     batch_id: str | None = None,
     allowed_scopes: frozenset[str] | None = None,
@@ -340,6 +350,7 @@ async def persist_api_completion_run_in_transaction(
     run = ChatRun(
         id=str(uuid.uuid4()), run_scope="api", run_kind="api_completion", project_id=project_id, user_id=user_id,
         model_name=capability["model_name"], source=source, api_key_id=api_key_id,
+        payer_domain_id=payer.domain_id if payer is not None else None,
         workload_class=route.workload_class, worker_pool_id=route.worker_pool_id, batch_id=batch_id,
         client_request_id=client_request_id, request_fingerprint=fingerprint, fingerprint_version=1,
         execution_protocol_version=1, capability_snapshot=capability, pricing_snapshot=pricing,
@@ -394,13 +405,20 @@ async def _segment_start(run_id: str, *, owner: str, operation: str, required_sc
                          bound: Decimal) -> str:
     """Commit the hold and irrevocable I/O intent, or report why no provider I/O may begin.
 
-    Lock order: batch (shared) -> run -> segment -> provider config -> wallet.
+    Lock order: payer -> batch (shared) -> run -> segment -> provider config.
     """
     from .admission import _lock_run_configurations
+    approval = None
+    async with _factory()() as session:
+        candidate = await read_dispatch_candidate(session, run_id, _SEGMENT)
+        if candidate is not None:
+            _require_owned_running_lease(candidate, owner)
+            approval = await preflight_dispatch(session, candidate, required_scopes)
 
     async def transaction() -> str:
         async with _factory()() as session, session.begin():
             await session.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
+            await credit.lock_run_payer(session, run_id)
             batch_id = await session.scalar(select(ChatRun.batch_id).where(ChatRun.id == run_id))
             batch_open = batch_id is not None and await worker_routing.lock_open_batch(session, batch_id)
             run = (await session.execute(select(ChatRun).where(ChatRun.id == run_id)
@@ -420,14 +438,15 @@ async def _segment_start(run_id: str, *, owner: str, operation: str, required_sc
             if not batch_open:
                 return "batch_closed"
             await _lock_run_configurations(session, run.capability_snapshot, model_name=run.model_name)
-            await authorize_api_key_in_transaction(session, api_key_id=run.api_key_id, user_id=run.user_id,
-                                                   project_id=run.project_id, required_scopes=required_scopes,
-                                                   credential_authority=(run.capability_snapshot or {}).get("credential_authority"))
+            verified = await check_dispatch(session, run, approval)
+            payer = credit.run_payer(run)
             await credit.reserve_call_credit_in_transaction(session, user_id=run.user_id, project_id=run.project_id,
-                                                            api_key_id=run.api_key_id, bound=bound)
+                                                            api_key_id=run.api_key_id, bound=bound, payer=payer)
             session.add(ChatModelCallReservation(run_id=run.id, segment_id=_SEGMENT, bound_credits=bound,
-                                                 status="reserved"))
+                                                 status="reserved", **payer.columns()))
+            await credit.refresh_domain_reserved(session, payer)
             run.reserved_credits = bound
+            verified.require_fresh()
             begin_segment_io(segment)
             run.provider_started_at = _now()
             await append_event(session, run, _event(run, "run.stage.changed", {"stage": "model_request"}))
@@ -530,9 +549,11 @@ async def _settle(run_id: str, *, owner: str) -> Literal["completed", "rejected"
             # Other runs can settle this user's wallet after our identity reads.
             # Select isolation before any statement so that delta is not a stale snapshot write.
             await worker_routing.use_read_committed(session)
+            await credit.lock_run_payer(session, run_id)
             run = (await session.execute(select(ChatRun).where(ChatRun.id == run_id)
                    .with_for_update().execution_options(populate_existing=True))).scalar_one()
             _require_owned_running_lease(run, owner)
+            payer = credit.run_payer(run)
             segment = (await session.execute(select(ChatRunSegment).where(
                 ChatRunSegment.run_id == run_id, ChatRunSegment.segment_id == _SEGMENT,
             ).with_for_update().execution_options(populate_existing=True))).scalar_one()
@@ -549,11 +570,15 @@ async def _settle(run_id: str, *, owner: str) -> Literal["completed", "rejected"
             if reservation.status != "reserved" or not isinstance(envelope, dict):
                 raise DurableRunProviderResultUnknown("api completion result cannot safely be settled")
             if rejected:
-                # The provider refused before inference: release the hold at zero, no ledger row.
+                # Proven pre-inference refusals release credit without a balance delta.
                 reservation.actual_credits = Decimal("0")
                 reservation.status = "settled"
                 reservation.settled_at = _now()
                 run.usage_reconciled_at = _now()
+                await credit.release_domain_in_transaction(
+                    session, payer=payer, reference=f"run:{run.id}",
+                    user_id=credit.actor_id(run.user_id, run.api_key_id),
+                )
                 return "rejected"
             pricing = run.pricing_snapshot
             usage = load_segment_payload(segment.usage_payload)
@@ -571,8 +596,12 @@ async def _settle(run_id: str, *, owner: str) -> Literal["completed", "rejected"
                 raise DurableRunProviderResultUnknown("api completion usage cannot safely be settled") from exc
             margin = Decimal(pricing["margin_multiplier"])
             per_usd = Decimal(pricing["chat_credit_per_usd"])
+            actual = credit.credits_for_cost(usage_cost.raw_cost, margin, per_usd)
+            if payer.domain_id is not None and actual > reservation.bound_credits:
+                raise DurableRunProviderResultUnknown("api completion usage exceeds prepaid reservation")
             credited = await credit.apply_usage_in_transaction(
                 session, event_id=f"run:{run.id}", user_id=run.user_id, project_id=run.project_id,
+                payer=payer,
                 model_name=run.model_name, provider=run.capability_snapshot["provider_name"],
                 prompt_tokens=breakdown.input_tokens, completion_tokens=breakdown.output_tokens,
                 usage_cost=usage_cost, breakdown=breakdown, margin_multiplier=margin, credit_per_usd=per_usd,
@@ -584,6 +613,7 @@ async def _settle(run_id: str, *, owner: str) -> Literal["completed", "rejected"
             reservation.actual_credits = credited
             reservation.status = "settled"
             reservation.settled_at = _now()
+            await credit.refresh_domain_reserved(session, payer)
             run.usage_reconciled_at = _now()
             await append_event(session, run, _event(run, "usage.updated", {
                 "components": components, "prompt_tokens": breakdown.input_tokens,
@@ -679,8 +709,8 @@ async def _execute(run_id: str, *, owner: str, payload: dict, capability_snapsho
         pre_io_error = ("api_key_unauthorized", "API key is no longer authorized for this request")
     except ApiKeyAuthorityUnavailable:
         pre_io_error = ("inference_authority_unavailable", "Current inference authority is unavailable")
-    except credit.QuotaExceeded:
-        pre_io_error = ("quota_exceeded", "credit quota is exhausted")
+    except credit.QuotaExceeded as exc:
+        pre_io_error = (getattr(exc, "code", "quota_exceeded"), "credit quota is exhausted")
     except DurableRunConflict:
         pre_io_error = ("provider_configuration_changed", "provider configuration changed after admission")
     except DurableRunInputError:

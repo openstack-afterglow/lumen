@@ -11,7 +11,7 @@ from fastapi.routing import APIRoute
 from pydantic import ValidationError
 
 from lumen.auth import Principal, require_scopes
-from lumen.models.decision_contracts import MAX_DECISION_BODY_BYTES, DecisionRequest
+from lumen.models.decision_contracts import MAX_DECISION_BODY_BYTES, NativeDecisionRequest
 from lumen.models.gemini_decision_contracts import (
     MAX_GEMINI_DECISION_BODY_BYTES,
     GeminiDecisionModalityUnsupported,
@@ -137,9 +137,9 @@ class ProviderDecisionRoute(BoundedDecisionRoute):
 router = APIRouter(route_class=ProviderDecisionRoute)
 
 
-def _openai_request(raw: object) -> DecisionRequest:
+def _openai_request(raw: object) -> NativeDecisionRequest:
     try:
-        return DecisionRequest.model_validate(raw)
+        return NativeDecisionRequest.model_validate(raw)
     except ValidationError as exc:
         errors = exc.errors(include_url=False, include_context=False, include_input=False)
         for error in errors:
@@ -150,12 +150,12 @@ def _openai_request(raw: object) -> DecisionRequest:
 @router.post("/chat/decisions", openapi_extra={"requestBody": {
     "required": True,
     "content": {"application/json": {"schema": {"oneOf": [
-        {"$ref": "#/components/schemas/DecisionRequest"},
+        {"$ref": "#/components/schemas/NativeDecisionRequest"},
         GEMINI_DECISION_BODY_SCHEMA,
     ]}}},
 }})
 async def create_decision(request: Request,
-                          principal: Principal = Depends(require_scopes("native:runs:write"))):
+                          principal: Principal = Depends(require_scopes("decisions:write"))):
     content = await request.body()
     if not content:
         raise RequestValidationError([{"type": "missing", "loc": ("body",), "msg": "Field required"}])
@@ -172,22 +172,32 @@ async def create_decision(request: Request,
 
     # A questions array is impossible in Gemini. Preserve fail-fast validation
     # for legacy array requests, even when the registry is unavailable.
-    body = None
+    body = gemini_body = None
     if not isinstance(raw, dict) or isinstance(raw.get("questions"), list):
         if len(content) > MAX_DECISION_BODY_BYTES:
             raise HTTPException(413, "decision request body exceeds 16 MiB")
         body = _openai_request(raw)
-    model = raw.get("model")
-    if not isinstance(model, str) or not 1 <= len(model) <= 190 or any("\ud800" <= c <= "\udfff" for c in model):
-        _openai_request(raw)
+    model, model_row_id = raw.get("model"), raw.get("model_row_id")
+    if model_row_id is not None:
+        if body is None:
+            gemini_body = parse_gemini_request(request, content, decoded=(raw, duplicate_key))
+        selection = body if body is not None else gemini_body
+        model, model_row_id = selection.model, selection.model_row_id
+    if model is not None and (
+        not isinstance(model, str) or not 1 <= len(model) <= 190 or any("\ud800" <= c <= "\udfff" for c in model)
+    ):
         raise HTTPException(422, "invalid decision model")
+    if model is None and model_row_id is None:
+        _openai_request(raw)
     caller = dict(user_id=principal["user_id"], project_id=principal["project_id"],
-                  api_key_id=principal.get("api_key_id"), required_scopes=("native:runs:write",),
+                  api_key_id=principal.get("api_key_id"), required_scopes=("decisions:write",),
+                  payer=principal.get("payer"),
                   source="api" if principal.get("api_key_id") is not None else "web")
     try:
-        route = await decisions.resolve(model)
+        route = (await decisions.resolve(model, model_row_id=model_row_id)
+                 if model_row_id is not None else await decisions.resolve(model))
         if route.get("provider_type") == "gemini":
-            gemini = parse_gemini_request(request, content, decoded=(raw, duplicate_key))
+            gemini = gemini_body or parse_gemini_request(request, content, decoded=(raw, duplicate_key))
             return await gemini_decisions.decide(route=route, body=gemini, **caller)
         if len(content) > MAX_DECISION_BODY_BYTES:
             raise HTTPException(413, "decision request body exceeds 16 MiB")

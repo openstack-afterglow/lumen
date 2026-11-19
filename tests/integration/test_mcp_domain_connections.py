@@ -18,7 +18,13 @@ from sqlalchemy.orm.attributes import set_committed_value
 
 from lumen.db import close_db, get_session_factory, init_db
 from lumen.models.chat_contracts import ChatFeatureOptions
-from lumen.models.chat_db import ChatMcpActivation, ChatMcpOAuthConnection, ChatMcpOAuthRequest, ChatMcpServer
+from lumen.models.chat_db import (
+    ChatCustomTool,
+    ChatMcpActivation,
+    ChatMcpOAuthConnection,
+    ChatMcpOAuthRequest,
+    ChatMcpServer,
+)
 from lumen.services import chat_admission, mcp_oauth, mcp_settings
 from lumen.services import extensions_store as es
 from lumen.services import mcp_registry_catalog as catalog
@@ -38,10 +44,13 @@ async def domain_db(monkeypatch, request):
     member = {"user_id": f"member-{suffix}", "project_id": f"pa-{suffix}", "auth_type": "keystone"}
     foreign = {"user_id": f"foreign-{suffix}", "project_id": f"pb-{suffix}", "auth_type": "keystone"}
     ids = []
+    tool_ids = []
+    second_project = f"pa2-{suffix}"
+    project_domains = {manager["project_id"]: domain_a, second_project: domain_a, manager_b["project_id"]: domain_b}
 
     async def resolve(user_id, project_id, domain_id=None, *, credential_authority=None, compute_manage=True,
                       unrestricted_human=False):
-        target = domain_a if project_id == manager["project_id"] else domain_b
+        target = project_domains[project_id]
         if domain_id is not None and domain_id != target:
             raise HTTPException(403, "wrong domain")
         return {"domain_id": target, "is_member": True,
@@ -49,9 +58,14 @@ async def domain_db(monkeypatch, request):
                 and unrestricted_human}
 
     async def project_domain(project_id):
-        return domain_a if project_id == manager["project_id"] else domain_b
+        return project_domains[project_id]
 
     monkeypatch.setattr("lumen.services.mcp_domain_authority.project_domain_id", project_domain)
+
+    async def project_authority(user_id, project_id):
+        return {"roles": ["member"], "is_system_admin": False}
+
+    monkeypatch.setattr(mcp_oauth, "resolve_project_authority", project_authority)
 
     async def access(user_id, project_id, domain_id=None, *, manage=False, human=None):
         result = await resolve(user_id, project_id, domain_id, unrestricted_human=True)
@@ -64,12 +78,14 @@ async def domain_db(monkeypatch, request):
     monkeypatch.setattr(es.ssrf, "validate_url", lambda url: url)
     try:
         yield {"factory": factory, "manager": manager, "manager_b": manager_b, "member": member, "foreign": foreign,
-               "a": domain_a, "b": domain_b, "ids": ids, "suffix": suffix}
+               "a": domain_a, "b": domain_b, "ids": ids, "tool_ids": tool_ids, "suffix": suffix,
+               "second_project": second_project, "project_domains": project_domains}
     finally:
         async with factory() as session, session.begin():
             for model in (ChatMcpOAuthRequest, ChatMcpOAuthConnection, ChatMcpActivation):
                 await session.execute(delete(model).where(model.mcp_server_id.in_(ids)))
             await session.execute(delete(ChatMcpServer).where(ChatMcpServer.id.in_(ids)))
+            await session.execute(delete(ChatCustomTool).where(ChatCustomTool.id.in_(tool_ids)))
         await close_db()
 
 
@@ -296,8 +312,6 @@ async def test_authority_outage_never_fails_unrelated_listing_or_implicit_runs(d
             None, ChatFeatureOptions(tool_policy={"enabled_mcp_ids": [server["id"]]}), **owner(db["member"])
         )
     assert unavailable.value.status_code == 404
-    versions = await es.mcp_credential_versions([server["id"]], **owner(db["member"]))
-    assert versions in ({}, {server["id"]: None})
 
 
 async def test_legacy_route_cannot_repoint_a_catalog_connection(domain_db):
@@ -328,3 +342,153 @@ async def test_idempotent_org_install_releases_lookup_connection_before_effectiv
     assert again["server"]["id"] == first["id"]
     assert again["server"]["is_active"] is False
     assert again["server"]["server_is_active"] is True
+
+
+def verified_actor(db, name="member", *, project_id=None, domain_id=None):
+    principal = db[name]
+    project_id = project_id or principal["project_id"]
+    return {
+        **principal, "credential_class": "keystone", "project_id": project_id,
+        "domain_id": domain_id or db["project_domains"][project_id],
+    }
+
+
+async def test_personal_catalog_reuses_domain_connection_but_not_foreign_or_legacy_owner(domain_db):
+    db = domain_db
+    candidate = template("open")
+    home = verified_actor(db)
+    same_domain = verified_actor(db, project_id=db["second_project"])
+    other_domain = verified_actor(db, project_id=db["foreign"]["project_id"])
+    first = await mcp_settings.create(home, candidate["id"], label=db["suffix"])
+    server_id = first["server"]["id"]
+    db["ids"].append(server_id)
+    assert first["server"]["owner_domain_id"] == db["a"]
+    existing = await mcp_settings.create(same_domain, candidate["id"], label=db["suffix"])
+    assert existing["created"] is False
+    assert es.selection_fingerprint(existing["server"]) == es.selection_fingerprint(first["server"])
+    assert existing["server"]["owner_project_id"] == home["project_id"]
+    async with db["factory"]() as session:
+        row = await session.get(ChatMcpServer, server_id)
+        assert row.connection_scope_key == f"user:{home['user_id']}:domain:{db['a']}"
+        assert row.owner_project_id == home["project_id"]
+    for principal in (other_domain, verified_actor(db, "manager"), {**home, "credential_class": "personal_key"}):
+        with pytest.raises(es.ExtensionForbidden):
+            await mcp_settings.scoped_connection(principal, server_id)
+    await mcp_settings.delete(same_domain, server_id)
+
+
+async def test_domain_custom_tool_requires_exact_manager_and_live_selected_project(domain_db):
+    db = domain_db
+    manager, member = verified_actor(db, "manager"), verified_actor(db, project_id=db["second_project"])
+    fields = {"name": "shared_http", "url": "https://tools.example/test"}
+    with mcp_settings.actor(member), pytest.raises(es.ExtensionForbidden):
+        await es.create("tool", fields, scope="domain", owner_user_id=member["user_id"],
+                        owner_project_id=member["project_id"], owner_domain_id=db["a"])
+    with mcp_settings.actor(manager):
+        tool = await es.create("tool", fields, scope="domain", owner_user_id=manager["user_id"],
+                               owner_project_id=manager["project_id"], owner_domain_id=db["a"])
+    db["tool_ids"].append(tool["id"])
+    with mcp_settings.actor(member):
+        assert [row["id"] for row in await es.list_for_user("tool", **owner(member),
+                                                           selected_ids=(tool["id"],))] == [tool["id"]]
+        with pytest.raises(es.ExtensionForbidden):
+            await es.delete("tool", tool["id"], requester_user_id=member["user_id"],
+                            requester_project_id=member["project_id"], domain_id=db["a"])
+    snapshot = {"mcp": [], "tools": [{"id": tool["id"], "config_fingerprint": es.selection_fingerprint(tool)}]}
+    with es.actor_scope(human=False, mode="run", owner=(member["user_id"], member["project_id"], db["a"])):
+        selected, _, _ = await es.validated_frozen_selection(snapshot, **owner(member))
+        assert selected == (tool["id"],)
+        db["project_domains"][member["project_id"]] = db["b"]
+        selected, _, _ = await es.validated_frozen_selection(snapshot, **owner(member))
+        assert selected == ()
+
+
+async def test_personal_custom_tool_domain_and_origin_fallback_are_disjoint(domain_db):
+    db = domain_db
+    home, second = verified_actor(db), verified_actor(db, project_id=db["second_project"])
+    fields = {"name": "personal_http", "url": "https://tools.example/test"}
+    creation = {"scope": "user", "owner_user_id": home["user_id"], "owner_project_id": home["project_id"]}
+    legacy = await es.create("tool", fields, **creation)
+    with mcp_settings.actor(home):
+        scoped = await es.create("tool", fields, **creation)
+    ids = (legacy["id"], scoped["id"])
+    db["tool_ids"].extend(ids)
+    for principal, expected in ((home, ids), (second, (scoped["id"],)), ({**home, "domain_id": None}, (legacy["id"],))):
+        with mcp_settings.actor(principal):
+            rows = await es.list_for_user("tool", **owner(principal), selected_ids=ids)
+        assert {row["id"] for row in rows} == set(expected)
+
+
+async def test_domain_activation_and_oauth_shadow_an_active_origin_row(domain_db):
+    db = domain_db
+    member = verified_actor(db)
+    second = verified_actor(db, project_id=db["second_project"])
+    server = await es.create("mcp", {
+        "name": "oauth-shadow", "url": "https://mcp.example/oauth", "auth_mode": "oauth",
+    }, scope="global")
+    server_id = server["id"]
+    db["ids"].append(server_id)
+    async with db["factory"]() as session, session.begin():
+        for principal, domain_id, active in ((member, None, True), (second, db["a"], False)):
+            session.add(ChatMcpActivation(
+                mcp_server_id=server_id, owner_user_id=principal["user_id"], owner_project_id=principal["project_id"],
+                owner_domain_id=domain_id, is_active=active, config_version=1, generation=1,
+            ))
+            session.add(ChatMcpOAuthConnection(
+                id=str(uuid.uuid4()), mcp_server_id=server_id, owner_user_id=principal["user_id"],
+                owner_project_id=principal["project_id"], owner_domain_id=domain_id,
+                encrypted_tokens=mcp_oauth._encrypt({"access_token": "synthetic-token"}) if active else mcp_oauth._encrypt({}),
+                status="active" if active else "revoked", server_config_version=1, credential_version=1,
+            ))
+    with mcp_settings.actor(member):
+        row, = await es.list_for_user("mcp", **owner(member), selected_ids=(server_id,))
+        assert not row["activation_is_active"] and not row["auth_connected"]
+        store = mcp_oauth.SqlMcpConnectionStore()
+        assert (await store.connection(server_id, Namespace(**owner(member)))).status == "revoked"
+    with mcp_settings.actor({**member, "domain_id": None}):
+        row, = await es.list_for_user("mcp", **owner(member), selected_ids=(server_id,))
+        assert row["activation_is_active"] and row["auth_connected"]
+
+
+async def test_personal_oauth_state_fences_callback_project_domain(domain_db):
+    db = domain_db
+    origin = verified_actor(db)
+    second = verified_actor(db, project_id=db["second_project"])
+    with mcp_settings.actor(origin):
+        server = await es.create("mcp", {
+            "name": "personal-oauth", "url": "https://mcp.example/oauth", "auth_mode": "oauth",
+        }, scope="user", owner_user_id=origin["user_id"], owner_project_id=origin["project_id"], catalog_authorized=True)
+    db["ids"].append(server["id"])
+    state_hash = uuid.uuid4().hex
+    store = mcp_oauth.SqlMcpConnectionStore()
+    with mcp_settings.actor(second):
+        await store.create_state(
+            state_hash=state_hash, server_id=server["id"], namespace=Namespace(**owner(second)),
+            payload={"synthetic": True}, expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        )
+    assert await store.consume_state(state_hash) == {"synthetic": True}
+    # A same-domain callback writes one credential, while preserving the actual initiating project.
+    assert await store.complete_state(
+        state_hash, token={"access_token": "synthetic-token"}, expires_at=None,
+    ) == server["id"]
+    with mcp_settings.actor(origin):
+        row, = await es.list_for_user("mcp", **owner(origin), active_only=True, selected_ids=(server["id"],))
+        assert row["credential_version"] == 1
+        connection = await store.connection(server["id"], Namespace(**owner(origin)))
+        assert connection.project_id == second["project_id"]
+    state_hash = uuid.uuid4().hex
+    with mcp_settings.actor(second):
+        await store.create_state(
+            state_hash=state_hash, server_id=server["id"], namespace=Namespace(**owner(second)),
+            payload={"synthetic": True}, expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        )
+    await store.consume_state(state_hash)
+    db["project_domains"][second["project_id"]] = db["b"]
+    with pytest.raises(mcp_oauth.McpOAuthError, match="management authority is no longer available"):
+        await store.complete_state(state_hash, token={"access_token": "synthetic-token"}, expires_at=None)
+    async with db["factory"]() as session:
+        persisted = (await session.execute(select(ChatMcpOAuthConnection).where(
+            ChatMcpOAuthConnection.mcp_server_id == server["id"],
+        ))).scalar_one()
+        assert persisted.owner_domain_id == db["a"]
+        assert persisted.credential_version == 1

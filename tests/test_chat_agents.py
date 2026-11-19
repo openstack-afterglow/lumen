@@ -6,6 +6,10 @@ DB 없이 agent_store 를 monkeypatch 하여 라우터 계약만 검증:
 - 허브 검색·복제 위임
 """
 
+import pytest
+
+from lumen.auth import get_principal
+from lumen.main import app
 from lumen.services import agent_store as ags
 
 _URL = "/api/v1/chat/agents"
@@ -177,3 +181,42 @@ class TestOwnership:
             assert agent_id == 7
             assert kwargs["user_id"] == "test-user-123"
             assert kwargs["project_id"] == "test-project-123"
+
+
+@pytest.mark.parametrize("restricted", [False, True], ids=["verified-keystone", "reduced-keystone"])
+async def test_agent_routes_forward_only_verified_domain(client, monkeypatch, restricted):
+    original = app.dependency_overrides[get_principal]
+
+    async def principal():
+        return {
+            **await original(),
+            "credential_class": "keystone",
+            "domain_id": "verified-domain",
+            "credential_restricted": restricted,
+        }
+
+    monkeypatch.setitem(app.dependency_overrides, get_principal, principal)
+    forwarded = []
+
+    async def capture(*_args, **kwargs):
+        forwarded.append(kwargs)
+        return {}
+
+    requests = [
+        ("create_agent", "POST", _URL, {"name": "New", "domain_id": "untrusted"}),
+        ("list_agents", "GET", _URL, None),
+        ("list_public", "GET", f"{_URL}/hub", None),
+        ("get_agent", "GET", f"{_URL}/7", None),
+        ("update_agent", "PATCH", f"{_URL}/7", {"name": "Updated", "domain_id": "untrusted"}),
+        ("delete_agent", "DELETE", f"{_URL}/7", None),
+        ("clone_agent", "POST", f"{_URL}/7/clone", None),
+    ]
+    for operation, method, path, body in requests:
+        monkeypatch.setattr(ags, operation, capture)
+        assert (await client.request(method, path, json=body)).is_success
+    assert len(forwarded) == len(requests)
+    for kwargs in forwarded:
+        # Unverified callers use the store default: exact selected-project legacy rows only.
+        assert kwargs.get("domain_id") == (None if restricted else "verified-domain")
+        assert kwargs["project_id"] == "test-project-123"
+        assert "domain_id" not in kwargs.get("patch", {})

@@ -101,7 +101,8 @@ class ChatMemoryOutbox(Base):
 
     change_seq: Mapped[int] = mapped_column(BIGINT, primary_key=True, autoincrement=True)
     event_key: Mapped[str] = mapped_column(VARCHAR(190), nullable=False, unique=True)
-    memory_id: Mapped[int] = mapped_column(BIGINT, ForeignKey("chat_memories.id", ondelete="RESTRICT"), nullable=False)
+    memory_id: Mapped[int | None] = mapped_column(BIGINT, ForeignKey("chat_memories.id", ondelete="RESTRICT"))
+    vault_note_id: Mapped[int | None] = mapped_column(BIGINT, ForeignKey("memory_vault_notes.id"))
     mutation: Mapped[str] = mapped_column(VARCHAR(20), nullable=False)
     content_hash: Mapped[str] = mapped_column(CHAR(64), nullable=False)
     required_generations: Mapped[list] = mapped_column(JSON, nullable=False)

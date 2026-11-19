@@ -163,6 +163,21 @@ func prepare(parent context.Context, e Envelope) (*executionPlan, error) {
 		}
 	}
 
+	if e.Protocol == "gemini_generate" {
+		if provider != "gemini" || len(body["request"]) == 0 || body["request"][0] != '{' {
+			return nil, errUnsupported
+		}
+		operation := "generateContent"
+		if stream {
+			operation = "streamGenerateContent?alt=sse"
+		}
+		p.body = body["request"]
+		p.target = appendPath(base, "models/"+url.PathEscape(strings.TrimPrefix(model, "models/"))+":"+operation)
+		p.event = geminiNativeEvent()
+		success = true
+		return p, nil
+	}
+
 	// Native same-wire operations intentionally bypass typed round-tripping: unknown native
 	// fields, signed thinking/compaction items and cache-control TTL must survive unchanged.
 	native := (e.Protocol == "responses" && (provider == "openai" || provider == "azure" || (provider == "perplexity" && perplexityAgent(model, e.APIBase)) || provider == "openrouter" || provider == "xai")) ||

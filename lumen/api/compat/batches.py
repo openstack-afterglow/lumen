@@ -137,6 +137,7 @@ async def create_batch(
             project_id=principal["project_id"],
             user_id=principal["user_id"],
             api_key_id=principal.get("api_key_id"),
+            payer=principal.get("payer"),
             scopes=tuple(principal["scopes"]),
             source=principal.get("source", "api"),
             request=body,

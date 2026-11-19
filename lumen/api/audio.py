@@ -43,8 +43,8 @@ def audio_error(exc: Exception) -> HTTPException:
 
 async def admit(payload: SpeechRequest | TranscriptionRequest, *, kind: str, principal: Principal,
                 idempotency_key: UUID, api_provider: str | None = None,
-                required_scopes: tuple[str, ...] | None = None) -> str:
-    body = payload.model_dump(mode="json")
+                required_scopes: tuple[str, ...] | None = None, compat: bool = False) -> str:
+    body = payload.model_dump(mode="json", exclude={"model_row_id"} if payload.model_row_id is None else None)
     body["kind"] = kind
     if api_provider is not None:
         body["provider_id"] = api_provider
@@ -53,11 +53,14 @@ async def admit(payload: SpeechRequest | TranscriptionRequest, *, kind: str, pri
             body, project_id=principal["project_id"], user_id=principal["user_id"],
             client_request_id=str(idempotency_key), source=principal.get("source", "web"),
             api_key_id=principal.get("api_key_id"),
+            payer=principal.get("payer"),
             required_scopes=required_scopes,
             credential_authority=credential_authority_snapshot(principal),
         )
     except (durable_errors.DurableRunError, assets.AssetError, assets.AssetUnavailable,
             ChatStorageUnavailable, credit.QuotaExceeded, ProviderValidationError) as exc:
+        if compat and isinstance(exc, durable_errors.MediaModelAmbiguous):
+            raise HTTPException(status_code=409, detail="model_route_ambiguous") from exc
         raise audio_error(exc) from exc
     return descriptor.run_id
 
@@ -86,6 +89,8 @@ async def completed_audio(run_id: str, *, principal: Principal, request: Request
                     # The hold was released at zero: the refusal is reported with the upstream status class.
                     status, _error_type, refusal = rejection_http_response(terminal.payload.safe_message)
                     raise HTTPException(status_code=status, detail=refusal)
+                if terminal is not None and getattr(terminal.payload, "error_code", None) == "domain_credit_insufficient":
+                    raise HTTPException(status_code=402, detail="domain_credit_insufficient")
                 message = terminal.payload.safe_message if terminal is not None else "Audio run failed"
                 raise HTTPException(status_code=500, detail=message or "Audio run failed")
         except (durable_errors.DurableRunError, assets.AssetError, assets.AssetUnavailable,

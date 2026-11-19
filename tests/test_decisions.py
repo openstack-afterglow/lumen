@@ -18,7 +18,7 @@ from pydantic import ValidationError
 from lumen.api import decisions as native
 from lumen.api.compat import decisions as compat
 from lumen.auth import get_principal
-from lumen.models.decision_contracts import DecisionRequest, InputJSON
+from lumen.models.decision_contracts import DecisionRequest, InputJSON, NativeDecisionRequest
 from lumen.service_authority import SERVICE_CAPABILITIES
 from lumen.services import credit, decisions, stateless_credit
 from lumen.services.api_key_store import ApiKeyForbidden
@@ -271,7 +271,7 @@ async def test_failure_releases_or_retains_unknown(lifecycle, monkeypatch, uncer
     with pytest.raises(decisions.DecisionError):
         await run()
     lifecycle["finish"].assert_awaited_once()
-    assert lifecycle["finish"].call_args.kwargs == {"uncertain": uncertain}
+    assert lifecycle["finish"].call_args.kwargs == {"uncertain": uncertain, "payer": None}
     lifecycle["settle"].assert_not_called()
 
 
@@ -283,7 +283,7 @@ async def test_cancel_after_send_retains_unknown(lifecycle, monkeypatch):
     monkeypatch.setattr(decisions, "transport", cancel_after_dispatch)
     with pytest.raises(asyncio.CancelledError):
         await run()
-    assert lifecycle["finish"].call_args.kwargs == {"uncertain": True}
+    assert lifecycle["finish"].call_args.kwargs == {"uncertain": True, "payer": None}
 
 
 async def test_missing_cache_price_after_response_retains_unknown(lifecycle, monkeypatch):
@@ -291,7 +291,7 @@ async def test_missing_cache_price_after_response_retains_unknown(lifecycle, mon
     with pytest.raises(decisions.DecisionError) as caught:
         await run(selected_route=route(cache_write_price_per_token=None))
     assert caught.value.status_code == 502
-    assert lifecycle["finish"].call_args.kwargs == {"uncertain": True}
+    assert lifecycle["finish"].call_args.kwargs == {"uncertain": True, "payer": None}
 
 
 async def test_quota_failure_never_enters_provider(lifecycle, monkeypatch):
@@ -352,13 +352,18 @@ async def test_real_synthetic_http_success_all_answer_types(lifecycle, monkeypat
     monkeypatch.setenv("NO_PROXY", "")
     monkeypatch.setenv("no_proxy", "")
     with fake_provider(payload) as (base, calls):
-        result = await run(body, route(api_base=base))
+        result = await decisions.decide(
+            route=route(api_base=base),
+            body=NativeDecisionRequest.model_validate({**body, "model": None, "model_row_id": 12}),
+            user_id="u", project_id="p", api_key_id=3, required_scopes=("native:runs:write",),
+        )
     assert result["model"] == "gpt-6-luna"
     assert [a["type"] for a in result["answers"]] == ["predicate", "choice", "score", "refusal"]
     assert result["cost_usd"] == 0.00000845
     assert len(calls) == 1 and calls[0][0] == "/v1/decisions"
     assert calls[0][1]["Authorization"] == f"Bearer {route()['api_key']}"
     assert calls[0][2]["model"] == "upstream-luna"
+    assert "model_row_id" not in calls[0][2]
     settled = lifecycle["settle"].call_args.kwargs
     assert settled["usage_components"][0]["category"] == "decision"
     assert "Package" not in str(settled) and "damaged" not in str(settled)
@@ -380,10 +385,10 @@ async def test_connection_failure_releases_hold(lifecycle):
         pass
     with pytest.raises(decisions.DecisionError):
         await run(selected_route=route(api_base=base))
-    assert lifecycle["finish"].call_args.kwargs == {"uncertain": False}
+    assert lifecycle["finish"].call_args.kwargs == {"uncertain": False, "payer": None}
 
 
-def principal(auth_type="api_key", scopes=("compat:completions:write", "native:runs:write")):
+def principal(auth_type="api_key", scopes=("decisions:write",)):
     return {"auth_type": auth_type, "user_id": "u", "project_id": "p", "api_key_id": 3 if auth_type == "api_key" else None,
             "source": "api", "scopes": scopes, "roles": ["member", *SERVICE_CAPABILITIES], "is_system_admin": False}
 
@@ -408,8 +413,29 @@ def test_compat_and_native_routes(path, auth_type, native_result, monkeypatch):
     reply = client(principal(auth_type)).post(path, json=request())
     assert reply.status_code == 200
     assert reply.json() == (result if native_result else {key: result[key] for key in ("model", "answers", "usage")})
-    assert call.call_args.kwargs["required_scopes"] == (("native:runs:write",) if native_result else ("compat:completions:write",))
+    assert call.call_args.kwargs["required_scopes"] == ("decisions:write",)
     assert call.call_args.kwargs["source"] == ("api" if auth_type == "api_key" else "web")
+
+
+def test_native_http_exact_row_checks_name_without_changing_openai_wire(monkeypatch):
+    selected = route(model_id=12, provider_id=2)
+    exact = AsyncMock(return_value=selected)
+    legacy = AsyncMock(side_effect=decisions.errors.AmbiguousModelRouteError("duplicate model"))
+    monkeypatch.setattr(decisions.routing, "resolve_model_by_id", exact)
+    monkeypatch.setattr(decisions.routing, "resolve_api_model", legacy)
+    run = AsyncMock(return_value=response())
+    monkeypatch.setattr(decisions, "decide", run)
+    http = client()
+    assert http.post("/v1/chat/decisions", json=request(model=None, model_row_id=12)).status_code == 200
+    exact.assert_awaited_once_with(12, model_kind=("text", "decision"), required_capabilities=("decisions",))
+    assert run.await_args.kwargs["route"]["provider_id"] == 2
+    legacy.assert_not_called()
+    wrong = http.post("/v1/chat/decisions", json=request(model="different", model_row_id=12))
+    assert (wrong.status_code, wrong.json()["detail"]) == (422, "model_selection_mismatch")
+    assert http.post("/v1/chat/decisions", json=request()).status_code == 409
+    assert http.post("/v1/decisions", json=request(model_row_id=12)).status_code == 422
+    assert http.post("/v1/decisions", json=request()).status_code == 409
+    run.assert_awaited_once()
 
 
 def test_routes_reject_wrong_auth_or_scopes_before_resolve(monkeypatch):
@@ -470,7 +496,7 @@ async def test_oversized_upstream_response_keeps_unknown_hold(lifecycle, monkeyp
         with pytest.raises(decisions.DecisionError, match="size limit"):
             await run(selected_route=route(api_base=base))
     assert len(calls) == 1
-    assert lifecycle["finish"].call_args.kwargs == {"uncertain": True}
+    assert lifecycle["finish"].call_args.kwargs == {"uncertain": True, "payer": None}
 
 
 @pytest.mark.parametrize("base,expected", [
@@ -509,7 +535,7 @@ async def test_credential_resolution_failure_releases_before_dispatch(lifecycle,
     with pytest.raises(expected):
         await run()
     lifecycle["reserve"].assert_awaited_once()
-    assert lifecycle["finish"].call_args.kwargs == {"uncertain": False}
+    assert lifecycle["finish"].call_args.kwargs == {"uncertain": False, "payer": None}
     transport.assert_not_called()
     lifecycle["settle"].assert_not_called()
 
@@ -583,7 +609,7 @@ async def test_real_compatible_input_only_route_refuses_inherited_cache_write(li
     with pytest.raises(decisions.DecisionError, match="no valid rate"):
         await run(selected_route=selected)
     lifecycle["settle"].assert_not_called()
-    assert lifecycle["finish"].call_args.kwargs == {"uncertain": True}
+    assert lifecycle["finish"].call_args.kwargs == {"uncertain": True, "payer": None}
     # The missing tier must not resurrect the inherited base rate above threshold.
     with pytest.raises(decisions.DecisionError, match="pricing unavailable"):
         decisions.decision_cost(selected, usage(inputs=272001, cached=0, written=10))

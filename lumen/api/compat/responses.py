@@ -12,7 +12,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from lumen.auth import ensure_scopes, require_api_key_scopes
 from lumen.models.api_requests import ResponsesRequest
 from lumen.services import completion_api as core
-from lumen.services.inference_authority import completion_scopes
+from lumen.services.inference_authority import HOSTED_TOOL_CODE, completion_scopes, hosted_tool_message, hosted_tools
 from lumen.services.infrastructure.api_load import admit_sse, register_sse_resource
 
 from .streaming import events_with_ping
@@ -45,7 +45,10 @@ async def responses(
     x_lumen_provider: str | None = Header(default=None, alias="X-Lumen-Provider"),
     token_info: dict = Depends(require_api_key_scopes("compat:completions:write")),
 ):
-    ensure_scopes(token_info, *completion_scopes(body.model_dump(exclude_none=True)))
+    request_body = body.model_dump(exclude_none=True)
+    if hosted := hosted_tools(request_body):
+        return responses_error(403, hosted_tool_message(hosted), code=HOSTED_TOOL_CODE)
+    ensure_scopes(token_info, *completion_scopes(request_body))
     if body.store is True:
         return responses_error(400, "store=true is not supported", code="stateful_responses_not_supported")
     if body.previous_response_id is not None or body.conversation is not None:
@@ -57,7 +60,8 @@ async def responses(
     try:
         provider = core.select_api_provider(body.provider, x_lumen_provider)
         resolved = await core.resolve_api(body.model, provider=provider, operation="responses")
-        await core.precheck(token_info["user_id"], token_info["project_id"], api_key_id=token_info.get("api_key_id"))
+        await core.precheck(token_info["user_id"], token_info["project_id"], api_key_id=token_info.get("api_key_id"),
+                            payer=token_info.get("payer"))
         options = body.model_dump(
             exclude={
                 "model",
@@ -79,6 +83,7 @@ async def responses(
             user_id=token_info["user_id"],
             project_id=token_info["project_id"],
             api_key_id=token_info.get("api_key_id"),
+            payer=token_info.get("payer"),
             options=options,
         )
     except core.CompletionError as exc:

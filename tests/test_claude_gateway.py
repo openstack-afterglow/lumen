@@ -9,6 +9,7 @@ from starlette.requests import Request
 
 from lumen import auth
 from lumen.main import app
+from lumen.models.billing import Payer
 from lumen.models.chat_db import ChatGatewayDeviceGrant
 from lumen.services import api_key_store
 from lumen.services import claude_gateway as gateway
@@ -35,6 +36,7 @@ def gateway_auth():
             "credential_kind": "claude_gateway",
             "expires_at": datetime.now(UTC) + timedelta(hours=1),
             "source": "api",
+            "payer": Payer("user", "user-1", None),
             "roles": ["member", "lumen-inventory_reader", "lumen-chat_user"],
             "is_system_admin": False,
         }
@@ -160,6 +162,9 @@ async def test_identical_dual_headers_work_but_mismatch_is_rejected(client, gate
 
     async def verify(raw):
         return {
+            "credential_class": "claude_gateway",
+            "auth_type": "api_key",
+            "source": "api",
             "user_id": "user-1",
             "project_id": "project-1",
             "api_key_id": 19,
@@ -216,7 +221,11 @@ async def test_managed_settings_support_conditional_etag(client, gateway_auth, m
     assert second.headers["etag"] == etag
 
 
-async def test_gateway_fixed_scope_denies_client_tools_before_resolution(client, gateway_auth, monkeypatch):
+@pytest.mark.parametrize("server_tool", [
+    {"tools": [{"type": "web_search_20250305", "name": "web_search"}]},
+    {"tool_choice": {"type": "web_search_20250305"}},
+])
+async def test_gateway_denies_server_tools_before_resolution(client, gateway_auth, monkeypatch, server_tool):
     from unittest.mock import AsyncMock
 
     resolve = AsyncMock()
@@ -224,10 +233,10 @@ async def test_gateway_fixed_scope_denies_client_tools_before_resolution(client,
     response = await client.post(
         f"{_GATEWAY}/v1/messages", headers=_HEADERS,
         json={"model": "client-alias", "messages": [{"role": "user", "content": "hello"}],
-              "max_tokens": 100, "tools": [{"name": "read", "description": "read",
-                                           "input_schema": {"type": "object"}}]},
+              "max_tokens": 100, **server_tool},
     )
     assert response.status_code == 403
+    assert "server_tool_not_allowed_for_key" in response.text
     resolve.assert_not_awaited()
 
 
@@ -240,7 +249,7 @@ async def test_gateway_messages_use_configured_route_and_preserve_native_blocks(
         return {"model_name": model, "provider_name": provider}
 
     async def precheck(*args, **kwargs):
-        return None
+        captured["precheck_payer"] = kwargs.get("payer")
 
     async def complete(**kwargs):
         captured.update(kwargs)
@@ -270,6 +279,8 @@ async def test_gateway_messages_use_configured_route_and_preserve_native_blocks(
             "thinking": {"type": "enabled", "budget_tokens": 12000},
             "context_management": {"edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
             "output_config": {"effort": "high"},
+            # Claude Code's own tools: forwarded declarations, executed by the client.
+            "tools": [{"name": "Bash", "input_schema": {"type": "object"}}],
         },
     )
     assert response.status_code == 200
@@ -279,10 +290,13 @@ async def test_gateway_messages_use_configured_route_and_preserve_native_blocks(
     assert captured["options"]["thinking"]["budget_tokens"] == 12000
     assert captured["options"]["context_management"]["edits"][0]["keep"] == "all"
     assert captured["options"]["output_config"] == {"effort": "high"}
+    assert captured["options"]["tools"] == [{"name": "Bash", "input_schema": {"type": "object"}}]
     assert captured["options"]["anthropic_headers"] == {
         "anthropic-beta": "context-management-2025-06-27",
         "anthropic-version": "2023-06-01",
     }
+    # The server-side principal payer reaches both the precheck and the bounded hold.
+    assert captured["precheck_payer"] == captured["payer"] == Payer("user", "user-1", None)
 
 
 async def test_gateway_count_tokens_does_not_require_generation_budget(client, gateway_auth, monkeypatch):

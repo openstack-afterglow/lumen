@@ -15,7 +15,7 @@ from lumen.models.chat_runs import (
     ChatTempThread,
     ChatToolApproval,
 )
-from lumen.services import worker_routing
+from lumen.services import credit, worker_routing
 from lumen.services.run_protocol_v2 import transition_allowed
 from lumen.services.run_store import (
     NONTERMINAL,
@@ -128,10 +128,15 @@ async def _request_cancelled_transaction(
     factory = _factory()
     wake_parent: str | None = None
     async with factory() as session, session.begin():
+        await worker_routing.use_read_committed(session)
         try:
             identity = await load_owned_run(session, run_id, user_id=user_id, project_id=project_id, lock=False)
         except RunStoreError as exc:
             raise DurableRunNotFound(str(exc)) from exc
+        payer = credit.run_payer(identity)
+        if payer.domain_id is not None:
+            await credit.lock_payer(session, payer, user_id=identity.user_id,
+                                    project_id=identity.project_id, api_key_id=identity.api_key_id)
         # Root cancellation is a barrier committed under the global lock order before any further
         # child dispatch; a child cancels itself only after its lineage is locked root-first.
         order = budgets.LockOrder()
@@ -316,10 +321,15 @@ async def fail_waiting_run(
     async def transaction() -> tuple[bool, str | None]:
         order = budgets.LockOrder()
         async with _factory()() as session, session.begin():
+            await worker_routing.use_read_committed(session)
             identity = (await session.execute(select(ChatRun).where(ChatRun.id == run_id))).scalar_one_or_none()
             if (identity is None or identity.status not in {"waiting_resource", "queued"}
                     or (require_unstarted and int(identity.lease_fence or 0) != 0)):
                 return False, None
+            payer = credit.run_payer(identity)
+            if payer.domain_id is not None:
+                await credit.lock_payer(session, payer, user_id=identity.user_id,
+                                        project_id=identity.project_id, api_key_id=identity.api_key_id)
             quota = None
             root = None
             has_children = (

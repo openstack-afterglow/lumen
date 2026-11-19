@@ -83,7 +83,7 @@ def test_frozen_output_and_tool_bounds_fail_closed_without_capacity(monkeypatch)
 async def test_managed_fetch_settles_actual_from_frozen_prices_once():
 
     run = SimpleNamespace(
-        id="root", project_id="project", parent_run_id=None, root_run_id=None,
+        id="root", user_id="user", payer_domain_id=None, project_id="project", parent_run_id=None, root_run_id=None,
         model_name="model", credit_ceiling=Decimal("2"), reserved_credits=Decimal("0"),
         descendant_credits_reserved=Decimal("0"),
         pricing_snapshot={
@@ -118,12 +118,12 @@ async def test_managed_fetch_settles_actual_from_frozen_prices_once():
 async def test_child_parent_overrun_and_unknown_replay_preserve_headroom():
     quota = SimpleNamespace(project_id="project", max_credit_reservation=Decimal("10"), credits_reserved=Decimal("1"))
     root = SimpleNamespace(
-        id="root", project_id="project", parent_run_id=None, root_run_id=None,
+        id="root", user_id="user", payer_domain_id=None, project_id="project", parent_run_id=None, root_run_id=None,
         credit_ceiling=Decimal("1.5"), reserved_credits=Decimal("0"),
         descendant_credits_reserved=Decimal("1"), reservation_released_at=None,
     )
     child = SimpleNamespace(
-        id="child", project_id="project", parent_run_id="root", root_run_id="root",
+        id="child", user_id="user", payer_domain_id=None, project_id="project", parent_run_id="root", root_run_id="root",
         credit_ceiling=Decimal("1"), reserved_credits=Decimal("0"),
     )
     allocation = SimpleNamespace(
@@ -205,7 +205,8 @@ async def test_modality_prices_bound_actual_child_usage_and_reject_underfunding(
                            credit_ceiling=Decimal("100"), reserved_credits=Decimal("0"),
                            descendant_credits_reserved=Decimal("0.5"))
     child = SimpleNamespace(
-        id="child", project_id="project", parent_run_id="root", root_run_id="root", model_name="model",
+        id="child", user_id="user", payer_domain_id=None, project_id="project", parent_run_id="root", root_run_id="root",
+        model_name="model",
         credit_ceiling=Decimal("0.5"), reserved_credits=Decimal("0"),
         capability_snapshot={"capabilities": {"context_limit": 10}},
         pricing_snapshot={"input_price_per_token": "0", "output_price_per_token": "0",
@@ -288,6 +289,7 @@ async def test_frozen_main_summary_modality_rates_survive_edits_and_reach_ledger
     capabilities, pricing = chat_admission._run_snapshots(route, {}, summary_route=summary)
     pricing["chat_credit_per_usd"] = "1"
     run = SimpleNamespace(id="root", user_id="user", project_id="project", conversation_id=None, api_key_id=None,
+                          payer_domain_id=None,
                           model_name="main", pricing_snapshot=pricing, capability_snapshot=capabilities)
     route["media_pricing"]["token_rates"]["audio"]["input_per_million"] = "9000000"
     summary["media_pricing"]["token_rates"]["audio"]["input_per_million"] = "9000000"

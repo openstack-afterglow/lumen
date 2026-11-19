@@ -17,6 +17,10 @@ class DurableRunInputError(DurableRunError):
     pass
 
 
+class MediaModelAmbiguous(DurableRunInputError):
+    """A legacy model selector matched several media routes."""
+
+
 class RealtimeKindMismatch(DurableRunInputError):
     """A realtime model was requested on an endpoint that serves a different realtime kind."""
 

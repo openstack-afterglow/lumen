@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from lumen.auth import require_api_key_scopes
+from lumen.services.inference_authority import principal_may_use
 from lumen.services.providers import errors, routing
 
 from .openai import openai_error_dict
@@ -56,9 +57,10 @@ class CliModelListResponse(BaseModel):
     openapi_extra={"security": [{"APIKeyBearer": []}, {"XApiKey": []}]},
 )
 async def list_cli_models(token_info: dict = Depends(require_api_key_scopes("models:read"))):
-    del token_info
     try:
-        models = await routing.list_cli_models()
+        # Same intrinsic-scope rule as dispatch: model keys never see Sonar routes.
+        models = [row for row in await routing.list_cli_models()
+                  if principal_may_use(token_info, row["required_scopes"])]
     except errors.ChatStorageUnavailable:
         # An empty 200 would read as "no models"; installers must not rewrite config from it.
         return JSONResponse(

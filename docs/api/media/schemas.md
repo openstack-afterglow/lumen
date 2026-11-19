@@ -8,7 +8,10 @@ Each section lists the fields of one component schema referenced by this group's
 
 | Field | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
-| `image` | string (binary) | yes | — | Image |
+| `image` | array of string (binary) \| null | no | — | Image |
+| `image[]` | array of string (binary) \| null | no | — | Image[] |
+| `mask` | string (binary) \| null | no | — | Mask |
+| `markup` | string (binary) \| null | no | — | Markup |
 | `prompt` | string | yes | — | Prompt |
 | `model` | string | yes | — | Model |
 | `provider` | string \| null | no | — | Provider |
@@ -16,6 +19,16 @@ Each section lists the fields of one component schema referenced by this group's
 | `n` | integer | no | `1` | N |
 | `size` | string | no | `"auto"` | Size |
 | `quality` | string | no | `"auto"` | Quality |
+| `complexity` | string \| null | no | — | Complexity |
+| `background` | string \| null | no | — | Background |
+| `output_format` | string \| null | no | — | Output Format |
+| `output_compression` | integer \| null | no | — | Output Compression |
+| `frame_count` | integer \| null | no | — | Frame Count |
+| `frame_duration_ms` | integer \| null | no | — | Frame Duration Ms |
+| `input_fidelity` | string \| null | no | — | Input Fidelity |
+| `moderation` | string \| null | no | — | Moderation |
+| `stream` | boolean \| null | no | — | Stream |
+| `partial_images` | integer \| null | no | — | Partial Images |
 | `response_format` | string | no | `"b64_json"` | Response Format |
 
 ### Body_transcriptions_v1_audio_transcriptions_post
@@ -53,43 +66,97 @@ Each section lists the fields of one component schema referenced by this group's
 
 | Field | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
-| `model_id` | string | yes | — | Model Id (max 190 chars) |
-| `provider_id` | integer \| null | no | — | Provider Id |
+| `model_id` | string \| null | no | — | Model Id |
+| `model_row_id` | integer \| null | no | — | Model Row Id |
+| `background` | enum: `transparent`, `opaque`, `auto` \| null | no | — | Background |
+| `output_format` | enum: `png`, `jpeg`, `webp`, `gif`, `svg` \| null | no | — | Output Format |
+| `output_compression` | integer \| null | no | — | Output Compression |
+| `frame_count` | integer \| null | no | — | Frame Count |
+| `frame_duration_ms` | integer \| null | no | — | Frame Duration Ms |
+| `stream` | const `False` \| null | no | — | Stream |
+| `partial_images` | const `0` \| null | no | — | Partial Images |
+| `moderation` | enum: `auto`, `low` \| null | no | — | Moderation |
+| `svg_model` | string \| null | no | — | Svg Model |
+| `svg_reasoning_effort` | string \| null | no | — | Svg Reasoning Effort |
 | `prompt` | string | yes | — | Prompt |
 | `size` | string | no | `"auto"` | Size |
 | `quality` | string | no | `"auto"` | Quality |
+| `complexity` | enum: `low`, `medium`, `high` \| null | no | — | Complexity |
 | `n` | integer | no | `1` | N (numeric lower bound) |
-| `input_asset_id` | string (uuid) | yes | — | Input Asset Id |
+| `provider_id` | integer \| null | no | — | Provider Id |
+| `input_asset_id` | string (uuid) \| null | no | — | Input Asset Id |
+| `input_asset_ids` | array of string (uuid) \| null | no | — | Input Asset Ids |
+| `mask_asset_id` | string (uuid) \| null | no | — | Mask Asset Id |
+| `markup_asset_id` | string (uuid) \| null | no | — | Markup Asset Id |
+| `input_fidelity` | enum: `low`, `high` \| null | no | — | Input Fidelity |
 
 ### ImageGenerationRequest
 
 | Field | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
-| `model_id` | string | yes | — | Model Id (max 190 chars) |
-| `provider_id` | integer \| null | no | — | Provider Id |
+| `model_id` | string \| null | no | — | Model Id |
+| `model_row_id` | integer \| null | no | — | Model Row Id |
+| `background` | enum: `transparent`, `opaque`, `auto` \| null | no | — | Background |
+| `output_format` | enum: `png`, `jpeg`, `webp`, `gif`, `svg` \| null | no | — | Output Format |
+| `output_compression` | integer \| null | no | — | Output Compression |
+| `frame_count` | integer \| null | no | — | Frame Count |
+| `frame_duration_ms` | integer \| null | no | — | Frame Duration Ms |
+| `stream` | const `False` \| null | no | — | Stream |
+| `partial_images` | const `0` \| null | no | — | Partial Images |
+| `moderation` | enum: `auto`, `low` \| null | no | — | Moderation |
+| `svg_model` | string \| null | no | — | Svg Model |
+| `svg_reasoning_effort` | string \| null | no | — | Svg Reasoning Effort |
 | `prompt` | string | yes | — | Prompt |
 | `size` | string | no | `"auto"` | Size |
 | `quality` | string | no | `"auto"` | Quality |
+| `complexity` | enum: `low`, `medium`, `high` \| null | no | — | Complexity |
 | `n` | integer | no | `1` | N (numeric lower bound) |
+| `provider_id` | integer \| null | no | — | Provider Id |
 
 ### OpenAIImageGenerationRequest
 
 | Field | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
+| `background` | enum: `transparent`, `opaque`, `auto` \| null | no | — | Background |
+| `output_format` | enum: `png`, `jpeg`, `webp`, `gif`, `svg` \| null | no | — | Output Format |
+| `output_compression` | integer \| null | no | — | Output Compression |
+| `frame_count` | integer \| null | no | — | Frame Count |
+| `frame_duration_ms` | integer \| null | no | — | Frame Duration Ms |
+| `stream` | const `False` \| null | no | — | Stream |
+| `partial_images` | const `0` \| null | no | — | Partial Images |
+| `moderation` | enum: `auto`, `low` \| null | no | — | Moderation |
+| `svg_model` | string \| null | no | — | Svg Model |
+| `svg_reasoning_effort` | string \| null | no | — | Svg Reasoning Effort |
+| `prompt` | string | yes | — | Prompt |
+| `size` | string | no | `"auto"` | Size |
+| `quality` | string | no | `"auto"` | Quality |
+| `complexity` | enum: `low`, `medium`, `high` \| null | no | — | Complexity |
+| `n` | integer | no | `1` | N (numeric lower bound) |
 | `model` | string | yes | — | Model (max 190 chars) |
 | `provider` | string \| null | no | — | Provider |
 | `provider_id` | integer \| null | no | — | Provider Id |
-| `prompt` | string | yes | — | Prompt |
-| `n` | integer | no | `1` | N (numeric lower bound) |
-| `size` | string | no | `"auto"` | Size |
-| `quality` | string | no | `"auto"` | Quality |
 | `response_format` | string | no | `"b64_json"` | Response Format |
+| `svg` | [OpenAIImageSvgOptions](#openaiimagesvgoptions) \| null | no | — |  |
+
+### OpenAIImageSvgOptions
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `model` | string | yes | — | Model (max 190 chars) |
+| `reasoning` | [OpenAIImageSvgReasoning](#openaiimagesvgreasoning) \| null | no | — |  |
+
+### OpenAIImageSvgReasoning
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `effort` | string \| null | no | — | Effort |
 
 ### RealtimeSessionRequest
 
 | Field | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
-| `model_id` | string | yes | — | Model Id (max 190 chars) |
+| `model_id` | string \| null | no | — | Model Id |
+| `model_row_id` | integer \| null | no | — | Model Row Id |
 | `provider_id` | string \| integer \| null | no | — | Provider Id |
 | `kind` | enum: `conversation`, `transcription`, `translation`, `live` | no | `"conversation"` | Kind |
 | `voice` | string \| null | no | — | Voice |
@@ -104,7 +171,8 @@ Each section lists the fields of one component schema referenced by this group's
 
 | Field | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
-| `model_id` | string | yes | — | Model Id (max 190 chars) |
+| `model_id` | string \| null | no | — | Model Id |
+| `model_row_id` | integer \| null | no | — | Model Row Id |
 | `provider_id` | integer \| string \| null | no | — | Provider Id |
 | `input` | string | yes | — | Input (max 4096 chars) |
 | `voice` | string | yes | — | Voice (max 190 chars) |
@@ -114,7 +182,8 @@ Each section lists the fields of one component schema referenced by this group's
 
 | Field | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
-| `model_id` | string | yes | — | Model Id (max 190 chars) |
+| `model_id` | string \| null | no | — | Model Id |
+| `model_row_id` | integer \| null | no | — | Model Row Id |
 | `provider_id` | integer \| string \| null | no | — | Provider Id |
 | `input_asset_id` | string (uuid) | yes | — | Input Asset Id |
 | `language` | string \| null | no | — | Language |

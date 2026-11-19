@@ -4,63 +4,79 @@
 
 | 방식 | 헤더 | 용도 |
 | --- | --- | --- |
-| Lumen API 키 | `Authorization: Bearer <key>` 또는 `x-api-key: <key>` | `/v1` 호출 전반. 두 헤더에 같은 키가 함께 있으면 허용되고, 다른 키면 400이다. |
+| Lumen 모델 API 키 | `Authorization: Bearer <key>`, `X-API-Key: <key>` 또는 Gemini의 `X-Goog-Api-Key: <key>` | 개인·서비스 키 모두 아래 허용된 모델 API만 호출할 수 있다. |
 | Keystone 토큰 | `X-Auth-Token: <token>` 또는 `Authorization: Bearer <token>` | 네이티브 경로 전반, MCP 연결 관리, API 키 발급. 프로젝트 범위 토큰이어야 한다. |
 
 - 호환 텍스트 경로(`/v1/models`, `/v1/cli/models`, `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`)는 API 키만 받는다. Keystone 토큰은 401이다.
 - `X-Project-Id`는 연결 범위 프로젝트다.
 - `X-Target-Project-Id`는 시스템 관리자가 다른 프로젝트를 대상으로 관리 작업을 할 때만 쓴다. 프로젝트 범위가 없고 대상도 없는 시스템 토큰은 관리 경로에서 401이다(`Project-scoped Keystone token or explicit admin target required`). 2026-11-10 로컬 검증에서 확인했다.
+- 개인·서비스 키에는 프로젝트 권한이 없다. `X-Project-Id`와 `X-Target-Project-Id`는 두 키의 인증, 사용량, 결제를 바꾸지 않는다. Claude Gateway 자격 증명은 기존 프로젝트 바인딩을 유지한다.
 
 ## 권한 모델
 
 - 네이티브 경로의 권한은 Keystone의 현재 유효 역할을 Lumen의 `oslo.policy`로 평가한다. 표준 `admin`, `manager`, `member`는 소유 자원을 관리하고, `reader`는 비밀이 아닌 자원만 읽는다.
 - `/v1/admin/...` 경로는 등록된 `system:admin` 정책과 검증된 사람 시스템 권한을 모두 요구한다. 프로젝트 admin은 시스템 관리자가 아니다.
-- API 키의 scope는 아래 표에서만 고른다. 키는 발급자의 현재 권한을 넘을 수 없다.
-- 키 관리 자체(`native:keys:*`)는 키로 발급할 수 없다. Keystone 토큰으로만 한다.
 
 ## API 키 발급
 
-`POST /v1/api-keys`는 Keystone 토큰만 받는다. 키 값은 응답에 한 번만 나온다. 저장되는 것은 해시다.
+`POST /v1/api-keys`는 Keystone 토큰만 받는다. 발급 시에는 현재 Keystone 역할과 정책이 요청 scope를 허용해야 한다. 개인 키는 사용자가 소유하고 사용자 지갑을 사용한다. 원래 발급에 쓴 프로젝트와 무관하게 본인 키를 조회·수정·폐기한다. 키 값은 응답에 한 번만 나온다. 저장되는 것은 해시다.
 
 ```http
 POST /v1/api-keys
 X-Auth-Token: <keystone-project-token>
-X-Project-Id: <project-id>
 Content-Type: application/json
 
-{"name": "afterglow-backend", "scopes": ["models:read", "compat:completions:write", "usage:read"]}
+{"name": "afterglow-backend", "scopes": ["models:read", "compat:completions:write"]}
 ```
 
 `scopes`를 생략하면 `models:read`와 `compat:completions:write`가 기본값이다. 목록 조회는 `GET /v1/api-keys`, 폐기는 `DELETE /v1/api-keys/{key_id}`다.
 
+## 서비스 키
+
+`GET/POST /v1/service-keys`, `GET /v1/service-keys/issuance-policy`, `PATCH /v1/service-keys/{id}/limits`, `DELETE /v1/service-keys/{id}`는 현재 도메인의 관리자만 호출할 수 있다. 요청마다 Keystone 사람 세션과 현재 도메인 관리자 권한을 확인한다. 요청에 다른 도메인을 지정하지 않는다. `GET /v1/admin/service-keys`는 시스템 관리자용 전체 인벤토리다.
+
+`GET /v1/service-keys/issuance-policy`는 `POST /v1/service-keys`가 받는 scope를 그대로 반환한다. 관리자 자신의 프로젝트 역할은 결과를 좁히지 않는다.
+
+```json
+{"domain_id": "<domain>", "allowed_scopes": ["compat:audio:write", "..."],
+ "default_scopes": ["models:read", "compat:completions:write"],
+ "scope_routes": {"embeddings:write": ["POST /v1/chat/embeddings", "POST /v1/embeddings", "..."]}}
+```
+
+서비스 키는 발급자가 아니라 도메인이 소유한다. 발급자의 관리자 역할이 사라져도 키는 유효하다. 도메인이 비활성화 또는 삭제되거나 키가 만료·폐기되면 인증을 거부한다. 서비스 키 사용량은 도메인 선불 풀에서 차감한다. 개별 키의 월·주 한도는 도메인 풀 한도와 별도로 적용된다.
+
 ## API 키로 발급 가능한 scope
 
-출처: `lumen/service_authority.py::SCOPE_CAPABILITIES`(발급 가능 여부는 `api_key_store.API_KEY_SCOPES`). 아래 표는 2026-11-10 소스 기준 전체 목록이다. 키 관리 scope 3개(`native:keys:read`, `native:keys:write`, `native:keys:delete`)는 발급 불가라 제외했다.
+출처: `lumen/service_authority.py::MODEL_API_KEY_ROUTE_SCOPES`. HTTP 메서드와 실제 등록된 경로가 모두 허용 목록에 있어야 한다.
 
-| scope | 필요한 capability 항목(`service_authority.SCOPE_CAPABILITIES`) | 쓰는 기능 |
-| --- | --- | --- |
-| `models:read` | `lumen-inventory_reader` | 모델 목록 (`/v1/models`, `/v1/chat/models`) |
-| `usage:read` | `lumen-inventory_reader` | 사용량 기록 |
-| `compat:completions:write` | `lumen-chat_user` | Chat Completions, Responses, Messages |
-| `compat:images:write` | `lumen-images_user` | 호환 이미지 생성 |
-| `compat:audio:write` | `lumen-audio_user` | 호환 음성 |
-| `compat:realtime:write` | `lumen-audio_user` | 호환 실시간 음성 |
-| `compat:files:read`, `compat:files:write`, `compat:files:delete` | `inventory_reader`, `assets_editor`, `resources_admin` | 호환 Files |
-| `compat:batches:read`, `compat:batches:write` | `history_reader`, `chat_user`/`images_user`/`audio_user` | 호환 Batch |
-| `native:runs:read` | `lumen-history_reader` | run 조회, 이벤트 스트림 |
-| `native:runs:write` | `lumen-chat_user` | 완료 요청 시작, 취소, 승인 |
-| `native:conversations:read`, `native:conversations:write`, `native:conversations:delete` | `history_reader`, `chat_user`, `history_editor` | 대화 |
-| `native:memory:read`, `native:memory:write`, `native:memory:delete` | `history_reader`, `history_editor`, `history_editor` | 메모리 |
-| `native:agents:read`, `native:agents:use`, `native:agents:write`, `native:agents:delete` | `inventory_reader`, `tools_user`, `agents_editor`, `resources_admin` | agent |
-| `native:assets:read`, `native:assets:write`, `native:assets:delete` | `inventory_reader`, `assets_editor`, `resources_admin` | asset |
-| `native:extensions:read`, `native:extensions:write`, `native:extensions:delete` | `inventory_reader`, `assets_editor`, `resources_admin` | 커스텀 도구·확장 |
-| `native:tools:execute` | `lumen-tools_user` | 도구 실행이 필요한 run |
-| `native:images:write`, `native:audio:write`, `native:realtime:write` | 각 `*_user` | 네이티브 이미지·음성·실시간 |
-| `native:batches:read`, `native:batches:write` | `history_reader`, `chat_user`/`images_user`/`audio_user` | 네이티브 Batch |
+| Scope | 엔드포인트 |
+| --- | --- |
+| `models:read` | `GET /v1/models`, `/v1/cli/models`, `/v1/chat/models`, `/v1beta/models`, `/v1beta/models/{model}` |
+| `compat:completions:write` | `POST /v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/messages/count_tokens`, `/v1beta/models/{model}:generateContent`, `:streamGenerateContent`, `:countTokens` |
+| `embeddings:write` | `POST /v1/embeddings`, `/v1/chat/embeddings`, `/v1beta/models/{model}:embedContent`, `/v1beta/models/{model}:batchEmbedContents` |
+| `decisions:write` | `POST /v1/decisions`, `/v1/chat/decisions`, `/v1beta/decisions` |
+| `compat:images:write` | `POST /v1/images/generations`, `/v1/images/edits` |
+| `compat:audio:write` | `POST /v1/audio/speech`, `/v1/audio/transcriptions` |
+| `native:audio:write` | `POST /v1/chat/audio/speech` |
+| `compat:realtime:write` | WebSocket `/v1/realtime`, `/v1/realtime/translations`, `/v1/live/sessions`, `/v1beta/realtime` |
 
-MCP 연결 관리(`/v1/mcp-servers`, activation, OAuth)는 API 키 scope가 없다. Keystone 토큰과 정책으로만 호출한다. `mcp:read`, `mcp:write`라는 scope는 존재하지 않는다.
+모델 키로 대화와 실행 기록, 메모리, 서버 도구, MCP, 에이전트, 확장, 에셋, Batch/Files, 클라우드 도구 또는 키 관리에 접근할 수 없다. 결과를 반환하지 않는 네이티브 이미지·실시간 실행 요청이나 에셋 권한이 필요한 네이티브 음성 전사 대신, 결과를 직접 반환하는 호환 API를 사용한다.
 
-완료 요청은 조건부 scope를 추가로 요구한다. 예: `features.memory=true`이면 `native:memory:read`와 `native:memory:write`, 도구 정책이 켜져 있으면 `native:tools:execute`, 스킬이나 확장을 선택하면 `native:extensions:read`, `agent_id`를 지정하면 `native:agents:use`다. 정확한 조건은 [reference.md](reference.md)의 Scopes 열과 `x-conditional-api-key-scopes`를 본다.
+키 목록·조회 응답(`GET /v1/api-keys`, `GET /v1/service-keys`, `GET /v1/admin/service-keys`, 관리자 키 인벤토리)의 `scopes`는 저장된 값이 아니라 인증 시 실제로 적용되는 위 표의 scope만 반환한다. 038에서 개인 키로 전환된 기존 키(`created_by_user_id`가 없는 행)에 남은 `native:*` scope는 저장 데이터에 그대로 두지만 효력이 없으므로 표시하지 않는다. 이 전환 키는 0.6.20과 같은 접근을 유지하도록 `compat:completions:write` 또는 `native:runs:write`가 있으면 `embeddings:write`와 `decisions:write`도 가지며, 목록에도 그렇게 표시된다. 새로 발급한 키에는 이 별칭이 없다.
+
+호환 완료 API는 클라이언트가 선언하고 직접 실행하는 도구를 그대로 전달한다. Lumen은 모델의 도구 호출만 반환하고 실행하지 않는다. 허용하는 도구는 OpenAI `function`/`custom`/`local_shell`/`apply_patch`와 `environment.type`이 `local`인 `shell`, Anthropic 사용자 정의 도구(`type` 없음 또는 `custom`)와 클라이언트 실행 `bash_*`/`text_editor_*`/`memory_*`, Gemini `functionDeclarations`다. `shell`의 `environment`가 없거나 `container_auto`·`container_reference`·알 수 없는 값이면 OpenAI가 호스팅하는 컨테이너에서 실행될 수 있으므로 거절한다(openai 2.53 SDK는 생략 시 기본값을 정의하지 않는다). Lumen이나 공급자가 실행하는 도구(OpenAI `web_search*`, `file_search`, `code_interpreter`, `computer_use_preview`, `image_generation`, `mcp`, `web_search_options`; Anthropic `web_search_*`, `web_fetch_*`, `code_execution_*`, `computer_*`, `container`, `mcp_servers`; Gemini `googleSearch`, `codeExecution`, `urlContext` 등)는 모든 API 키에서 크레딧 예약 전에 403 `server_tool_not_allowed_for_key`로 거절한다. `model="lumen"` 가상 모델은 Claude Gateway 키만 조회·호출할 수 있다.
+
+`tool_choice`로 서버 도구를 강제하는 요청도 같은 403으로 거절한다. `auto`·`none`·`required`, `function`·`custom` 같은 클라이언트 도구 유형과 Anthropic `auto`·`any`·`tool`·`none`은 허용한다. 그 밖의 강제 유형과 `allowed_tools` 하위 목록의 서버 도구는 거절한다. `shell` 강제는 선언된 모든 `shell`의 환경이 `local`일 때만 허용한다. 다른 사용자의 개인 키를 수정하거나 폐기하려 하면 없는 키와 똑같이 404를 반환한다.
+
+OpenAI `namespace`는 안의 모든 도구가(중첩 포함) 클라이언트 도구일 때만 허용한다. `tool_search`는 `execution`이 없거나 `client`·`server`이면 허용한다. 서버 실행도 요청에 선언된 지연 로딩 도구만 검색하며, 그 도구들은 각각 따로 검사한다. Codex CLI는 기본값으로 공급자가 실행하는 `web_search` 도구를 보내므로 API 키로는 403을 받는다. 오류 메시지는 거절한 도구 유형을 알려 주고, `~/.codex/config.toml`에 `web_search = "disabled"`를 설정하거나 대시보드 채팅에서 웹 검색을 쓰라고 안내한다.
+
+Gemini 경로의 `{model}`은 `models/lumen/<provider_id>/<model_id>`처럼 `/`를 포함할 수 있어 route template은 `{model:path}`이다.
+
+Perplexity Sonar처럼 검색을 항상 내장 실행하는 모델은 `native:tools:execute`가 필요하므로 모델 키로 호출하면 OpenAI·Anthropic·Gemini 경로 모두 크레딧 예약이나 공급자 호출 전에 HTTP 403 `model_requires_server_tools`를 반환한다. 키가 보는 모델 목록(`/v1/models`의 두 형식, `/v1/cli/models`, `/v1beta/models`)에서도 이 모델을 숨긴다. Keystone 대시보드 목록은 바뀌지 않는다.
+
+사용량 조회(`/v1/usage`, `/v1/usage/timeseries`, `/v1/usage/keys`, `/v1/usage/records`)는 Keystone 세션만 사용할 수 있다.
+
+마이그레이션 038은 기존 키를 개인 키로 변환하며, 키 값·해시·기존 scope·한도·상태를 보존한다. 기존 JSON의 허용 목록 밖 scope는 동작하지 않는다. 임베딩과 Decision 호출에는 각각 명시적 새 scope의 키를 발급한다. `oslo.policy`에서 `model_api_key:True`를 사용해 Keystone 역할이 없는 모델 키를 식별할 수 있다. 운영 정책은 허용 목록을 넓힐 수 없다.
 
 ## 응답과 오류 형식
 

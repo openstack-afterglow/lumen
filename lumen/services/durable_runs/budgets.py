@@ -1,8 +1,8 @@
 """Project agent quotas and per-run reservations with a fixed global lock order.
 
-Lock order (never acquire a later class while holding an earlier one out of sequence):
-project quota -> conversation/temp thread -> root run -> ancestor runs by depth ->
-children by creation order/UUID -> reservation/delegation/approval rows -> resources.
+Lock order: domain pool -> user wallet -> project quota -> conversation/temp
+thread -> root run -> ancestors by depth -> children by creation order/UUID ->
+reservation/delegation/approval rows -> resources. Skip unused lock classes.
 All functions here take an open session and a caller-owned transaction; nothing here
 performs network I/O, so a deadlock retry is safe for pure DB callers only.
 """
@@ -14,6 +14,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from decimal import Decimal
+from hashlib import sha256
 from uuid import uuid4
 
 from sqlalchemy import select
@@ -22,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from lumen.models.chat_infrastructure import ChatAgentReservation, ChatProjectAgentQuota
 from lumen.models.chat_runs import ChatModelCallReservation, ChatRun, ChatRunSegment
+from lumen.services import credit
 
 from .errors import DurableRunConflict, DurableRunError, DurableRunInputError
 
@@ -167,9 +169,10 @@ async def close_root_budget(session: AsyncSession, *, quota: ChatProjectAgentQuo
             held = min(spent, Decimal(str(row.amount))) if row.kind == "sandbox_seconds" else spent
             _release_counters(quota, root, row.kind, held)
             row.released_at = now
-    quota.credits_reserved = max(
-        Decimal("0"), Decimal(str(quota.credits_reserved)) - Decimal(str(root.reserved_credits))
-    )
+    if _uses_project_credit_ceiling(root):
+        quota.credits_reserved = max(
+            Decimal("0"), Decimal(str(quota.credits_reserved)) - Decimal(str(root.reserved_credits))
+        )
     root.reservation_released_at = now
     return True
 
@@ -216,6 +219,12 @@ async def reserve(
     if kind not in _KIND_TO_CAP:
         raise DurableRunInputError("unknown reservation kind")
     value = _positive(amount, kind)
+    payer = credit.run_payer(root) if kind == "credit" else None
+    if payer is not None and payer.domain_id is not None:
+        await credit.reserve_call_credit_in_transaction(
+            session, payer=payer, user_id=root.user_id, project_id=root.project_id,
+            api_key_id=root.api_key_id, bound=value,
+        )
     cap, used, counter_field = _cap_and_counter(quota, kind)
     if cap <= 0:
         raise BudgetExceeded("delegation_disabled", f"project {kind} cap is zero")
@@ -257,9 +266,12 @@ async def reserve(
         kind=kind,
         amount=value,
         status="reserved",
+        **(payer.columns() if payer is not None else {}),
     )
     session.add(row)
     setattr(quota, counter_field, type(getattr(quota, counter_field))(used + value))
+    if payer is not None:
+        await credit.refresh_domain_reserved(session, payer)
     return row
 
 
@@ -311,6 +323,8 @@ async def settle(
         held = min(spent, reserved) if kind == "sandbox_seconds" else spent
         _release_counters(quota, root, kind, held)
         row.released_at = row.settled_at
+    if kind == "credit":
+        await credit.refresh_domain_reserved(session, credit.run_payer(root))
     return True
 
 
@@ -330,6 +344,12 @@ async def release(
     _release_counters(quota, root, kind, Decimal(str(row.amount)))
     row.status = "released"
     row.released_at = datetime.now(UTC)
+    if kind == "credit":
+        payer = credit.run_payer(root)
+        if payer.domain_id is not None:
+            await credit.release_domain_in_transaction(
+                session, payer=payer, reference=f"allocation:{row.id}", user_id=root.user_id,
+            )
     return True
 
 
@@ -378,6 +398,14 @@ async def reserve_call_credit(
     """Reserve before I/O under the caller's quota -> root -> run -> segment locks."""
     _validate_call_scope(quota, root, run, segment)
     amount = _credits(amount, label="call credit bound")
+    payer = credit.run_payer(run)
+    if payer.domain_id is not None:
+        # An active child allocation has already funded this call. Project and
+        # child ceilings below prevent a call from exceeding the allocation.
+        await credit.reserve_call_credit_in_transaction(
+            session, payer=payer, user_id=run.user_id, project_id=run.project_id,
+            api_key_id=run.api_key_id, bound=amount if run is root else Decimal(0),
+        )
     if segment.status != "prepared":
         raise DurableRunConflict("call segment has already started")
     existing = (
@@ -389,7 +417,7 @@ async def reserve_call_credit(
     if existing is not None:
         raise DurableRunConflict("call credit reservation already exists")
     if run is root:
-        if amount:
+        if amount and _uses_project_credit_ceiling(run):
             cap, used, _counter = _cap_and_counter(quota, "credit")
             if cap <= 0:
                 raise BudgetExceeded("delegation_disabled", "project credit cap is zero")
@@ -413,9 +441,15 @@ async def reserve_call_credit(
             raise BudgetExceeded("child_budget_exhausted", "child credit ceiling exceeded")
         run.reserved_credits = child_total
 
-    row = ChatModelCallReservation(run_id=run.id, segment_id=segment.segment_id, bound_credits=amount, status="reserved")
+    row = ChatModelCallReservation(run_id=run.id, segment_id=segment.segment_id,
+                                   bound_credits=amount, status="reserved", **payer.columns())
     session.add(row)
+    await credit.refresh_domain_reserved(session, payer)
     return True
+
+
+def _uses_project_credit_ceiling(run: ChatRun) -> bool:
+    return run.payer_domain_id is None or run.execution_mode != "chat" or run.credit_ceiling is not None
 
 
 async def settle_call_credit(
@@ -437,14 +471,24 @@ async def settle_call_credit(
         raise DurableRunError("model call reservation is missing")
     if row.status != "reserved":
         return False
+    payer = credit.run_payer(run)
+    if spent is not None and payer.domain_id is not None:
+        if spent > row.bound_credits:
+            raise DurableRunError("domain charge exceeds durable reservation")
+        reference = f"segment:{run.id}:{sha256(segment.segment_id.encode()).hexdigest()}"
+        await credit.charge_domain_in_transaction(
+            session, payer=payer, amount=spent, reference=reference,
+            user_id=credit.actor_id(run.user_id, run.api_key_id),
+        )
     if run is not root:
         await _child_credit_allocation(session, root=root, run=run, order=LockOrder())
     if spent is not None:
         delta = spent - Decimal(str(row.bound_credits))
         run.reserved_credits = Decimal(str(run.reserved_credits)) + delta
-        if run is root:
+        if run is root and _uses_project_credit_ceiling(run):
             quota.credits_reserved = Decimal(str(quota.credits_reserved)) + delta
         row.actual_credits = spent
     row.status = "unknown" if spent is None else "settled"
     row.settled_at = datetime.now(UTC)
+    await credit.refresh_domain_reserved(session, payer)
     return True

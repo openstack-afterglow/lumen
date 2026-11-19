@@ -7,7 +7,7 @@ projection update is atomic with ``active_leaf_id``.
 
 from __future__ import annotations
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from lumen.models import (
@@ -19,16 +19,33 @@ from lumen.models import (
 )
 
 
+def graph_matches_conversation(graph: ChatMessageGraph, conversation: ChatConversation) -> bool:
+    """Require the same user and domain, with exact origin for unbackfilled graphs."""
+    return (
+        graph.user_id == conversation.user_id
+        and graph.domain_id == conversation.domain_id
+        and (graph.domain_id is not None or graph.project_id == conversation.project_id)
+    )
+
+
 class MessageGraphError(ValueError):
     """The requested leaf does not form a valid path in its conversation."""
 
 
-def reachable_message_clause(conversation_id: str, message=ChatMessage):
+def reachable_message_clause(conversation_id: str, message=ChatMessage, *, domain_scope: bool = True):
     """Restrict a message to an explicitly granted conversation view.
 
-    Callers authorize the target conversation's user AND project first. Origin
-    conversation IDs are provenance, never a grant (and may become NULL).
+    Callers authorize the target conversation first. Origin conversation IDs
+    are provenance, never a grant (and may become NULL).
     """
+    same_project = ChatMessageGraph.project_id == ChatConversation.project_id
+    owner_scope = (
+        (
+            ChatMessageGraph.domain_id.is_not_distinct_from(ChatConversation.domain_id),
+            or_(ChatMessageGraph.domain_id.is_not(None), same_project),
+        )
+        if domain_scope else (same_project,)
+    )
     return (
         select(ChatConversationMessage.message_id)
         .join(ChatConversation, ChatConversation.id == ChatConversationMessage.conversation_id)
@@ -38,7 +55,7 @@ def reachable_message_clause(conversation_id: str, message=ChatMessage):
             ChatConversationMessage.message_id == message.id,
             message.graph_id == ChatMessageGraph.id,
             ChatMessageGraph.user_id == ChatConversation.user_id,
-            ChatMessageGraph.project_id == ChatConversation.project_id,
+            *owner_scope,
         )
         .correlate(message)
         .exists()
@@ -54,7 +71,7 @@ async def register_message(session: AsyncSession, *, conversation_id: str, messa
     graph = await session.get(ChatMessageGraph, message.graph_id)
     if (
         conversation is None or graph is None or conversation.graph_id != graph.id
-        or conversation.user_id != graph.user_id or conversation.project_id != graph.project_id
+        or not graph_matches_conversation(graph, conversation)
     ):
         raise MessageGraphError("message graph is outside the conversation owner scope")
     if message.parent_id is not None:
@@ -75,6 +92,7 @@ async def ancestor_message_ids(
     *,
     conversation_id: str,
     leaf_id: int | None,
+    domain_scope: bool = True,
 ) -> list[int]:
     """Return root-to-leaf IDs, rejecting missing/ungranted parents and cycles."""
     if leaf_id is None:
@@ -91,7 +109,7 @@ async def ancestor_message_ids(
             await session.execute(
                 select(ChatMessage.id, ChatMessage.parent_id).where(
                     ChatMessage.id == current_id,
-                    reachable_message_clause(conversation_id),
+                    reachable_message_clause(conversation_id, domain_scope=domain_scope),
                 )
             )
         ).one_or_none()

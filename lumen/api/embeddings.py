@@ -20,7 +20,7 @@ class EmbedRequest(BaseModel):
 
 @router.post("/chat/embeddings")
 async def create_embeddings(body: EmbedRequest,
-        principal: Principal = Depends(require_scopes("native:runs:write"))):
+        principal: Principal = Depends(require_scopes("embeddings:write"))):
     if any(not text.strip() for text in body.input):
         raise HTTPException(status_code=422, detail="input items must be non-empty")
     try:
@@ -29,7 +29,8 @@ async def create_embeddings(body: EmbedRequest,
             raise HTTPException(status_code=404, detail="embedding model not found")
         result = await embeddings.embed(
             route=route, inputs=body.input, user_id=principal["user_id"], project_id=principal["project_id"],
-            api_key_id=principal.get("api_key_id"), required_scopes=("native:runs:write",),
+            api_key_id=principal.get("api_key_id"), required_scopes=("embeddings:write",),
+            payer=principal.get("payer"),
             dimensions=body.dimensions,
         )
     except embeddings.EmbeddingError as exc:

@@ -26,8 +26,11 @@ from typing import Any
 
 import httpx
 import pytest
+from system.fake_keystone import OWNER_TOKEN, PROJECT_ID
 
 pytestmark = pytest.mark.system
+
+_OWNER_HEADERS = {"X-Auth-Token": OWNER_TOKEN, "X-Project-Id": PROJECT_ID}
 
 
 def _load_connection_context() -> tuple[str, str, str, str, str]:
@@ -131,16 +134,22 @@ def test_process_stack_temp_completion_e2e() -> None:
     }
 
     with httpx.Client(base_url=api_base_url, timeout=30.0) as client:
-        # 1. Call GET /v1/models
+        # 1. Call GET /v1/models. Model API keys never see or call the virtual model.
         models_resp = client.get(f"{container_base_url}/models", headers=headers)
         assert models_resp.status_code == 200, f"GET /v1/models failed: {models_resp.status_code}"
         models_data = models_resp.json()
         assert models_data.get("object") == "list", "GET /v1/models response must be an OpenAI model list"
         model_ids = {item.get("id") for item in models_data.get("data", [])}
         assert model_name in model_ids, "Generated connection model is absent from GET /v1/models"
-        assert "lumen" in model_ids, "Lumen virtual model is absent from GET /v1/models"
-        lumen_model_item = next((item for item in models_data.get("data", []) if item.get("id") == "lumen"), None)
-        assert lumen_model_item is not None and lumen_model_item.get("owned_by") == "lumen"
+        assert "lumen" not in model_ids, "Lumen virtual model must stay hidden from a model API key"
+        denied_lumen = client.post(
+            f"{container_base_url}/chat/completions", headers=headers,
+            json={"model": "lumen", "messages": [{"role": "user", "content": "model key must not reach lumen"}]},
+        )
+        assert denied_lumen.status_code == 403, denied_lumen.text
+        assert denied_lumen.json()["error"]["code"] == "model_not_allowed_for_key"
+        # Gateway keys keep the virtual model; test_process_stack_native_protocols_and_gateway_device_login
+        # lists and runs it with the device-issued key.
 
         # 2. Call non-streaming POST /v1/chat/completions
         chat_payload = {
@@ -208,68 +217,9 @@ def test_process_stack_temp_completion_e2e() -> None:
         assert stream_usage.get("completion_tokens") == 5
         assert stream_usage.get("total_tokens") == 15
 
-        # 3b. Call non-streaming POST /v1/chat/completions with model="lumen" (durable run via worker)
-        chat_payload_lumen = {
-            "model": "lumen",
-            "messages": [{"role": "user", "content": "Hello process stack via lumen virtual model"}],
-            "stream": False,
-        }
-        chat_resp_lumen = client.post(
-            f"{container_base_url}/chat/completions", headers=headers, json=chat_payload_lumen
-        )
-        assert chat_resp_lumen.status_code == 200, (
-            f"POST /v1/chat/completions (model=lumen) failed: {chat_resp_lumen.status_code}"
-        )
-        chat_data_lumen = chat_resp_lumen.json()
-        assert chat_data_lumen.get("model") == "lumen", "Expected model=lumen in response"
-        choices_lumen = chat_data_lumen.get("choices", [])
-        assert len(choices_lumen) == 1
-        assert choices_lumen[0].get("message", {}).get("content") == "Hello from fake provider!"
-        usage_lumen = chat_data_lumen.get("usage", {})
-        assert usage_lumen.get("total_tokens") == 15
-
-        # 3c. Call streaming POST /v1/chat/completions with model="lumen" and include_usage
-        stream_payload_lumen = {
-            "model": "lumen",
-            "messages": [{"role": "user", "content": "Hello streaming process stack via lumen virtual model"}],
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        }
-
-        received_deltas_lumen: list[str] = []
-        stream_usage_lumen = None
-        seen_done_lumen = False
-
-        with client.stream(
-            "POST", f"{container_base_url}/chat/completions", headers=headers, json=stream_payload_lumen
-        ) as stream_resp_lumen:
-            assert stream_resp_lumen.status_code == 200
-            for line in stream_resp_lumen.iter_lines():
-                line = line.strip()
-                if not line or not line.startswith("data:"):
-                    continue
-                data_str = line[5:].strip()
-                if data_str == "[DONE]":
-                    seen_done_lumen = True
-                    break
-                chunk = json.loads(data_str)
-
-                for choice in chunk.get("choices", []):
-                    delta = choice.get("delta", {})
-                    if "content" in delta and delta["content"]:
-                        received_deltas_lumen.append(delta["content"])
-
-                if "usage" in chunk and chunk["usage"]:
-                    stream_usage_lumen = chunk["usage"]
-
-        assert seen_done_lumen, "Streaming model=lumen response did not terminate with [DONE]"
-        assert "".join(received_deltas_lumen) == "Hello from fake provider!"
-        assert stream_usage_lumen is not None
-        assert stream_usage_lumen.get("total_tokens") == 15
-
         # 4. Submit native temp completion
         temp_headers = {
-            "Authorization": f"Bearer {api_key}",
+            **_OWNER_HEADERS,
             "Idempotency-Key": str(uuid.uuid4()),
             "Content-Type": "application/json",
         }
@@ -286,11 +236,12 @@ def test_process_stack_temp_completion_e2e() -> None:
         run_id = run_data.get("run_id") or run_data.get("id")
         assert run_id, f"Response missing run_id: {run_data}"
 
-        run_detail = _poll_run_until_terminal(client, run_id, headers)
+        run_detail = _poll_run_until_terminal(client, run_id, _OWNER_HEADERS)
         assert run_detail.get("status") == "completed"
 
         # 5. Assert usage attribution via public usage API
-        usage_resp = client.get("/v1/usage/records", headers={"Authorization": f"Bearer {api_key}"})
+        assert client.get("/v1/usage/records", headers=headers).status_code == 403
+        usage_resp = client.get("/v1/usage/records", headers=_OWNER_HEADERS)
         assert usage_resp.status_code == 200, f"Failed getting usage records: {usage_resp.text}"
         usage_data = usage_resp.json()
 
@@ -299,9 +250,8 @@ def test_process_stack_temp_completion_e2e() -> None:
 
         native_record = next((item for item in records if item.get("run_id") == run_id), None)
         assert native_record is not None, f"Expected usage record for native run {run_id}"
-        assert native_record["source"] == "api"
-        api_key_id = native_record["api_key_id"]
-        assert isinstance(api_key_id, int)
+        assert native_record["source"] == "web"
+        assert native_record["api_key_id"] is None
 
 
 # ============================================================================
@@ -316,11 +266,11 @@ def test_process_stack_small_delta_exposed_within_scheduler_allowance() -> None:
     The worker's flush deadline (50ms) and SSE poller (100ms) guarantee the client observes
     'delta1' well before the provider finishes (observed < 1.5s while total duration >= 2.0s).
     """
-    api_base_url, _, api_key, model_name, fake_provider_url = _load_connection_context()
+    api_base_url, _, _, model_name, fake_provider_url = _load_connection_context()
     _configure_fake_provider(fake_provider_url, {"mode": "small_delta_pause", "pause_seconds": 2.0})
 
     headers = {
-        "Authorization": f"Bearer {api_key}",
+        **_OWNER_HEADERS,
         "Idempotency-Key": str(uuid.uuid4()),
         "Content-Type": "application/json",
     }
@@ -344,7 +294,7 @@ def test_process_stack_small_delta_exposed_within_scheduler_allowance() -> None:
         completed_seen = False
 
         with client.stream(
-            "GET", f"/v1/runs/{run_id}/events", headers={"Authorization": f"Bearer {api_key}"}
+            "GET", f"/v1/runs/{run_id}/events", headers=_OWNER_HEADERS
         ) as stream_resp:
             assert stream_resp.status_code == 200
             for line in stream_resp.iter_lines():
@@ -401,11 +351,11 @@ def test_process_stack_burst_streaming_ordered_and_replayable_terminal() -> None
     The observable contract is strict event ordering and exact reconstruction of the
     2,000-character provider output on both the live and replay streams.
     """
-    api_base_url, _, api_key, model_name, fake_provider_url = _load_connection_context()
+    api_base_url, _, _, model_name, fake_provider_url = _load_connection_context()
     _configure_fake_provider(fake_provider_url, {"mode": "burst", "burst_chunks": 500, "burst_chunk_size": 4})
 
     headers = {
-        "Authorization": f"Bearer {api_key}",
+        **_OWNER_HEADERS,
         "Idempotency-Key": str(uuid.uuid4()),
         "Content-Type": "application/json",
     }
@@ -427,7 +377,7 @@ def test_process_stack_burst_streaming_ordered_and_replayable_terminal() -> None
         live_seqs: list[int] = []
 
         with client.stream(
-            "GET", f"/v1/runs/{run_id}/events", headers={"Authorization": f"Bearer {api_key}"}
+            "GET", f"/v1/runs/{run_id}/events", headers=_OWNER_HEADERS
         ) as stream_resp:
             assert stream_resp.status_code == 200
             for line in stream_resp.iter_lines():
@@ -459,7 +409,7 @@ def test_process_stack_burst_streaming_ordered_and_replayable_terminal() -> None
         # 2. Replay terminal stream from database journal
         replay_resp = client.get(
             f"/v1/runs/{run_id}/events?after_seq=0",
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers=_OWNER_HEADERS,
         )
         assert replay_resp.status_code == 200
 
@@ -504,11 +454,11 @@ def test_process_stack_context_preview_readonly_no_provider_calls() -> None:
     - HTTP 200 ContextState returned with valid budget, revision, and recommendations
     - Provider request count remains completely unchanged before and after the preview call
     """
-    api_base_url, _, api_key, model_name, fake_provider_url = _load_connection_context()
+    api_base_url, _, _, model_name, fake_provider_url = _load_connection_context()
     _reset_fake_provider(fake_provider_url)
 
     headers = {
-        "Authorization": f"Bearer {api_key}",
+        **_OWNER_HEADERS,
         "Idempotency-Key": str(uuid.uuid4()),
         "Content-Type": "application/json",
     }
@@ -539,7 +489,7 @@ def test_process_stack_context_preview_readonly_no_provider_calls() -> None:
         # Execute preview request
         preview_resp = client.post(
             preview_url,
-            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            headers=_OWNER_HEADERS,
             json={
                 "model_id": model_name,
                 "features": {},
@@ -582,10 +532,10 @@ def test_process_stack_manual_compaction_and_sentinel_preservation() -> None:
     5. Compaction completes without inserting new message rows in conversation/thread history.
     6. Next completion prompt receives summary preserving the old sentinels and recent turns.
     """
-    api_base_url, _, api_key, model_name, fake_provider_url = _load_connection_context()
+    api_base_url, _, _, model_name, fake_provider_url = _load_connection_context()
     _reset_fake_provider(fake_provider_url)
 
-    auth_headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    auth_headers = _OWNER_HEADERS
 
     with httpx.Client(base_url=api_base_url, timeout=45.0) as client:
         # Determine whether persistent conversation creation is available
@@ -756,10 +706,10 @@ def test_process_stack_manual_compaction_and_sentinel_preservation() -> None:
 
 def test_process_stack_title_first_answer_influences_title_no_extra_calls() -> None:
     """Verify title generation occurs once after first turn, influenced by answer, with no extra calls."""
-    api_base_url, _, api_key, model_name, fake_provider_url = _load_connection_context()
+    api_base_url, _, _, model_name, fake_provider_url = _load_connection_context()
     _reset_fake_provider(fake_provider_url)
 
-    auth_headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    auth_headers = _OWNER_HEADERS
 
     with httpx.Client(base_url=api_base_url, timeout=30.0) as client:
         # The generated local transport is authorized for the native persistent
@@ -844,11 +794,11 @@ def test_process_stack_title_first_answer_influences_title_no_extra_calls() -> N
 
 def test_process_stack_paused_provider_and_cancellation() -> None:
     """Verify an in-flight run under provider pause can be canceled cleanly via public cancel API."""
-    api_base_url, _, api_key, model_name, fake_provider_url = _load_connection_context()
+    api_base_url, _, _, model_name, fake_provider_url = _load_connection_context()
     _configure_fake_provider(fake_provider_url, {"mode": "pause", "pause_seconds": 6.0})
 
     headers = {
-        "Authorization": f"Bearer {api_key}",
+        **_OWNER_HEADERS,
         "Idempotency-Key": str(uuid.uuid4()),
         "Content-Type": "application/json",
     }
@@ -871,7 +821,7 @@ def test_process_stack_paused_provider_and_cancellation() -> None:
         # Issue cancellation
         cancel_resp = client.post(
             f"/v1/runs/{run_id}/cancel",
-            headers={"Authorization": f"Bearer {api_key}"},
+            headers=_OWNER_HEADERS,
         )
         assert cancel_resp.status_code in (200, 202), f"Cancel failed: {cancel_resp.status_code}"
 
@@ -908,6 +858,9 @@ async def _approve_gateway_code_and_seed_anthropic(user_code: str, fake_provider
             model_name="claude-sonnet-4-6",
             input_price_per_million="1",
             output_price_per_million="1",
+            # A fake base is a compatible route, so no native catalog window applies. Set the one
+            # Anthropic publishes for this model, as an administrator must for compatible models.
+            capabilities={"context_limit": 1_000_000},
         )
         decision = await claude_gateway.authorize_user_code(
             user_code=user_code,
@@ -922,7 +875,7 @@ async def _approve_gateway_code_and_seed_anthropic(user_code: str, fake_provider
 
 def test_process_stack_native_protocols_and_gateway_device_login() -> None:
     """Exercise native protocol wires and one-time Gateway issuance through real processes."""
-    api_base_url, _, api_key, model_name, fake_provider_url = _load_connection_context()
+    api_base_url, container_base_url, api_key, model_name, fake_provider_url = _load_connection_context()
     _reset_fake_provider(fake_provider_url)
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
@@ -1086,12 +1039,14 @@ def test_process_stack_native_protocols_and_gateway_device_login() -> None:
         claude_messages = [{"role": "user", "content": "run a local command"}]
         before_denied = _get_fake_provider_stats(fake_provider_url)
         assert before_denied is not None
+        # Claude Code's own tools are forwarded; a provider-run server tool is refused before I/O.
         denied_gateway_tools = client.post(
             "/v1/claude-gateway/v1/messages", headers=gateway_headers,
-            json={"model": "client-alias-is-ignored", "max_tokens": 128,
-                  "messages": claude_messages, "tools": [bash_tool]},
+            json={"model": "client-alias-is-ignored", "max_tokens": 128, "messages": claude_messages,
+                  "tools": [bash_tool, {"type": "web_search_20250305", "name": "web_search"}]},
         )
         assert denied_gateway_tools.status_code == 403, denied_gateway_tools.text
+        assert "server_tool_not_allowed_for_key" in denied_gateway_tools.text
         after_denied = _get_fake_provider_stats(fake_provider_url)
         assert after_denied is not None and after_denied["history"] == before_denied["history"]
         tool_headers = {**headers, "anthropic-version": "2023-06-01",
@@ -1169,6 +1124,72 @@ def test_process_stack_native_protocols_and_gateway_device_login() -> None:
         assert replay.status_code == 400
         assert replay.json()["error"] == "invalid_grant"
 
+        # Claude Gateway keys keep the virtual model that model API keys cannot see.
+        gateway_models = client.get(f"{container_base_url}/models", headers={"Authorization": f"Bearer {gateway_key}"})
+        assert gateway_models.status_code == 200, gateway_models.text
+        lumen_model_item = next((item for item in gateway_models.json().get("data", []) if item.get("id") == "lumen"), None)
+        assert lumen_model_item is not None and lumen_model_item.get("owned_by") == "lumen"
+        lumen_headers = {"Authorization": f"Bearer {gateway_key}", "Content-Type": "application/json"}
+
+        # 3b. Call non-streaming POST /v1/chat/completions with model="lumen" (durable run via worker)
+        chat_payload_lumen = {
+            "model": "lumen",
+            "messages": [{"role": "user", "content": "Hello process stack via lumen virtual model"}],
+            "stream": False,
+        }
+        chat_resp_lumen = client.post(
+            f"{container_base_url}/chat/completions", headers=lumen_headers, json=chat_payload_lumen
+        )
+        assert chat_resp_lumen.status_code == 200, (
+            f"POST /v1/chat/completions (model=lumen) failed: {chat_resp_lumen.status_code}"
+        )
+        chat_data_lumen = chat_resp_lumen.json()
+        assert chat_data_lumen.get("model") == "lumen", "Expected model=lumen in response"
+        choices_lumen = chat_data_lumen.get("choices", [])
+        assert len(choices_lumen) == 1
+        assert choices_lumen[0].get("message", {}).get("content") == "Hello from fake provider!"
+        usage_lumen = chat_data_lumen.get("usage", {})
+        assert usage_lumen.get("total_tokens") == 15
+
+        # 3c. Call streaming POST /v1/chat/completions with model="lumen" and include_usage
+        stream_payload_lumen = {
+            "model": "lumen",
+            "messages": [{"role": "user", "content": "Hello streaming process stack via lumen virtual model"}],
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+
+        received_deltas_lumen: list[str] = []
+        stream_usage_lumen = None
+        seen_done_lumen = False
+
+        with client.stream(
+            "POST", f"{container_base_url}/chat/completions", headers=lumen_headers, json=stream_payload_lumen
+        ) as stream_resp_lumen:
+            assert stream_resp_lumen.status_code == 200
+            for line in stream_resp_lumen.iter_lines():
+                line = line.strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                data_str = line[5:].strip()
+                if data_str == "[DONE]":
+                    seen_done_lumen = True
+                    break
+                chunk = json.loads(data_str)
+
+                for choice in chunk.get("choices", []):
+                    delta = choice.get("delta", {})
+                    if "content" in delta and delta["content"]:
+                        received_deltas_lumen.append(delta["content"])
+
+                if "usage" in chunk and chunk["usage"]:
+                    stream_usage_lumen = chunk["usage"]
+
+        assert seen_done_lumen, "Streaming model=lumen response did not terminate with [DONE]"
+        assert "".join(received_deltas_lumen) == "Hello from fake provider!"
+        assert stream_usage_lumen is not None
+        assert stream_usage_lumen.get("total_tokens") == 15
+
     _reset_fake_provider(fake_provider_url)
 
 
@@ -1216,6 +1237,8 @@ async def _register_discovered_system_model(fake_provider_url: str, model_name: 
             model_name=model_name,
             input_price_per_million="2",
             output_price_per_million="4",
+            # Unlisted on the compatible fake base: the administrator supplies the window.
+            capabilities={"context_limit": 200_000},
         )
         return {"provider": provider, "registered": registered}
     finally:
@@ -1277,7 +1300,7 @@ def test_process_stack_discovers_and_routes_new_claude_without_restart() -> None
 
         unsupported = client.post(
             "/v1/temp-completions",
-            headers={**headers, "Idempotency-Key": str(uuid.uuid4())},
+            headers={**_OWNER_HEADERS, "Idempotency-Key": str(uuid.uuid4())},
             json={
                 "parts": [{"type": "text", "text": "search must remain denied"}],
                 "model_id": model_name,
@@ -1302,7 +1325,7 @@ def test_process_stack_discovers_and_routes_new_claude_without_restart() -> None
 
         admitted = client.post(
             "/v1/temp-completions",
-            headers={**headers, "Idempotency-Key": str(uuid.uuid4())},
+            headers={**_OWNER_HEADERS, "Idempotency-Key": str(uuid.uuid4())},
             json={
                 "parts": [{"type": "text", "text": "newly registered worker route"}],
                 "model_id": model_name,
@@ -1311,10 +1334,10 @@ def test_process_stack_discovers_and_routes_new_claude_without_restart() -> None
         )
         assert admitted.status_code == 202, admitted.text
         run_id = admitted.json()["run_id"]
-        terminal = _poll_run_until_terminal(client, run_id, headers)
+        terminal = _poll_run_until_terminal(client, run_id, _OWNER_HEADERS)
         assert terminal["status"] == "completed", terminal
 
-        records = client.get("/v1/usage/records", headers=headers)
+        records = client.get("/v1/usage/records", headers=_OWNER_HEADERS)
         assert records.status_code == 200, records.text
         record = next(item for item in records.json()["records"] if item["run_id"] == run_id)
         assert record["model_name"] == model_name

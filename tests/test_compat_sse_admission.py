@@ -25,6 +25,11 @@ _HEADERS = {"Authorization": "Bearer sk-afgl-admission"}
 _GATEWAY_HEADERS = {"Authorization": "Bearer sk-afgl-gateway"}
 
 
+def _headers(protocol):
+    # model=lumen stays a Claude Gateway key capability; personal/service keys are rejected.
+    return _GATEWAY_HEADERS if protocol in {"gateway", "lumen"} else _HEADERS
+
+
 def _request(protocol, *, stream=True):
     if protocol == "responses":
         return "/v1/responses", {"model": "test-model", "input": "hello", "stream": stream}
@@ -62,6 +67,8 @@ def harness(monkeypatch):
         if key == "sk-afgl-invalid":
             return None
         return {"user_id": "user", "project_id": "project", "api_key_id": 7,
+                "auth_type": "api_key", "source": "api",
+                "credential_class": "claude_gateway" if key == "sk-afgl-gateway" else "personal_key",
                 "roles": ["member", *SERVICE_CAPABILITIES], "service_system_admin": False,
                 "credential_kind": "claude_gateway" if key == "sk-afgl-gateway" else "api_key",
                 "scopes": ("models:read",) if key == "sk-afgl-no-scope" else ("compat:completions:write",)}
@@ -143,7 +150,7 @@ def harness(monkeypatch):
         boundary("create_temp_run")
         return SimpleNamespace(run_id="run-admission")
 
-    async def summary_route(resolved):
+    async def summary_route(resolved, *, domain_paid=False):
         return resolved
 
     # Keep the virtual route's real normalization, resolution, precheck and durable
@@ -175,8 +182,7 @@ async def _post(harness, protocol, *, stream=True, headers=None, body=None):
     path, default_body = _request(protocol, stream=stream)
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=harness.app), base_url="http://test") as client:
         return await client.post(path, json=default_body if body is None else body,
-                                 headers=(_GATEWAY_HEADERS if protocol == "gateway" else _HEADERS)
-                                 if headers is None else headers)
+                                 headers=_headers(protocol) if headers is None else headers)
 
 
 def _start_stream(harness, protocol):
@@ -196,7 +202,7 @@ def _start_stream(harness, protocol):
              "http_version": "1.1", "method": "POST", "scheme": "http", "path": path,
              "raw_path": path.encode(), "query_string": b"", "root_path": "",
              "headers": [(b"host", b"test"), (b"content-type", b"application/json"),
-                         (b"authorization", (_GATEWAY_HEADERS if protocol == "gateway" else _HEADERS)["Authorization"].encode())],
+                         (b"authorization", _headers(protocol)["Authorization"].encode())],
              "client": ("127.0.0.1", 1234), "server": ("test", 80)}
     task = asyncio.create_task(harness.app(scope, incoming.get, send))
     return SimpleNamespace(task=task, incoming=incoming, messages=messages, first_text=first_text)
@@ -248,7 +254,7 @@ async def test_saturation_rejects_before_resolution_precheck_provider_or_run_row
 async def test_auth_and_schema_reject_before_any_sse_reservation(harness, protocol, occupied, rejection):
     slot = harness.capacity.reserve("sse") if occupied else None
     _, body = _request(protocol)
-    headers = _GATEWAY_HEADERS if protocol == "gateway" else _HEADERS
+    headers = _headers(protocol)
     expected = 401
     if rejection == "missing_auth":
         headers = {}
@@ -345,6 +351,17 @@ async def test_precheck_error_response_releases_and_keeps_error_envelope(harness
         assert response.json()["type"] == "error"
         assert response.json()["error"]["type"] == "permission_error"
     assert not any(name.startswith("provider") or name in {"stream", "create_temp_run"} for name, _ in harness.calls)
+    _assert_idle(harness)
+
+
+@pytest.mark.parametrize("stream", [True, False])
+async def test_model_key_virtual_model_rejects_before_any_reservation_or_run(harness, stream):
+    response = await _post(harness, "chat", stream=stream, body={
+        "model": "lumen", "messages": [{"role": "user", "content": "hello"}], "stream": stream,
+    })
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "model_not_allowed_for_key"
+    assert harness.calls == []
     _assert_idle(harness)
 
 
@@ -498,7 +515,7 @@ async def test_response_start_failure_closes_eager_provider_stream_before_releas
              "http_version": "1.1", "method": "POST", "scheme": "http", "path": path,
              "raw_path": path.encode(), "query_string": b"", "root_path": "",
              "headers": [(b"host", b"test"), (b"content-type", b"application/json"),
-                         (b"authorization", (_GATEWAY_HEADERS if protocol == "gateway" else _HEADERS)["Authorization"].encode())],
+                         (b"authorization", _headers(protocol)["Authorization"].encode())],
              "client": ("127.0.0.1", 1234), "server": ("test", 80)}
     await asyncio.gather(harness.app(scope, incoming.get, send), return_exceptions=True)
 

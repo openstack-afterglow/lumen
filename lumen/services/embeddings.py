@@ -7,9 +7,14 @@ import uuid
 from decimal import Decimal
 from typing import Any
 
-from lumen.services import credit, provider_client, provider_metadata
+import anyio
+
+from lumen.config import get_settings
+from lumen.models.billing import Payer
+from lumen.services import credit, provider_client, provider_metadata, stateless_credit
 from lumen.services.api_key_store import ApiKeyAuthorityUnavailable, ApiKeyForbidden
 from lumen.services.inference_authority import authorize_new_io
+from lumen.services.provider_errors import ProviderError
 from lumen.services.providers import errors, routing
 from lumen.services.usage_breakdown import UsageBreakdown
 
@@ -105,22 +110,41 @@ def _limits(route: dict, inputs: list[str], dimensions: int | None) -> tuple[int
 async def embed(
     *, route: dict, inputs: list[str], user_id: str, project_id: str, api_key_id: int | None,
     required_scopes: tuple[str, ...], dimensions: int | None = None,
-    task_type: str | None = None, title: str | None = None,
+    task_type: str | None = None, title: str | None = None, payer: Payer | None = None,
 ) -> dict:
     expected_dimensions, _ = _limits(route, inputs, dimensions)
     if route.get("input_price_per_token") is None:
         raise EmbeddingError(422, "embedding input pricing unavailable")
+    domain_billed = payer is not None and payer.domain_id is not None
+    bounded = payer is not None
+    event_id = str(uuid.uuid4())
+    held = dispatched = False
+    conversion = Decimal(str(get_settings().chat_credit_per_usd))
     try:
-        await credit.precheck(user_id, project_id, api_key_id=api_key_id)
-    except credit.QuotaExceeded as exc:
-        raise EmbeddingError(429, str(exc)) from exc
-    except credit.ChatStorageUnavailable as exc:
-        raise EmbeddingError(503, "embedding service unavailable") from exc
-    try:
+        if not bounded:
+            await credit.precheck(user_id, project_id, api_key_id=api_key_id, payer=payer)
         await authorize_new_io(
-            user_id=user_id, project_id=project_id, api_key_id=api_key_id,
-            required_scopes=required_scopes,
+            user_id=user_id, project_id=project_id, api_key_id=api_key_id, required_scopes=required_scopes,
         )
+        if bounded:
+            max_tokens = embedding_metadata(route)["max_input_tokens"]
+            if type(max_tokens) is not int or max_tokens <= 0:
+                raise EmbeddingError(422, "embedding input bound unavailable")
+            max_tokens *= len(inputs)
+            if route.get("provider_type") == "openai" and provider_metadata.direct_provider_route(
+                "openai", route.get("api_base"),
+            ):
+                max_tokens = min(max_tokens, 300000)
+            bound = credit.call_credit_bound(
+                {"input_price_per_token": route["input_price_per_token"], "output_price_per_token": 0,
+                 "chat_credit_per_usd": conversion, "margin_multiplier": route["margin_multiplier"]},
+                input_tokens=max_tokens, output_tokens=0,
+            )
+            await stateless_credit.reserve(event_id=event_id, user_id=user_id, project_id=project_id,
+                                           api_key_id=api_key_id, payer=payer, bound=bound)
+            held = True
+
+        dispatched = True
         response = await provider_client.aembedding(
             model=route["model_name"], input=inputs,
             api_base=route.get("api_base"), api_key=route.get("api_key"),
@@ -130,6 +154,48 @@ async def embed(
             title=title if route.get("provider_type") == "gemini" else None,
         )
         vectors = _values(response)
+        if len(vectors) != len(inputs) or any(
+            expected_dimensions and len(item["embedding"]) != expected_dimensions for item in vectors
+        ):
+            raise EmbeddingError(502, "embedding response dimensions do not match the request")
+
+        usage = getattr(response, "usage", None)
+        prompt_tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else (
+            getattr(usage, "prompt_tokens", None) if usage is not None else None
+        )
+        estimated = type(prompt_tokens) is not int or prompt_tokens <= 0
+        if bounded and (estimated or prompt_tokens > max_tokens):
+            raise EmbeddingError(502, "provider_result_unknown")
+        if estimated:
+            prompt_tokens = sum(provider_metadata.count_tokens(route["model_name"], text=text) for text in inputs)
+        breakdown = UsageBreakdown.from_totals(prompt_tokens, 0)
+        try:
+            cost = provider_metadata.cost_from_usage(
+                route["model_name"], prompt_tokens, 0,
+                input_price_per_token=route.get("input_price_per_token"),
+                output_price_per_token=Decimal(0), price_source=route.get("price_source"),
+                provider_type=route.get("provider_type"), api_base=route.get("api_base"), breakdown=breakdown,
+                allow_catalog_prices=not bounded,
+            )
+            settle = stateless_credit.settle if held else credit.apply_usage
+            with anyio.CancelScope(shield=held):
+                credited = await settle(
+                    event_id=event_id, user_id=user_id, project_id=project_id, payer=payer,
+                    model_name=route["model_name"], provider=route.get("provider_name"),
+                    prompt_tokens=prompt_tokens, completion_tokens=0, usage_cost=cost,
+                    margin_multiplier=route["margin_multiplier"], credit_per_usd=conversion,
+                    source="api" if api_key_id is not None or not domain_billed else "web", api_key_id=api_key_id,
+                    breakdown=breakdown, execution_route=route,
+                )
+                held = False
+        except stateless_credit.ChargeExceedsReservation as exc:
+            raise EmbeddingError(502, "provider_result_unknown") from exc
+        except Exception as exc:
+            raise EmbeddingError(503, "embedding usage settlement unavailable") from exc
+    except credit.QuotaExceeded as exc:
+        raise EmbeddingError(429, str(exc)) from exc
+    except credit.ChatStorageUnavailable as exc:
+        raise EmbeddingError(503, "embedding service unavailable") from exc
     except EmbeddingError:
         raise
     except ApiKeyForbidden as exc:
@@ -137,39 +203,17 @@ async def embed(
     except ApiKeyAuthorityUnavailable as exc:
         raise EmbeddingError(503, "inference authority unavailable") from exc
     except errors.ProviderSubscriptionError as exc:
+        dispatched = False
         raise EmbeddingError(exc.status_code, "embedding protocol unsupported") from None
+    except ProviderError as exc:
+        dispatched = not exc.known_rejection
+        raise EmbeddingError(502, "upstream embedding error") from exc
     except Exception as exc:
         raise EmbeddingError(502, "upstream embedding error") from exc
-    if len(vectors) != len(inputs) or any(
-        expected_dimensions and len(item["embedding"]) != expected_dimensions for item in vectors
-    ):
-        raise EmbeddingError(502, "embedding response dimensions do not match the request")
-
-    usage = getattr(response, "usage", None)
-    prompt_tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else (
-        getattr(usage, "prompt_tokens", None) if usage is not None else None
-    )
-    estimated = type(prompt_tokens) is not int or prompt_tokens <= 0
-    if estimated:
-        prompt_tokens = sum(provider_metadata.count_tokens(route["model_name"], text=text) for text in inputs)
-    breakdown = UsageBreakdown.from_totals(prompt_tokens, 0)
-    try:
-        cost = provider_metadata.cost_from_usage(
-            route["model_name"], prompt_tokens, 0,
-            input_price_per_token=route.get("input_price_per_token"),
-            output_price_per_token=Decimal(0), price_source=route.get("price_source"),
-            provider_type=route.get("provider_type"), api_base=route.get("api_base"), breakdown=breakdown,
-            allow_catalog_prices=True,
-        )
-        credited = await credit.apply_usage(
-            event_id=str(uuid.uuid4()), user_id=user_id, project_id=project_id,
-            model_name=route["model_name"], provider=route.get("provider_name"),
-            prompt_tokens=prompt_tokens, completion_tokens=0, usage_cost=cost,
-            margin_multiplier=route["margin_multiplier"], source="api", api_key_id=api_key_id,
-            breakdown=breakdown, execution_route=route,
-        )
-    except Exception as exc:
-        raise EmbeddingError(503, "embedding usage settlement unavailable") from exc
+    finally:
+        if held:
+            with anyio.CancelScope(shield=True):
+                await stateless_credit.finish(event_id, uncertain=dispatched, payer=payer)
     return {
         "model": route["api_model_name"], "embeddings": vectors,
         "usage": {"prompt_tokens": prompt_tokens, "total_tokens": prompt_tokens, "estimated": estimated},

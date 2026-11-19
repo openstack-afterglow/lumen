@@ -86,6 +86,44 @@ func TestGeminiEmbeddingAndModalityUsageUseUpstreamConverters(t *testing.T) {
 		t.Fatalf("modality evidence %d %s calls=%d", status, result, calls.Load())
 	}
 }
+func TestNativeGeminiGenerateKeepsWireAndRequiresUsageTerminal(t *testing.T) {
+	for _, complete := range []bool{false, true} {
+		var paths []string
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			paths = append(paths, r.URL.RequestURI())
+			body, _ := io.ReadAll(r.Body)
+			if r.Header.Get("X-Goog-Api-Key") != "gemini-A" || !bytes.Equal(body, []byte(`{"contents":[{"parts":[{"text":"hi"}]}],"safetySettings":[{"category":"X","threshold":"BLOCK_NONE"}]}`)) {
+				t.Errorf("native request changed: %s", body)
+			}
+			if !strings.Contains(r.URL.RawQuery, "alt=sse") {
+				_, _ = io.WriteString(w, `{"candidates":[{"content":{"parts":[{"thoughtSignature":"sig","text":"ok"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":1}}`)
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(w, "data: "+`{"candidates":[{"content":{"parts":[{"text":"o"}]},"finishReason":"STOP"}]}`+"\n\n")
+			if complete {
+				_, _ = io.WriteString(w, "data: "+`{"usageMetadata":{"promptTokenCount":2,"candidatesTokenCount":1}}`+"\n\n")
+			}
+		}))
+		_, server := runtimeFixture(t)
+		request := `{"contents":[{"parts":[{"text":"hi"}]}],"safetySettings":[{"category":"X","threshold":"BLOCK_NONE"}]}`
+		status, result := execute(t, server, Envelope{Provider: "gemini", Protocol: "gemini_generate", APIBase: upstream.URL + "/v1beta", APIKey: "gemini-A", Body: json.RawMessage(`{"model":"gemini-2.5-flash","stream":false,"request":` + request + `}`)})
+		if status != 200 || !bytes.Contains(result, []byte(`"thoughtSignature":"sig"`)) {
+			t.Fatalf("native response changed %d %s", status, result)
+		}
+		status, result = execute(t, server, Envelope{Provider: "gemini", Protocol: "gemini_generate", APIBase: upstream.URL + "/v1beta", APIKey: "gemini-A", Body: json.RawMessage(`{"model":"gemini-2.5-flash","stream":true,"request":` + request + `}`)})
+		if status != 200 || bytes.Contains(result, []byte("[DONE]")) != complete {
+			t.Fatalf("usage terminal=%v %d %s", complete, status, result)
+		}
+		if paths[0] != "/v1beta/models/gemini-2.5-flash:generateContent" || paths[1] != "/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse" {
+			t.Fatalf("wrong targets %v", paths)
+		}
+		upstream.Close()
+	}
+	if _, err := prepare(context.Background(), Envelope{Provider: "openai", Protocol: "gemini_generate", APIKey: "a", Body: json.RawMessage(`{"model":"m","request":{}}`)}); err == nil {
+		t.Fatal("non-Gemini provider accepted the native Gemini protocol")
+	}
+}
 func TestNativeResponsesEventsRetainReasoningAndToolPayload(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

@@ -19,7 +19,7 @@ from lumen.config import get_settings
 CONTRACT = "single-attempt-v1"
 # Kept in sync with the pinned module in runtime/bifrost/go.mod.
 BIFROST_VERSION = "v1.13.2-0.20261021235121-668a660e5ac0"
-_PROTOCOLS = {"chat", "responses", "messages", "count_tokens", "embeddings"}
+_PROTOCOLS = {"chat", "responses", "messages", "count_tokens", "embeddings", "gemini_generate"}
 
 
 class BifrostRuntimeError(RuntimeError):

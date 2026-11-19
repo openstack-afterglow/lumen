@@ -17,6 +17,8 @@ SCOPE_CAPABILITIES: dict[str, tuple[str, ...]] = {
     "compat:images:write": ("lumen-images_user",),
     "compat:audio:write": ("lumen-audio_user",),
     "compat:realtime:write": ("lumen-audio_user",),
+    "embeddings:write": ("lumen-chat_user",),
+    "decisions:write": ("lumen-chat_user",),
     "compat:batches:read": ("lumen-history_reader",),
     "compat:batches:write": ("lumen-chat_user", "lumen-images_user", "lumen-audio_user"),
     "compat:files:read": ("lumen-inventory_reader",),
@@ -51,6 +53,40 @@ SCOPE_CAPABILITIES: dict[str, tuple[str, ...]] = {
     "native:keys:write": ("lumen-keys_editor",),
     "native:keys:delete": ("lumen-resources_admin",),
 }
+
+# The matched route template and method must both appear here. A new route
+# sharing an action does not automatically become available to model keys.
+MODEL_API_KEY_ROUTE_SCOPES = {
+    ("GET", "/v1/models"): "models:read",
+    ("GET", "/v1/cli/models"): "models:read",
+    ("GET", "/v1/chat/models"): "models:read",
+    ("POST", "/v1/chat/completions"): "compat:completions:write",
+    ("POST", "/v1/messages"): "compat:completions:write",
+    ("POST", "/v1/messages/count_tokens"): "compat:completions:write",
+    ("POST", "/v1/responses"): "compat:completions:write",
+    ("GET", "/v1beta/models"): "models:read",
+    ("GET", "/v1beta/models/{model:path}"): "models:read",
+    ("POST", "/v1beta/models/{model:path}:generateContent"): "compat:completions:write",
+    ("POST", "/v1beta/models/{model:path}:streamGenerateContent"): "compat:completions:write",
+    ("POST", "/v1beta/models/{model:path}:countTokens"): "compat:completions:write",
+    ("POST", "/v1/embeddings"): "embeddings:write",
+    ("POST", "/v1/chat/embeddings"): "embeddings:write",
+    ("POST", "/v1beta/models/{model:path}:embedContent"): "embeddings:write",
+    ("POST", "/v1beta/models/{model:path}:batchEmbedContents"): "embeddings:write",
+    ("POST", "/v1/decisions"): "decisions:write",
+    ("POST", "/v1/chat/decisions"): "decisions:write",
+    ("POST", "/v1beta/decisions"): "decisions:write",
+    ("POST", "/v1/images/generations"): "compat:images:write",
+    ("POST", "/v1/images/edits"): "compat:images:write",
+    ("POST", "/v1/audio/speech"): "compat:audio:write",
+    ("POST", "/v1/audio/transcriptions"): "compat:audio:write",
+    ("POST", "/v1/chat/audio/speech"): "native:audio:write",
+    ("WEBSOCKET", "/v1/realtime"): "compat:realtime:write",
+    ("WEBSOCKET", "/v1/realtime/translations"): "compat:realtime:write",
+    ("WEBSOCKET", "/v1/live/sessions"): "compat:realtime:write",
+    ("WEBSOCKET", "/v1beta/realtime"): "compat:realtime:write",
+}
+MODEL_API_KEY_SCOPES = frozenset(MODEL_API_KEY_ROUTE_SCOPES.values())
 
 
 def capabilities(principal: dict) -> frozenset[str]:

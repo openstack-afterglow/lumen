@@ -31,7 +31,8 @@ _TRANSCRIPTION_FIELDS = frozenset({"file", "model", "provider", "provider_id", "
 
 def _compat_error(exc: HTTPException) -> JSONResponse:
     code = {402: 429, 422: 400}.get(exc.status_code, exc.status_code)
-    return openai_error_response(code, str(exc.detail), type_="timeout_error" if code == 504 else None)
+    return openai_error_response(code, str(exc.detail), type_="timeout_error" if code == 504 else None,
+                                 code="domain_credit_insufficient" if exc.detail == "domain_credit_insufficient" else None)
 
 
 async def _replayed_source(path: Path, key: uuid.UUID, principal: Principal) -> str | None:
@@ -101,7 +102,7 @@ async def speech(
                                 response_format=body.get("response_format", "mp3"), provider_id=body.get("provider_id"))
         run_id = await admit(payload, kind="tts", principal=principal,
                              idempotency_key=idempotency_key or uuid.uuid4(), api_provider=body.get("provider"),
-                             required_scopes=("compat:audio:write",))
+                             required_scopes=("compat:audio:write",), compat=True)
         result = await completed_audio(run_id, principal=principal, request=request)
         return await speech_stream(result, principal=principal)
     except ValidationError as exc:
@@ -161,7 +162,7 @@ async def transcriptions(
         try:
             run_id = await admit(payload, kind="stt", principal=principal,
                                  idempotency_key=idempotency_key or uuid.uuid4(), api_provider=provider,
-                                 required_scopes=("compat:audio:write",))
+                                 required_scopes=("compat:audio:write",), compat=True)
             result = await completed_audio(run_id, principal=principal, request=request)
             if result.get("kind") != "stt":
                 raise HTTPException(status_code=503, detail="transcript is unavailable")

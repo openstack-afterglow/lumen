@@ -114,11 +114,13 @@ async def test_claim_one_releases_mysql_transaction_before_external_work(monkeyp
         async def connection(self, *, execution_options):
             assert execution_options == {"isolation_level": "READ COMMITTED"}
 
-        async def get(self, _model, _memory_id):
+        async def get(self, model, note_id):
+            assert model is memory_outbox.VaultNote and note_id == 7
             return SimpleNamespace(
                 id=7,
                 user_id="user",
-                project_id="project",
+                domain_id="domain",
+                vector_project_id="domain",
                 workspace_id=None,
                 status="active",
                 is_active=True,
@@ -127,7 +129,8 @@ async def test_claim_one_releases_mysql_transaction_before_external_work(monkeyp
 
     row = SimpleNamespace(
         change_seq=3,
-        memory_id=7,
+        memory_id=None,
+        vault_note_id=7,
         mutation="upsert",
         content_hash="a" * 64,
         required_generations=[1],
@@ -145,6 +148,7 @@ async def test_claim_one_releases_mysql_transaction_before_external_work(monkeyp
     claim = await memory_outbox.claim_one(owner="worker")
 
     assert claim is not None
+    assert (claim.memory_id, claim.mutation, claim.project_id, claim.plaintext) == (7, "upsert", "domain", "plaintext")
     assert state["transaction_exited"] is True
 
 

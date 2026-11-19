@@ -1,4 +1,4 @@
-"""Store-level project-isolation regressions for chat agents.
+"""Store-level domain-isolation regressions for chat agents.
 
 These tests exercise the SQLAlchemy predicates emitted by the store rather than
 only asserting router-to-store argument forwarding.
@@ -84,6 +84,7 @@ async def test_owned_agent_operations_reject_same_user_other_project(monkeypatch
     assert "chat_agents.id = 41" in sql
     assert "chat_agents.owner_user_id = 'user-1'" in sql
     assert "chat_agents.project_id = 'project-current'" in sql
+    assert "chat_agents.domain_id IS NULL" in sql
     assert session.deleted == []
 
 
@@ -113,7 +114,7 @@ async def test_clone_rejects_inactive_public_template(monkeypatch):
     assert "chat_agents.is_active IS true" in sql
 
 
-async def test_owned_legacy_template_can_only_be_cloned_into_the_current_project(monkeypatch):
+async def test_owned_legacy_template_clones_only_in_its_origin(monkeypatch):
     source = SimpleNamespace(
         id=41,
         owner_user_id="user-1",
@@ -122,6 +123,7 @@ async def test_owned_legacy_template_can_only_be_cloned_into_the_current_project
         avatar=None,
         instructions=None,
         model_name=None,
+        model_row_id=None,
         params=None,
         is_active=True,
         visibility="private",
@@ -135,18 +137,61 @@ async def test_owned_legacy_template_can_only_be_cloned_into_the_current_project
     session = LegacyCloneSession()
     _scope_store(monkeypatch, session)
 
-    clone = await ags.clone_agent(41, user_id="user-1", project_id="project-current")
+    clone = await ags.clone_agent(41, user_id="user-1", project_id="project-current", domain_id="domain-current")
 
     sql = _statement_sql(session)
-    assert "chat_agents.project_id IS NULL" in sql
+    assert "chat_agents.domain_id = 'domain-current'" in sql
+    assert "chat_agents.domain_id IS NULL AND chat_agents.project_id = 'project-current'" in sql
     assert clone["owner_user_id"] == "user-1"
     assert clone["cloned_from_id"] == 41
     assert session.added.project_id == "project-current"
+    assert session.added.domain_id == "domain-current"
     assert session.added.mcp_ids is None
     assert session.added.tool_ids is None
 
 
-async def test_legacy_template_is_not_executable_until_cloned(monkeypatch):
+async def test_exact_agent_model_create_update_and_run_projection(client, monkeypatch):
+    class ModelSession(_Session):
+        async def execute(self, statement):
+            self.statements.append(statement)
+            return _Result(self.added)
+
+        async def flush(self):
+            self.added.id = 41
+
+    session = ModelSession()
+    _scope_store(monkeypatch, session)
+
+    async def resolve(row_id, *, model_kind):
+        assert model_kind == "text"
+        if row_id in (11, 12):
+            return {"model_name": "duplicate", "model_id": row_id, "provider_id": row_id - 10}
+        return None
+
+    monkeypatch.setattr(ags.routing, "resolve_model_by_id", resolve)
+    url = "/api/v1/chat/agents"
+    invalid = await client.post(url, json={"name": "Pinned", "model_row_id": 12, "model_name": "wrong"})
+    assert (invalid.status_code, invalid.json()["detail"]) == (422, "model_selection_mismatch")
+    created = await client.post(url, json={"name": "Pinned", "model_row_id": 12})
+    assert created.status_code == 201
+    assert (created.json()["model_row_id"], created.json()["model_name"]) == (12, "duplicate")
+    assert session.added.model_row_id == 12
+
+    invalid = await client.patch(f"{url}/41", json={"model_row_id": 11, "model_name": "wrong"})
+    assert (invalid.status_code, invalid.json()["detail"]) == (422, "model_selection_mismatch")
+    assert session.added.model_row_id == 12
+    updated = await client.patch(f"{url}/41", json={"model_row_id": 11, "model_name": "duplicate"})
+    assert updated.status_code == 200
+    assert updated.json()["model_row_id"] == 11
+    for_run = await ags.get_agent_for_run(41, user_id="test-user-123", project_id="test-project-123")
+    assert (for_run["model_row_id"], for_run["model_name"]) == (11, "duplicate")
+    echoed = await client.patch(f"{url}/41", json={"model_name": "duplicate"})
+    assert echoed.json()["model_row_id"] == 11
+    legacy = await client.patch(f"{url}/41", json={"model_name": "new-name"})
+    assert (legacy.json()["model_row_id"], legacy.json()["model_name"]) == (None, "new-name")
+
+
+async def test_agent_use_without_verified_domain_requires_exact_legacy_origin(monkeypatch):
     session = _Session()
     _scope_store(monkeypatch, session)
 
@@ -154,22 +199,29 @@ async def test_legacy_template_is_not_executable_until_cloned(monkeypatch):
 
     sql = _statement_sql(session)
     assert "chat_agents.project_id = 'project-current'" in sql
+    assert "chat_agents.domain_id IS NULL" in sql
     assert "chat_agents.is_active IS true" in sql
 
 
-async def test_hub_marks_same_user_different_project_template_as_not_owned(monkeypatch):
+@pytest.mark.parametrize(("caller_domain", "owner"), [("domain-shared", True), ("domain-other", False), (None, False)])
+async def test_hub_hides_private_attachments_even_if_ownership_matches(monkeypatch, caller_domain, owner):
     source = SimpleNamespace(
         id=41,
         owner_user_id="user-1",
         project_id="project-other",
+        domain_id="domain-shared",
         name="other project template",
         description=None,
         avatar=None,
         instructions=None,
         model_name=None,
+        model_row_id=None,
         params=None,
-        mcp_ids=None,
-        tool_ids=None,
+        mcp_ids=[4],
+        tool_ids=[5],
+        skill_ids=[6],
+        plugin_tool_ids=["private-tool"],
+        plugin_skill_ids=["private-skill"],
         visibility="public",
         cloned_from_id=None,
         clone_count=0,
@@ -185,11 +237,13 @@ async def test_hub_marks_same_user_different_project_template_as_not_owned(monke
     session = PublicRowsSession()
     _scope_store(monkeypatch, session)
 
-    hub = await ags.list_public(user_id="user-1", project_id="project-current")
+    hub = await ags.list_public(user_id="user-1", project_id="project-current", domain_id=caller_domain)
 
     assert hub[0]["id"] == 41
     assert "chat_agents.is_active IS true" in _statement_sql(session)
-    assert hub[0]["is_owner"] is False
+    assert hub[0]["is_owner"] is owner
+    for field in ("mcp_ids", "tool_ids", "skill_ids", "plugin_tool_ids", "plugin_skill_ids"):
+        assert hub[0][field] == []
 
 
 async def test_same_user_can_clone_public_template_from_another_project(monkeypatch):
@@ -201,7 +255,8 @@ async def test_same_user_can_clone_public_template_from_another_project(monkeypa
         description=None,
         avatar=None,
         instructions=None,
-        model_name=None,
+        model_name="pinned-model",
+        model_row_id=12,
         params=None,
         is_active=True,
         visibility="public",
@@ -219,3 +274,4 @@ async def test_same_user_can_clone_public_template_from_another_project(monkeypa
 
     assert clone["cloned_from_id"] == 41
     assert session.added.project_id == "project-current"
+    assert (clone["model_row_id"], clone["model_name"]) == (12, "pinned-model")

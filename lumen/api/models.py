@@ -18,7 +18,8 @@ from pydantic_core import PydanticCustomError
 from lumen.auth import require_admin
 from lumen.services import model_discovery
 from lumen.services.native_catalog import ModelKind, catalog_response, validate_embedding_metadata
-from lumen.services.providers import accounts, billing, credentials, errors, repository, subscriptions
+from lumen.services.providers import accounts, billing, credentials, errors, repository, routing, subscriptions
+from lumen.services.providers.pricing import domain_billing_readiness, frozen_token_pricing
 
 _PER_TOKEN_QUANTUM = Decimal("0.0000000001")
 _TOKENS_PER_MILLION = Decimal("1000000")
@@ -462,6 +463,10 @@ class ModelResponse(BaseModel):
     model_kind: ModelKind = "text"
     media_pricing: dict | None = None
     effective_media_pricing: dict | None = None
+    effective_media_price_sources: dict = Field(default_factory=dict)
+    effective_text_price_sources: dict[str, Literal["manual", "catalog"]] = Field(default_factory=dict)
+    # Image rows only: priced choices this provider/model can execute, independent of credentials.
+    image_pricing_readiness: dict | None = None
     api_model_name: str
     api_provider: str
     provider_type: str | None = None
@@ -493,6 +498,8 @@ class ModelResponse(BaseModel):
     capability_source: str | None = None
     effective_capabilities: dict | None = None
     effective_capability_source: str | None = None
+    # Text models only: {"ready", "reason_code"}; set capabilities.context_limit to fix context_limit_unknown.
+    domain_billing: dict | None = None
     created_at: str | None
     updated_at: str | None
 
@@ -870,6 +877,29 @@ async def get_native_catalog(provider_type: Literal["openai", "anthropic", "gemi
     return catalog_response(provider_type=provider_type)
 
 
+@router.get("/admin/title-model")
+async def get_title_model():
+    """Configured title/compaction model and whether domain-paid compaction can use it.
+
+    Title and memory jobs stay system-funded. Only in-run compaction is domain-paid; when the
+    title model is not domain-billing ready, domain-paid runs compact with their own chat model.
+    """
+    try:
+        route = await routing.resolve_title_model()
+    except errors.ChatStorageUnavailable as exc:
+        raise _map_storage(exc) from exc
+    if route is None:
+        return {"model_id": None, "model_name": None, "domain_billing": None,
+                "domain_compaction_route": "execution_model"}
+    readiness = domain_billing_readiness(route.get("capabilities") or {}, frozen_token_pricing(route))
+    return {
+        "model_id": route["model_id"],
+        "model_name": route["model_name"],
+        "domain_billing": readiness,
+        "domain_compaction_route": "title_model" if readiness["ready"] else "execution_model",
+    }
+
+
 @router.put("/admin/title-model", status_code=204)
 async def set_title_model(payload: TitleModelRequest):
     """대화 제목 자동 요약에 쓸 모델 1개를 지정(또는 해제). 요약 호출 비용은 시스템 부담."""
@@ -900,6 +930,8 @@ async def set_memory_model(payload: MemoryModelRequest):
 async def create_model(payload: ModelCreateRequest):
     try:
         return await repository.create_model(**payload.model_dump())
+    except errors.ImagePricingNotReady as exc:
+        raise HTTPException(status_code=409, detail=exc.detail()) from exc
     except errors.ProviderValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except errors.ChatStorageUnavailable as exc:
@@ -929,6 +961,8 @@ async def update_model(model_id: int, payload: ModelUpdateRequest):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except errors.ActiveRunConfigurationConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except errors.ImagePricingNotReady as exc:
+        raise HTTPException(status_code=409, detail=exc.detail()) from exc
     except errors.ProviderValidationError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except errors.ChatStorageUnavailable as exc:

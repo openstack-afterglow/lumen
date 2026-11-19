@@ -78,6 +78,10 @@ async def lifespan(app: FastAPI):
 async def _service_lifespan(app: FastAPI):
     configure_logging("api")
     settings = get_settings()
+    from lumen.services.afterglow_ingress import ingress_key
+
+    if ingress_key() is None:
+        logger.warning("Agent Vault disabled: LUMEN_AFTERGLOW_INGRESS_SECRET must contain at least 32 bytes")
     registry = get_registry()
     # Approved distributions/versions are checked before any entry point is imported;
     # an incompatible or missing required plugin stops the process instead of falling back.
@@ -108,6 +112,12 @@ async def _service_lifespan(app: FastAPI):
 
         await setup_semantic_memory()
 
+    scope_backfill = None
+    if settings.database_url:
+        from lumen.services.domain_scope_backfill import startup_domain_scope_backfill
+
+        scope_backfill = asyncio.create_task(startup_domain_scope_backfill(), name="domain-scope-backfill")
+
     logger.info("api ready")
     if logger.isEnabledFor(logging.DEBUG):
         logger.debug(
@@ -116,7 +126,12 @@ async def _service_lifespan(app: FastAPI):
             settings.chat_semantic_memory_enabled,
         )
 
-    yield
+    try:
+        yield
+    finally:
+        if scope_backfill is not None:
+            scope_backfill.cancel()
+            await asyncio.gather(scope_backfill, return_exceptions=True)
 
     try:
         from lumen.services.checkpointer import chat_checkpointer
@@ -354,8 +369,11 @@ from lumen.api import (
     chat_workspaces_router,
     claude_gateway,
 )
+from lumen.api import domain_pools as domain_pool_routes
+from lumen.api import extension_archives as extension_archive_routes
 from lumen.api import plugins as plugin_routes
 from lumen.api import policy as policy_routes
+from lumen.api import vault as vault_routes
 from lumen.api.compat import anthropic as compat_anthropic
 from lumen.api.compat import audio as compat_audio
 from lumen.api.compat import batches as compat_batches
@@ -364,6 +382,7 @@ from lumen.api.compat import decisions as compat_decisions
 from lumen.api.compat import discovery as compat_discovery
 from lumen.api.compat import embeddings as compat_embeddings
 from lumen.api.compat import files as compat_files
+from lumen.api.compat import gemini as compat_gemini
 from lumen.api.compat import images as compat_images
 from lumen.api.compat import openai as compat_openai
 from lumen.api.compat import realtime as compat_realtime
@@ -375,6 +394,7 @@ from lumen.auth import require_chat_api_host
 app.include_router(policy_routes.router, prefix="/v1", tags=["Policy"])
 app.include_router(plugin_routes.admin_router, prefix="/v1", tags=["Plugin Administration"])
 app.include_router(plugin_routes.router, prefix="/v1", tags=["Plugin Catalogue"])
+app.include_router(vault_routes.router, prefix="/v1", tags=["Agent Vault"])
 app.include_router(agent_runtime_routes.admin_router, prefix="/v1", tags=["Agent Runtime Administration"])
 app.include_router(agent_runtime_routes.router, prefix="/v1", tags=["Agent Runtime"])
 for router, tag in (
@@ -395,7 +415,9 @@ for router, tag in (
     (chat_mcp_oauth_router, "Chat MCP OAuth"),
     (chat_extensions_admin_router, "Chat Extensions Admin"),
     (chat_extensions_user_router, "Chat Extensions"),
+    (extension_archive_routes.router, "Chat Extension Archives"),
     (chat_usage_router, "Chat Usage"),
+    (domain_pool_routes.router, "Domain Credits"),
     (chat_stats_router, "Chat Stats"),
     (chat_quotas_router, "Chat Quotas"),
     (chat_admin_router, "Chat Administration"),
@@ -420,6 +442,7 @@ for router, tag in (
     app.include_router(router, prefix="/v1", tags=[tag], dependencies=[Depends(require_chat_api_host)])
 app.include_router(compat_realtime.router, tags=["Realtime Voice Compat"])
 compat_embeddings.google_router.include_router(compat_decisions.google_router, tags=["Gemini Decisions Compat"])
+compat_embeddings.google_router.include_router(compat_gemini.router)
 app.include_router(
     compat_embeddings.google_router, tags=["Gemini Compat"],
     dependencies=[Depends(require_chat_api_host)],
@@ -453,7 +476,9 @@ def custom_openapi() -> dict:
         batch_item_scopes,
     )
     from lumen.models.chat_contracts import _CHAT_RUN_EVENT
+    from lumen.models.decision_contracts import NativeDecisionRequest
     from lumen.models.gemini_decision_contracts import GeminiDecisionRequest
+    from lumen.service_authority import MODEL_API_KEY_ROUTE_SCOPES
 
     schema = get_openapi(title=app.title, version=app.version, description=app.description, routes=app.routes)
     schema["x-contract-version"] = "1.0.0"
@@ -464,6 +489,7 @@ def custom_openapi() -> dict:
         "openai_embeddings": "OpenAI-compatible stateless text embeddings (/v1/embeddings)",
         "openai_decisions": "OpenAI-compatible stateless typed decisions (/v1/decisions)",
         "gemini_embeddings": "Google Gemini-compatible text embeddings (/v1beta/models/{model}:embedContent, :batchEmbedContents)",
+        "gemini_models": "Google Gemini API v1beta models list/get, generateContent and streamGenerateContent (?alt=sse)",
         "gemini_decisions": "Google Gemini-compatible stateless typed decisions (/v1beta/decisions)",
         "anthropic_stateless": "Anthropic-compatible stateless completion (/v1/messages)",
         "openai_images": "OpenAI-compatible durable image generation and edits (/v1/images/generations, /v1/images/edits)",
@@ -531,31 +557,21 @@ def custom_openapi() -> dict:
     ):
         if path in schema.get("paths", {}) and method in schema["paths"][path]:
             schema["paths"][path][method]["security"] = api_key_security
-    for path in ("/v1beta/decisions", "/v1beta/models/{model}:embedContent", "/v1beta/models/{model}:batchEmbedContents"):
-        if path in schema.get("paths", {}) and "post" in schema["paths"][path]:
-            schema["paths"][path]["post"]["security"] = [*api_key_security, {"GoogleApiKey": []}]
+    gemini_paths = (
+        ("/v1beta/decisions", "post"), ("/v1beta/models/{model}:embedContent", "post"),
+        ("/v1beta/models/{model}:batchEmbedContents", "post"), ("/v1beta/models", "get"),
+        ("/v1beta/models/{model}", "get"), ("/v1beta/models/{model}:generateContent", "post"),
+        ("/v1beta/models/{model}:streamGenerateContent", "post"), ("/v1beta/models/{model}:countTokens", "post"),
+    )
+    for path, method in gemini_paths:
+        if path in schema.get("paths", {}) and method in schema["paths"][path]:
+            schema["paths"][path][method]["security"] = [*api_key_security, {"GoogleApiKey": []}]
 
     route_scopes: dict[tuple[str, str], list[str]] = {
-        ("/v1/images/generations", "post"): ["compat:images:write"],
-        ("/v1/images/edits", "post"): ["compat:images:write", "native:assets:write"],
-        ("/v1/audio/speech", "post"): ["compat:audio:write"],
-        ("/v1/audio/transcriptions", "post"): ["compat:audio:write", "native:assets:write"],
-        ("/v1/chat/completions", "post"): ["compat:completions:write"],
-        ("/v1/embeddings", "post"): ["compat:completions:write"],
-        ("/v1/decisions", "post"): ["compat:completions:write"],
-        ("/v1beta/decisions", "post"): ["compat:completions:write"],
-        ("/v1beta/models/{model}:embedContent", "post"): ["compat:completions:write"],
-        ("/v1beta/models/{model}:batchEmbedContents", "post"): ["compat:completions:write"],
-        ("/v1/responses", "post"): ["compat:completions:write"],
-        ("/v1/messages", "post"): ["compat:completions:write"],
-        ("/v1/messages/count_tokens", "post"): ["compat:completions:write"],
         ("/v1/claude-gateway/v1/messages", "post"): ["compat:completions:write"],
         ("/v1/claude-gateway/v1/messages/count_tokens", "post"): ["compat:completions:write"],
         ("/v1/claude-gateway/v1/models", "get"): ["models:read"],
         ("/v1/claude-gateway/v1/managed-settings", "get"): ["models:read"],
-        ("/v1/models", "get"): ["models:read"],
-        ("/v1/cli/models", "get"): ["models:read"],
-        ("/v1/chat/models", "get"): ["models:read"],
         ("/v1/capabilities", "get"): ["models:read"],
         ("/v1/conversations", "post"): ["native:conversations:write"],
         ("/v1/conversations", "get"): ["native:conversations:read"],
@@ -571,10 +587,8 @@ def custom_openapi() -> dict:
             "native:runs:write",
         ],
         ("/v1/temp-completions", "post"): ["native:runs:write"],
-        ("/v1/chat/decisions", "post"): ["native:runs:write"],
         ("/v1/chat/images/generations", "post"): ["native:images:write"],
         ("/v1/chat/images/edits", "post"): ["native:images:write", "native:assets:read"],
-        ("/v1/chat/audio/speech", "post"): ["native:audio:write"],
         ("/v1/chat/audio/transcriptions", "post"): ["native:audio:write", "native:assets:read"],
         ("/v1/chat/realtime/sessions", "post"): ["native:realtime:write"],
         ("/v1/conversations/{conversation_id}/messages/{message_id}/regenerate", "post"): [
@@ -616,6 +630,13 @@ def custom_openapi() -> dict:
         ("/v1/batches/{batch_id}", "get"): ["compat:batches:read"],
         ("/v1/batches/{batch_id}/cancel", "post"): ["compat:batches:write"],
     }
+    model_key_scopes = {
+        # Route templates may use converters (``{model:path}``); OpenAPI paths do not.
+        (path.replace("{model:path}", "{model}"), method.lower()): [scope]
+        for (method, path), scope in MODEL_API_KEY_ROUTE_SCOPES.items()
+        if method != "WEBSOCKET"
+    }
+    route_scopes.update(model_key_scopes)
     admission_posts = {
         ("/v1/conversations/{conversation_id}/completions", "post"),
         ("/v1/conversations/{conversation_id}/messages/{message_id}/regenerate", "post"),
@@ -633,6 +654,7 @@ def custom_openapi() -> dict:
         if path in schema.get("paths", {}) and method in schema["paths"][path]:
             op = schema["paths"][path][method]
             op["x-required-api-key-scopes"] = scopes
+            op["x-model-api-key-allowed"] = (path, method) in model_key_scopes
             if (path, method) in admission_posts:
                 op["x-conditional-api-key-scopes"] = conditional_scopes
     batch_conditional_scopes = {
@@ -694,6 +716,12 @@ def custom_openapi() -> dict:
     for def_name, def_schema in gemini_schema.pop("$defs", {}).items():
         components_schemas[f"GeminiDecision_{def_name}"] = def_schema
     components_schemas["GeminiDecisionRequest"] = gemini_schema
+    decision_schema = NativeDecisionRequest.model_json_schema(
+        ref_template="#/components/schemas/NativeDecision_{model}",
+    )
+    for def_name, def_schema in decision_schema.pop("$defs", {}).items():
+        components_schemas[f"NativeDecision_{def_name}"] = def_schema
+    components_schemas["NativeDecisionRequest"] = decision_schema
 
     def _fix_refs(obj: Any) -> None:
         if isinstance(obj, dict):
