@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field
 from lumen.auth import require_api_key_scopes
 from lumen.services import completion_api as core
 from lumen.services import openai_compat
-from lumen.services.inference_authority import HOSTED_TOOL_CODE, HOSTED_TOOL_MESSAGE, hosted_tools, principal_may_use
+from lumen.services.inference_authority import HOSTED_TOOL_CODE, hosted_tool_message, hosted_tools, principal_may_use
 from lumen.services.infrastructure.api_load import admit_sse, register_sse_resource
 from lumen.services.providers import errors, routing
 
@@ -385,8 +385,8 @@ def _error_frame(event: dict) -> str:
 async def _prepare(model: str, body: GeminiGenerateRequest, provider: str | None, token_info: dict) -> dict:
     selector = model.removeprefix("models/")
     # Same key tool policy as every compatibility route, before any provider resolution.
-    if hosted_tools(body.model_dump(exclude_none=True)):
-        raise core.CompletionError(403, f"{HOSTED_TOOL_CODE}: {HOSTED_TOOL_MESSAGE}", code=HOSTED_TOOL_CODE)
+    if hosted := hosted_tools(body.model_dump(exclude_none=True)):
+        raise core.CompletionError(403, f"{HOSTED_TOOL_CODE}: {hosted_tool_message(hosted)}", code=HOSTED_TOOL_CODE)
     if selector == openai_compat.VIRTUAL_MODEL_ID:
         raise core.CompletionError(404, f"model not found: {selector}")
     resolved = await core.resolve_api(selector, provider=provider, operation="chat")
