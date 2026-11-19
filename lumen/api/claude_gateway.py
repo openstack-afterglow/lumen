@@ -223,7 +223,10 @@ async def messages(
     ensure_scopes(token_info, *completion_scopes(request_body))
     try:
         _model, resolved = await _resolved_gateway_model()
-        await core.precheck(token_info["user_id"], token_info["project_id"], api_key_id=token_info.get("api_key_id"))
+        # The server-side principal payer selects the bounded wallet hold; without it the call
+        # would fall back to an advisory precheck that parallel requests can overrun.
+        await core.precheck(token_info["user_id"], token_info["project_id"], api_key_id=token_info.get("api_key_id"),
+                            payer=token_info.get("payer"))
         options = body.model_dump(
             exclude={"model", "provider", "messages", "max_tokens", "stream"},
             exclude_none=True,
@@ -235,6 +238,7 @@ async def messages(
             user_id=token_info["user_id"],
             project_id=token_info["project_id"],
             api_key_id=token_info.get("api_key_id"),
+            payer=token_info.get("payer"),
             resolved=resolved,
             messages=body.messages,
             max_tokens=body.max_tokens,

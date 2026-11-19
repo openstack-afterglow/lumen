@@ -9,6 +9,7 @@ from starlette.requests import Request
 
 from lumen import auth
 from lumen.main import app
+from lumen.models.billing import Payer
 from lumen.models.chat_db import ChatGatewayDeviceGrant
 from lumen.services import api_key_store
 from lumen.services import claude_gateway as gateway
@@ -35,6 +36,7 @@ def gateway_auth():
             "credential_kind": "claude_gateway",
             "expires_at": datetime.now(UTC) + timedelta(hours=1),
             "source": "api",
+            "payer": Payer("user", "user-1", None),
             "roles": ["member", "lumen-inventory_reader", "lumen-chat_user"],
             "is_system_admin": False,
         }
@@ -243,7 +245,7 @@ async def test_gateway_messages_use_configured_route_and_preserve_native_blocks(
         return {"model_name": model, "provider_name": provider}
 
     async def precheck(*args, **kwargs):
-        return None
+        captured["precheck_payer"] = kwargs.get("payer")
 
     async def complete(**kwargs):
         captured.update(kwargs)
@@ -289,6 +291,8 @@ async def test_gateway_messages_use_configured_route_and_preserve_native_blocks(
         "anthropic-beta": "context-management-2025-06-27",
         "anthropic-version": "2023-06-01",
     }
+    # The server-side principal payer reaches both the precheck and the bounded hold.
+    assert captured["precheck_payer"] == captured["payer"] == Payer("user", "user-1", None)
 
 
 async def test_gateway_count_tokens_does_not_require_generation_budget(client, gateway_auth, monkeypatch):
