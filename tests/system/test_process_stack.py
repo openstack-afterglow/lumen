@@ -134,16 +134,22 @@ def test_process_stack_temp_completion_e2e() -> None:
     }
 
     with httpx.Client(base_url=api_base_url, timeout=30.0) as client:
-        # 1. Call GET /v1/models
+        # 1. Call GET /v1/models. Model API keys never see or call the virtual model.
         models_resp = client.get(f"{container_base_url}/models", headers=headers)
         assert models_resp.status_code == 200, f"GET /v1/models failed: {models_resp.status_code}"
         models_data = models_resp.json()
         assert models_data.get("object") == "list", "GET /v1/models response must be an OpenAI model list"
         model_ids = {item.get("id") for item in models_data.get("data", [])}
         assert model_name in model_ids, "Generated connection model is absent from GET /v1/models"
-        assert "lumen" in model_ids, "Lumen virtual model is absent from GET /v1/models"
-        lumen_model_item = next((item for item in models_data.get("data", []) if item.get("id") == "lumen"), None)
-        assert lumen_model_item is not None and lumen_model_item.get("owned_by") == "lumen"
+        assert "lumen" not in model_ids, "Lumen virtual model must stay hidden from a model API key"
+        denied_lumen = client.post(
+            f"{container_base_url}/chat/completions", headers=headers,
+            json={"model": "lumen", "messages": [{"role": "user", "content": "model key must not reach lumen"}]},
+        )
+        assert denied_lumen.status_code == 403, denied_lumen.text
+        assert denied_lumen.json()["error"]["code"] == "model_not_allowed_for_key"
+        # Gateway keys keep the virtual model; test_process_stack_native_protocols_and_gateway_device_login
+        # lists and runs it with the device-issued key.
 
         # 2. Call non-streaming POST /v1/chat/completions
         chat_payload = {
@@ -210,65 +216,6 @@ def test_process_stack_temp_completion_e2e() -> None:
         assert stream_usage.get("prompt_tokens") == 10
         assert stream_usage.get("completion_tokens") == 5
         assert stream_usage.get("total_tokens") == 15
-
-        # 3b. Call non-streaming POST /v1/chat/completions with model="lumen" (durable run via worker)
-        chat_payload_lumen = {
-            "model": "lumen",
-            "messages": [{"role": "user", "content": "Hello process stack via lumen virtual model"}],
-            "stream": False,
-        }
-        chat_resp_lumen = client.post(
-            f"{container_base_url}/chat/completions", headers=headers, json=chat_payload_lumen
-        )
-        assert chat_resp_lumen.status_code == 200, (
-            f"POST /v1/chat/completions (model=lumen) failed: {chat_resp_lumen.status_code}"
-        )
-        chat_data_lumen = chat_resp_lumen.json()
-        assert chat_data_lumen.get("model") == "lumen", "Expected model=lumen in response"
-        choices_lumen = chat_data_lumen.get("choices", [])
-        assert len(choices_lumen) == 1
-        assert choices_lumen[0].get("message", {}).get("content") == "Hello from fake provider!"
-        usage_lumen = chat_data_lumen.get("usage", {})
-        assert usage_lumen.get("total_tokens") == 15
-
-        # 3c. Call streaming POST /v1/chat/completions with model="lumen" and include_usage
-        stream_payload_lumen = {
-            "model": "lumen",
-            "messages": [{"role": "user", "content": "Hello streaming process stack via lumen virtual model"}],
-            "stream": True,
-            "stream_options": {"include_usage": True},
-        }
-
-        received_deltas_lumen: list[str] = []
-        stream_usage_lumen = None
-        seen_done_lumen = False
-
-        with client.stream(
-            "POST", f"{container_base_url}/chat/completions", headers=headers, json=stream_payload_lumen
-        ) as stream_resp_lumen:
-            assert stream_resp_lumen.status_code == 200
-            for line in stream_resp_lumen.iter_lines():
-                line = line.strip()
-                if not line or not line.startswith("data:"):
-                    continue
-                data_str = line[5:].strip()
-                if data_str == "[DONE]":
-                    seen_done_lumen = True
-                    break
-                chunk = json.loads(data_str)
-
-                for choice in chunk.get("choices", []):
-                    delta = choice.get("delta", {})
-                    if "content" in delta and delta["content"]:
-                        received_deltas_lumen.append(delta["content"])
-
-                if "usage" in chunk and chunk["usage"]:
-                    stream_usage_lumen = chunk["usage"]
-
-        assert seen_done_lumen, "Streaming model=lumen response did not terminate with [DONE]"
-        assert "".join(received_deltas_lumen) == "Hello from fake provider!"
-        assert stream_usage_lumen is not None
-        assert stream_usage_lumen.get("total_tokens") == 15
 
         # 4. Submit native temp completion
         temp_headers = {
@@ -911,6 +858,9 @@ async def _approve_gateway_code_and_seed_anthropic(user_code: str, fake_provider
             model_name="claude-sonnet-4-6",
             input_price_per_million="1",
             output_price_per_million="1",
+            # A fake base is a compatible route, so no native catalog window applies. Set the one
+            # Anthropic publishes for this model, as an administrator must for compatible models.
+            capabilities={"context_limit": 1_000_000},
         )
         decision = await claude_gateway.authorize_user_code(
             user_code=user_code,
@@ -925,7 +875,7 @@ async def _approve_gateway_code_and_seed_anthropic(user_code: str, fake_provider
 
 def test_process_stack_native_protocols_and_gateway_device_login() -> None:
     """Exercise native protocol wires and one-time Gateway issuance through real processes."""
-    api_base_url, _, api_key, model_name, fake_provider_url = _load_connection_context()
+    api_base_url, container_base_url, api_key, model_name, fake_provider_url = _load_connection_context()
     _reset_fake_provider(fake_provider_url)
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
@@ -1174,6 +1124,72 @@ def test_process_stack_native_protocols_and_gateway_device_login() -> None:
         assert replay.status_code == 400
         assert replay.json()["error"] == "invalid_grant"
 
+        # Claude Gateway keys keep the virtual model that model API keys cannot see.
+        gateway_models = client.get(f"{container_base_url}/models", headers={"Authorization": f"Bearer {gateway_key}"})
+        assert gateway_models.status_code == 200, gateway_models.text
+        lumen_model_item = next((item for item in gateway_models.json().get("data", []) if item.get("id") == "lumen"), None)
+        assert lumen_model_item is not None and lumen_model_item.get("owned_by") == "lumen"
+        lumen_headers = {"Authorization": f"Bearer {gateway_key}", "Content-Type": "application/json"}
+
+        # 3b. Call non-streaming POST /v1/chat/completions with model="lumen" (durable run via worker)
+        chat_payload_lumen = {
+            "model": "lumen",
+            "messages": [{"role": "user", "content": "Hello process stack via lumen virtual model"}],
+            "stream": False,
+        }
+        chat_resp_lumen = client.post(
+            f"{container_base_url}/chat/completions", headers=lumen_headers, json=chat_payload_lumen
+        )
+        assert chat_resp_lumen.status_code == 200, (
+            f"POST /v1/chat/completions (model=lumen) failed: {chat_resp_lumen.status_code}"
+        )
+        chat_data_lumen = chat_resp_lumen.json()
+        assert chat_data_lumen.get("model") == "lumen", "Expected model=lumen in response"
+        choices_lumen = chat_data_lumen.get("choices", [])
+        assert len(choices_lumen) == 1
+        assert choices_lumen[0].get("message", {}).get("content") == "Hello from fake provider!"
+        usage_lumen = chat_data_lumen.get("usage", {})
+        assert usage_lumen.get("total_tokens") == 15
+
+        # 3c. Call streaming POST /v1/chat/completions with model="lumen" and include_usage
+        stream_payload_lumen = {
+            "model": "lumen",
+            "messages": [{"role": "user", "content": "Hello streaming process stack via lumen virtual model"}],
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+
+        received_deltas_lumen: list[str] = []
+        stream_usage_lumen = None
+        seen_done_lumen = False
+
+        with client.stream(
+            "POST", f"{container_base_url}/chat/completions", headers=lumen_headers, json=stream_payload_lumen
+        ) as stream_resp_lumen:
+            assert stream_resp_lumen.status_code == 200
+            for line in stream_resp_lumen.iter_lines():
+                line = line.strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                data_str = line[5:].strip()
+                if data_str == "[DONE]":
+                    seen_done_lumen = True
+                    break
+                chunk = json.loads(data_str)
+
+                for choice in chunk.get("choices", []):
+                    delta = choice.get("delta", {})
+                    if "content" in delta and delta["content"]:
+                        received_deltas_lumen.append(delta["content"])
+
+                if "usage" in chunk and chunk["usage"]:
+                    stream_usage_lumen = chunk["usage"]
+
+        assert seen_done_lumen, "Streaming model=lumen response did not terminate with [DONE]"
+        assert "".join(received_deltas_lumen) == "Hello from fake provider!"
+        assert stream_usage_lumen is not None
+        assert stream_usage_lumen.get("total_tokens") == 15
+
     _reset_fake_provider(fake_provider_url)
 
 
@@ -1221,6 +1237,8 @@ async def _register_discovered_system_model(fake_provider_url: str, model_name: 
             model_name=model_name,
             input_price_per_million="2",
             output_price_per_million="4",
+            # Unlisted on the compatible fake base: the administrator supplies the window.
+            capabilities={"context_limit": 200_000},
         )
         return {"provider": provider, "registered": registered}
     finally:
