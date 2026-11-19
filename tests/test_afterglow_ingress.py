@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from starlette.requests import Request
 from test_chat_completions import _patch_text_execution
 
 from lumen import auth
@@ -140,3 +141,28 @@ async def test_vault_ingress_and_persistent_chat_admission(directory, monkeypatc
     assert any(item["function"]["name"] == "vault_context" for item in payload["tool_schemas"]) is valid
     assert any("Dashboard-only fixture note" in item["content"] for item in payload["input_messages"]) is valid
     assert recall.await_count == int(valid)
+
+
+def test_afterglow_raw_path_signature_matches_bff_fixed_vector(monkeypatch):
+    monkeypatch.setenv("LUMEN_AFTERGLOW_INGRESS_SECRET", bytes(range(65, 97)).decode("ascii"))
+    monkeypatch.setattr(afterglow_ingress, "time", lambda: 1781234567)
+    request = Request(
+        {
+            "type": "http",
+            "method": "PATCH",
+            "route": SimpleNamespace(path="/v1/vault/notes/{note_id}"),
+            "path": "/edge/v1/vault/notes/1",
+            "raw_path": b"/edge/v1/vault/notes/%31",
+            "query_string": b"workspace_id=7",
+            "headers": [
+                (b"x-auth-token", b"fixture-keystone-token"),
+                (b"x-project-id", b"connection-project"),
+                (b"x-target-project-id", b"target-project"),
+                (
+                    b"x-lumen-ingress",
+                    b"v1:1781234567:71378ecd2c3525ff2aee85514f5925dc8f47394b1545b38717cf8dd7725707fc",
+                ),
+            ],
+        }
+    )
+    assert afterglow_ingress.verify(request, keystone_token="fixture-keystone-token")
