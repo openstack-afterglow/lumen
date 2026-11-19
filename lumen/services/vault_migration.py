@@ -1,23 +1,35 @@
-"""Idempotent online import from the old encrypted chat-memory source."""
+"""Idempotent online import from the old encrypted chat-memory source.
 
+``python -m lumen.services.vault_migration status`` prints read-only, content-free import progress.
+"""
+
+import argparse
+import asyncio
+import json
 import logging
 from datetime import UTC, datetime, timedelta
 from time import monotonic
 
 from cryptography.exceptions import InvalidTag
 from keystoneclient.exceptions import NotFound
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from starlette.concurrency import run_in_threadpool
 
 from lumen import auth
+from lumen.config import get_settings
 from lumen.crypto import decrypt_chat_content, derive_encryption_subkey
-from lumen.db import get_session_factory
+from lumen.db import close_db, get_session_factory, init_db
 from lumen.models.chat_db import ChatMemory, ChatWorkspace
 from lumen.services import auxiliary, vault_store
 
 _LEGACY_LIMIT = 1 << 40
-_DISABLED_RETRY = timedelta(minutes=15)
+# Deferred rows stay pending (status NULL); the reason is logged because no column carries it.
+_RETRY = {
+    "origin_disabled": timedelta(minutes=15),
+    "directory_unavailable": timedelta(minutes=1),
+    "decrypt_failed": timedelta(minutes=5),
+}
 logger = logging.getLogger(__name__)
 
 
@@ -86,9 +98,17 @@ async def _import_one(session, row: ChatMemory, domain_id: str | None) -> None:
     row.vault_migration_status = "imported"
 
 
+def _defer(row: ChatMemory, reason: str, now: datetime) -> None:
+    row.vault_migration_retry_at = now + _RETRY[reason]
+    logger.warning(
+        "vault_import_deferred memory_id=%s project_id=%s reason=%s retry_at=%s",
+        row.id, row.project_id or "-", reason, row.vault_migration_retry_at.isoformat(),
+    )
+
+
 @auxiliary.retry_db
 async def _finish_one(factory, note_id: int, project_id: str | None, domain_id: str | None, *,
-                      blocked: str | None, retry_after: timedelta = timedelta(minutes=1)) -> None:
+                      blocked: str | None, deferral: str | None = None) -> None:
     now = datetime.now(UTC)
     async with factory() as session, session.begin():
         row = await session.get(ChatMemory, note_id, with_for_update=True)
@@ -98,14 +118,14 @@ async def _finish_one(factory, note_id: int, project_id: str | None, domain_id: 
             row.vault_migration_status = blocked
             return
         if project_id and domain_id is None:
-            row.vault_migration_retry_at = now + retry_after
+            _defer(row, deferral or "directory_unavailable", now)
             return
         try:
             async with session.begin_nested():
                 await _import_one(session, row, domain_id)
         except InvalidTag:
             # Misconfigured encryption keys and bad ciphertext are indistinguishable.
-            row.vault_migration_retry_at = now + timedelta(minutes=5)
+            _defer(row, "decrypt_failed", now)
         except (UnresolvedProject, ValueError, IntegrityError):
             row.vault_migration_status = "invalid"
 
@@ -125,23 +145,23 @@ async def migrate_batch(*, limit: int = 32) -> int:
             ChatMemory.vault_migration_status.is_(None),
             or_(ChatMemory.vault_migration_retry_at.is_(None), ChatMemory.vault_migration_retry_at <= datetime.now(UTC)),
         ).order_by(ChatMemory.id).limit(limit))).all()
-    domains: dict[str, tuple[str | None, str | None, timedelta]] = {}
+    domains: dict[str, tuple[str | None, str | None, str | None]] = {}
     for note_id, project_id in targets:
         if project_id is None:
-            domain_id, blocked, retry_after = None, None, timedelta(minutes=1)
+            domain_id, blocked, deferral = None, None, None
         else:
             if project_id not in domains:
                 try:
-                    domains[project_id] = await run_in_threadpool(_native_domain, project_id), None, timedelta(minutes=1)
+                    domains[project_id] = await run_in_threadpool(_native_domain, project_id), None, None
                 except NotFound:
-                    domains[project_id] = None, "origin_missing", timedelta(minutes=1)
+                    domains[project_id] = None, "origin_missing", None
                 except DisabledProject:
                     # A disabled project or domain can be re-enabled; keep its rows pending.
-                    domains[project_id] = None, None, _DISABLED_RETRY
+                    domains[project_id] = None, None, "origin_disabled"
                 except Exception:
-                    domains[project_id] = None, None, timedelta(minutes=1)
-            domain_id, blocked, retry_after = domains[project_id]
-        await _finish_one(factory, note_id, project_id, domain_id, blocked=blocked, retry_after=retry_after)
+                    domains[project_id] = None, None, "directory_unavailable"
+            domain_id, blocked, deferral = domains[project_id]
+        await _finish_one(factory, note_id, project_id, domain_id, blocked=blocked, deferral=deferral)
     return len(targets)
 
 
@@ -154,3 +174,56 @@ async def process_one(*, owner: str) -> bool:
         found = found or bool(batch)
         if batch < 32 or monotonic() >= deadline:
             return found
+
+
+async def migration_status() -> dict:
+    """Content-free progress: sealed statuses, due pending rows and deferred origins."""
+    factory = get_session_factory()
+    if factory is None:
+        raise RuntimeError("chat DB is not configured")
+    now = datetime.now(UTC)
+    pending = ChatMemory.vault_migration_status.is_(None)
+    deferred = ChatMemory.vault_migration_retry_at > now
+    async with factory() as session:
+        statuses = (await session.execute(
+            select(ChatMemory.vault_migration_status, func.count(ChatMemory.id))
+            .group_by(ChatMemory.vault_migration_status)
+        )).all()
+        due = await session.scalar(select(func.count(ChatMemory.id)).where(
+            pending, or_(ChatMemory.vault_migration_retry_at.is_(None), ChatMemory.vault_migration_retry_at <= now),
+        ))
+        origins = (await session.execute(
+            select(ChatMemory.project_id, func.count(ChatMemory.id), func.max(ChatMemory.vault_migration_retry_at))
+            .where(pending, deferred).group_by(ChatMemory.project_id).order_by(ChatMemory.project_id)
+        )).all()
+    return {
+        "statuses": {status or "pending": int(count) for status, count in sorted(statuses, key=lambda item: item[0] or "")},
+        "pending": {"due": int(due or 0), "deferred": sum(int(count) for _project, count, _retry in origins)},
+        "deferred_origins": [
+            {"project_id": project, "rows": int(count), "next_attempt_at": retry.isoformat() if retry else None}
+            for project, count, retry in origins
+        ],
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="python -m lumen.services.vault_migration")
+    parser.add_argument("command", choices=["status"])
+    parser.parse_args(argv)
+
+    async def run() -> dict:
+        settings = get_settings()
+        if not settings.database_url:
+            raise SystemExit("database_url is not configured")
+        init_db(settings.database_url, pool_size=1, max_overflow=0)
+        try:
+            return await migration_status()
+        finally:
+            await close_db()
+
+    print(json.dumps(asyncio.run(run()), indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
