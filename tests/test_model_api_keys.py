@@ -1,7 +1,9 @@
 """Persisted model-key ownership, live manager checks, and exact HTTP/WS scope gates."""
 
+import json
 from contextlib import asynccontextmanager
 from itertools import count
+from pathlib import Path
 from types import SimpleNamespace
 from typing import get_args
 from unittest.mock import AsyncMock
@@ -525,6 +527,66 @@ def test_client_tool_choices_stay_forwarded():
     # Forcing shell is client-run only when every declared shell is explicitly local.
     assert hosted_tools({"tools": [local_shell], "tool_choice": {"type": "shell"}}) == ()
     assert hosted_tools({"tool_choice": {"type": "shell"}}) == ("shell",)
+
+
+def test_namespaces_and_tool_search_follow_their_contents():
+    from lumen.services.inference_authority import hosted_tools
+
+    function = {"type": "function", "name": "f", "parameters": {"type": "object"}}
+    client_ns = {"type": "namespace", "name": "mcp__echo", "description": "d",
+                 "tools": [function, {"type": "custom", "name": "c"}]}
+    assert hosted_tools({"tools": [client_ns]}) == ()
+    assert hosted_tools({"tools": [{**client_ns, "tools": [client_ns]}]}) == ()  # nested
+    for hosted in ({"type": "web_search"}, {"type": "mcp", "server_label": "s"},
+                   {"type": "shell", "environment": {"type": "container_auto"}}, "not-a-tool"):
+        assert hosted_tools({"tools": [{**client_ns, "tools": [function, hosted]}]}) == ("namespace",), hosted
+    assert hosted_tools({"tools": [{"type": "namespace", "name": "n", "description": "d"}]}) == ("namespace",)
+    # tool_search only exposes this request's own (separately classified) deferred tools.
+    for execution in ({}, {"execution": "client"}, {"execution": "server"}):
+        assert hosted_tools({"tools": [{"type": "tool_search", **execution}, {**function, "defer_loading": True}]}) == ()
+    assert hosted_tools({"tools": [{"type": "tool_search", "execution": "remote"}]}) == ("tool_search",)
+    assert hosted_tools({"tools": [{"type": "tool_search"}, {"type": "mcp", "server_label": "s",
+                                                             "defer_loading": True}]}) == ("mcp",)
+
+
+_CAPTURED = Path(__file__).parent / "fixtures" / "client_tools"
+
+
+@pytest.mark.parametrize(("fixture", "expected"), [
+    ("codex-0.170.0-gpt-5.2-codex-default.json", ("web_search",)),
+    ("codex-0.170.0-gpt-5.5-default.json", ("web_search",)),
+    ("codex-0.170.0-gpt-5.5-web-search-disabled.json", ()),
+    ("claude-code-2.1.327-messages.json", ()),
+])
+def test_captured_cli_tool_payloads(fixture, expected):
+    """Real Codex/Claude Code request tools captured against a loopback server (prose trimmed)."""
+    from lumen.services.inference_authority import hosted_tools
+
+    captured = json.loads((_CAPTURED / fixture).read_text())
+    assert hosted_tools({"tools": captured["tools"], "tool_choice": captured["tool_choice"]}) == expected
+
+
+@pytest.mark.parametrize("kind", ["personal", "service"])
+async def test_codex_default_web_search_gets_an_actionable_403(key_db, directory, monkeypatch, kind):
+    from lumen.services import completion_api
+
+    _, raw = await _key(key_db, kind, ["compat:completions:write"])
+    resolve = AsyncMock(side_effect=completion_api.CompletionError(404, "model not found"))
+    monkeypatch.setattr(completion_api, "resolve_api", resolve)
+    payloads = {name: json.loads((_CAPTURED / f"codex-0.170.0-gpt-5.5-{name}.json").read_text())
+                for name in ("default", "web-search-disabled")}
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        responses = {name: await client.post("/v1/responses", headers=_header(raw), json={
+            "model": "gpt-5.5", "input": "say ok", "tools": captured["tools"], "tool_choice": captured["tool_choice"],
+        }) for name, captured in payloads.items()}
+    denied = responses["default"]
+    assert denied.status_code == 403, denied.text
+    error = denied.json()["error"]
+    assert error["code"] == "server_tool_not_allowed_for_key"
+    assert "web_search" in error["message"] and 'web_search = "disabled"' in error["message"]
+    # Without hosted web search the same Codex request passes the tool gate to model resolution.
+    assert responses["web-search-disabled"].status_code == 404, responses["web-search-disabled"].text
+    resolve.assert_awaited_once()
 
 
 @pytest.mark.parametrize("kind", ["personal", "service"])

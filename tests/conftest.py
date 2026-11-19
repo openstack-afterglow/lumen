@@ -85,6 +85,10 @@ def _block_live_provider_requests(monkeypatch):
 @pytest.fixture(autouse=True)
 async def _reset_lumen_state(monkeypatch):
     """Keep settings and Redis state isolated without a live infrastructure dependency."""
+    # `client` clears overrides at teardown, but a test's monkeypatch.setitem on
+    # app.dependency_overrides is undone afterwards and restores the fixture's
+    # Keystone principal into the next test. Start every test without overrides.
+    app.dependency_overrides.clear()
     get_settings.cache_clear()
     fake = fakeredis.aioredis.FakeRedis(decode_responses=False)
     monkeypatch.setattr("lumen.cache._client", fake)

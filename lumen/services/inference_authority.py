@@ -141,12 +141,33 @@ _CLIENT_TOOL_PREFIXES = ("bash_", "text_editor_", "memory_")  # Anthropic-define
 _GEMINI_CLIENT_TOOL_KEYS = frozenset({"functionDeclarations", "function_declarations"})
 _HOSTED_REQUEST_FIELDS = ("web_search_options", "mcp_servers", "container")
 HOSTED_TOOL_CODE = "server_tool_not_allowed_for_key"
-HOSTED_TOOL_MESSAGE = "Server-executed tools are unavailable to API keys; declare client tools instead."
+
+
+def hosted_tool_message(hosted: tuple[str, ...]) -> str:
+    """Name the refused tools; Codex sends hosted web_search by default."""
+    message = f"Server-executed tools are unavailable to API keys: {', '.join(hosted)}. Declare client tools instead."
+    if any(kind.startswith("web_search") for kind in hosted):
+        message += (' Codex users: set web_search = "disabled" in ~/.codex/config.toml,'
+                    " or use dashboard chat for web search.")
+    return message
 
 
 def _client_tool(kind: str, tool: dict) -> bool:
     if kind in _CLIENT_TOOL_TYPES or kind.startswith(_CLIENT_TOOL_PREFIXES):
         return True
+    if kind == "namespace":
+        # A namespace only groups tools (Codex sends MCP tools this way); it is
+        # client-run iff every nested tool is, recursively.
+        nested = tool.get("tools")
+        return isinstance(nested, list) and all(
+            isinstance(item, dict) and isinstance(item.get("type"), str) and _client_tool(item["type"], item)
+            for item in nested
+        )
+    if kind == "tool_search":
+        # Deferred tool loading. execution="client" runs on the caller; server
+        # execution only searches this request's own deferred declarations, and
+        # each of those is classified separately. Either way no tool runs remotely.
+        return tool.get("execution") in (None, "client", "server")
     if kind != "shell":
         return False
     # OpenAI shell runs in the caller's environment only when it says so. The SDK
@@ -200,6 +221,8 @@ def _choice_entry_kind(choice: object, tools: list) -> str | None:
         return "invalid_tool_choice"
     kind = choice["type"]
     if kind in _CLIENT_TOOL_CHOICES or kind in _CLIENT_TOOL_TYPES or kind.startswith(_CLIENT_TOOL_PREFIXES):
+        return None
+    if kind == "tool_search" and _client_tool(kind, choice):
         return None
     # A forced shell is client-run only if every declared shell is explicitly local.
     shells = [tool for tool in tools if isinstance(tool, dict) and tool.get("type") == "shell"]

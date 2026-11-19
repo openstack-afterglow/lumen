@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 
 from lumen.auth import ensure_scopes, require_api_key_scopes
 from lumen.services import completion_api as core
-from lumen.services.inference_authority import HOSTED_TOOL_CODE, HOSTED_TOOL_MESSAGE, completion_scopes, hosted_tools
+from lumen.services.inference_authority import HOSTED_TOOL_CODE, completion_scopes, hosted_tool_message, hosted_tools
 from lumen.services.infrastructure.api_load import admit_sse, register_sse_resource
 
 from .streaming import events_with_ping
@@ -162,8 +162,8 @@ async def messages(
     token_info: dict = Depends(require_api_key_scopes("compat:completions:write")),
 ):
     request_body = body.model_dump(exclude_none=True)
-    if hosted_tools(request_body):
-        return anthropic_error_response(403, f"{HOSTED_TOOL_MESSAGE} ({HOSTED_TOOL_CODE})")
+    if hosted := hosted_tools(request_body):
+        return anthropic_error_response(403, f"{hosted_tool_message(hosted)} ({HOSTED_TOOL_CODE})")
     ensure_scopes(token_info, *completion_scopes(request_body))
     try:
         provider = core.select_api_provider(body.provider, x_lumen_provider)

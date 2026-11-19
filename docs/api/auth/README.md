@@ -66,6 +66,8 @@ Content-Type: application/json
 
 `tool_choice`로 서버 도구를 강제하는 요청도 같은 403으로 거절한다. `auto`·`none`·`required`, `function`·`custom` 같은 클라이언트 도구 유형과 Anthropic `auto`·`any`·`tool`·`none`은 허용한다. 그 밖의 강제 유형과 `allowed_tools` 하위 목록의 서버 도구는 거절한다. `shell` 강제는 선언된 모든 `shell`의 환경이 `local`일 때만 허용한다. 다른 사용자의 개인 키를 수정하거나 폐기하려 하면 없는 키와 똑같이 404를 반환한다.
 
+OpenAI `namespace`는 안의 모든 도구가(중첩 포함) 클라이언트 도구일 때만 허용한다. `tool_search`는 `execution`이 없거나 `client`·`server`이면 허용한다. 서버 실행도 요청에 선언된 지연 로딩 도구만 검색하며, 그 도구들은 각각 따로 검사한다. Codex CLI는 기본값으로 공급자가 실행하는 `web_search` 도구를 보내므로 API 키로는 403을 받는다. 오류 메시지는 거절한 도구 유형을 알려 주고, `~/.codex/config.toml`에 `web_search = "disabled"`를 설정하거나 대시보드 채팅에서 웹 검색을 쓰라고 안내한다.
+
 Gemini 경로의 `{model}`은 `models/lumen/<provider_id>/<model_id>`처럼 `/`를 포함할 수 있어 route template은 `{model:path}`이다.
 
 Perplexity Sonar처럼 검색을 항상 내장 실행하는 모델은 `native:tools:execute`가 필요하므로 모델 키로 호출하면 OpenAI·Anthropic·Gemini 경로 모두 크레딧 예약이나 공급자 호출 전에 HTTP 403 `model_requires_server_tools`를 반환한다. 키가 보는 모델 목록(`/v1/models`의 두 형식, `/v1/cli/models`, `/v1beta/models`)에서도 이 모델을 숨긴다. Keystone 대시보드 목록은 바뀌지 않는다.

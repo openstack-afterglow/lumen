@@ -25,8 +25,8 @@ from lumen.services import openai_compat
 from lumen.services.completion_format import nonstream_response, prompt_token_details
 from lumen.services.inference_authority import (
     HOSTED_TOOL_CODE,
-    HOSTED_TOOL_MESSAGE,
     completion_scopes,
+    hosted_tool_message,
     hosted_tools,
     principal_may_use,
 )
@@ -205,8 +205,8 @@ async def chat_completions(
     token_info: dict = Depends(require_api_key_scopes("compat:completions:write")),
 ):
     request_body = body.model_dump(exclude_none=True)
-    if hosted_tools(request_body):
-        return openai_error_response(403, HOSTED_TOOL_MESSAGE, code=HOSTED_TOOL_CODE)
+    if hosted := hosted_tools(request_body):
+        return openai_error_response(403, hosted_tool_message(hosted), code=HOSTED_TOOL_CODE)
     ensure_scopes(token_info, *completion_scopes(request_body))
     if body.service_tier not in (None, "default", "auto"):
         return openai_error_response(422, "Only Standard processing is supported.", code="service_tier_unsupported")
