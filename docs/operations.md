@@ -12,6 +12,8 @@ Provision one random shared value of at least 32 UTF-8 bytes in Kolla passwords 
 
 The BFF signs the exact forwarded request using `X-Lumen-Ingress: v1:<timestamp>:<lowercase-hex-HMAC-SHA256>`. The message is UTF-8 newline-joined fields: `v1`, Unix seconds, uppercase method, raw forwarded path without its query, lowercase SHA-256 hex of the lone `X-Auth-Token` value, `X-Project-Id` or empty, and `X-Target-Project-Id` or empty. Lumen accepts an absolute time skew of at most 120 seconds. Send no bearer or API-key headers on this path; do not trust a client-supplied ingress header.
 
+**Degraded window with an unsigned BFF (Afterglow 1.32.28).** Lumen 0.6.21 is deployed before Afterglow 1.32.29. Until the new BFF signs requests, every dashboard request arrives without a valid `X-Lumen-Ingress`: `/v1/vault/*` and `/v1/memories*` return 403 `vault_ingress_unverified`, and new dashboard runs are admitted without `vault_ingress_verified`, so they get no Vault context, memory recall, post-run memory extraction or Vault tools. Ordinary dashboard chat, domain billing and API keys keep working. Runs admitted in this window stay without memory after the BFF upgrade; only runs admitted afterwards gain it. Keep the window short and announce that memory is temporarily unavailable; the same state applies whenever the secret is absent or mismatched between Lumen and Afterglow.
+
 ## 0.6.20 롤아웃 메모
 
 - **Migration:** 없음. 최신 ledger는 035이며 `lumen-migrate` 상태가 깨끗해야 한다.

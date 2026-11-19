@@ -2,11 +2,10 @@
 
 | 요구 | 선택 |
 | --- | --- |
-| OpenAI SDK로 Lumen durable worker와 text chat | compat API의 `model="lumen"` |
-| OpenAI/Anthropic 형식의 provider-direct, caller-owned tool calls | compat API의 provider model ID |
-| durable conversation, server-managed tool/skill/memory, replay/approval | native `/v1` + `lumen_sdk.Client` 또는 Keystone Proxy |
+| 개인·서비스 Lumen API 키로 OpenAI/Anthropic/Gemini 형식 모델 호출(caller-owned tool calls 포함) | compat API의 provider model ID |
+| durable conversation, server-managed tool/skill/memory, replay/approval | native `/v1` + Keystone 세션(Afterglow 대시보드 또는 Keystone Proxy) |
 
-`model="lumen"` compat route는 첫 단계에서 text-only이며 server-managed tool/memory를 비활성화한다. 해당 기능이 필요하면 Native route를 사용한다.
+0.6.21부터 개인·서비스 API 키는 모델 API 전용이다. 가상 모델 `model="lumen"`은 개인·서비스 키에서 403 `model_not_allowed_for_key`이며 legacy Claude Gateway 자격 증명만 계속 쓸 수 있다. 서버 관리 tool/memory, 대화 기록, durable replay가 필요하면 Keystone 세션으로 Native route를 사용한다.
 
 ## OpenAI / Anthropic compat
 
@@ -24,11 +23,11 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
-`model="lumen"`은 서버의 `chat_default_model`을 사용해 Lumen durable worker에서 실행한다. 특정 공개 provider model ID는 stateless provider-direct 경로를 사용한다. `provider`는 공개 ID 충돌 때만 필요하며 내부 `model_name`/transport route나 account/credential ID를 SDK inference 요청에 보내지 않는다. Anthropic client도 deployment의 `/v1/messages` stateless surface와 같은 공개 선택자를 사용한다. Account policy 선택과 frozen credential/current-authority 검사는 Lumen이 소유하며 client 재시도로 unknown 실행을 반복하지 않는다.
+특정 공개 provider model ID는 stateless provider-direct 경로를 사용한다. `provider`는 공개 ID 충돌 때만 필요하며 내부 `model_name`/transport route나 account/credential ID를 SDK inference 요청에 보내지 않는다. Anthropic client도 deployment의 `/v1/messages` stateless surface와 같은 공개 선택자를 사용한다. Account policy 선택과 frozen credential/current-authority 검사는 Lumen이 소유하며 client 재시도로 unknown 실행을 반복하지 않는다.
 
 ## Direct API-key client
 
-`Client`는 `<base_url>/v1/...`에 Bearer key를 보낸다. `temp_completion`, `create_completion`, `run_events`, `usage_records`, conversation/memory/extension wrappers를 transport-neutral API set으로 제공한다.
+`Client`는 `<base_url>/v1/...`에 Bearer key를 보낸다. `temp_completion`, `create_completion`, `run_events`, `usage_records`, conversation/memory/extension wrappers를 transport-neutral API set으로 제공한다. 0.6.21의 개인·서비스 API 키는 모델 API route(`/v1/models`, compat completions·Responses·Messages, Gemini `v1beta`, embeddings, decisions, images, audio, realtime)만 호출할 수 있으므로, 아래 native run·`usage_records()`·memory wrapper는 API 키로 403이다(`/v1/usage*`는 `keystone_session_required`). 이 wrapper는 Keystone Proxy로 사용한다.
 
 ```python
 from uuid import uuid4
