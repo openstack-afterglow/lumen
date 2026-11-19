@@ -7,10 +7,11 @@ import re
 import uuid
 
 import pytest
-from sqlalchemy import event
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import create_async_engine
 
-from lumen.scripts.migrate import MIGRATIONS, _statements, load_manifest
+from lumen.scripts.migrate import MIGRATIONS, MigrationLedgerError, _statements, load_manifest, migrate
+from lumen.scripts.provider_account_migration import HISTORICAL_RECEIPTS
 
 pytestmark = pytest.mark.integration
 
@@ -78,3 +79,37 @@ async def test_migration_037_replays_after_partial_failure_and_twice():
     assert "`payer_domain_id` varchar(64) DEFAULT NULL" in clean["chat_usage_logs"]
     assert "`project_id` varchar(64) DEFAULT NULL" in clean["chat_usage_logs"]
     assert "KEY `idx_chat_usage_payer_user_created`" in clean["chat_usage_logs"]
+
+
+@pytest.mark.parametrize("receipt", ["historical", "unknown"])
+async def test_original_037_receipt_is_accepted_without_rewrite(receipt):
+    """Databases that completed the original 037 bytes keep that receipt; any other drift still stops."""
+    url = os.environ["DATABASE_URL"]
+    _path, historical_sha = HISTORICAL_RECEIPTS["037-domain-credit-pools"]
+    stored = historical_sha if receipt == "historical" else "0" * 64
+    engine = create_async_engine(url, pool_size=1, max_overflow=0)
+    try:
+        async with engine.begin() as connection:
+            current = (await connection.execute(text(
+                "SELECT sha256 FROM schema_migrations WHERE logical_id = '037-domain-credit-pools'"))).scalar_one()
+            await connection.execute(text(
+                "UPDATE schema_migrations SET sha256 = :sha WHERE logical_id = '037-domain-credit-pools'"),
+                {"sha": stored})
+        try:
+            if receipt == "historical":
+                assert await migrate(url, apply=True, repair_schema_drift=False) == ([], 0)
+                assert await migrate(url, apply=False, repair_schema_drift=False) == ([], 0)
+            else:
+                with pytest.raises(MigrationLedgerError, match="drift"):
+                    await migrate(url, apply=True, repair_schema_drift=False)
+            async with engine.connect() as connection:
+                assert (await connection.execute(text(
+                    "SELECT sha256 FROM schema_migrations WHERE logical_id = '037-domain-credit-pools'"
+                ))).scalar_one() == stored
+        finally:
+            async with engine.begin() as connection:
+                await connection.execute(text(
+                    "UPDATE schema_migrations SET sha256 = :sha WHERE logical_id = '037-domain-credit-pools'"),
+                    {"sha": current})
+    finally:
+        await engine.dispose()

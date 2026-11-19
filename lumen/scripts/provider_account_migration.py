@@ -15,6 +15,12 @@ HISTORICAL_ID = "027-provider-account-credentials"
 HISTORICAL_PATH = "027_provider_account_credentials.sql"
 HISTORICAL_SHA256 = "ee01a94044de1c5466c9627bd25e21ba22ec5ef03abf63c8494818775700711a"
 DOMAIN_BILLING_ID = "037-domain-credit-pools"
+# Receipts written by an earlier byte version of a migration whose resulting schema is identical.
+# 037 was later made re-runnable (IF NOT EXISTS); databases that completed the original keep its
+# receipt, which both ledger checks accept as applied and never rewrite.
+HISTORICAL_RECEIPTS = {
+    DOMAIN_BILLING_ID: ("037_domain_credit_pools.sql", "9233d802fb300e371f40eeaebbbbbca1aec2f7ea6c31697d3dcc80e5e992161b"),
+}
 
 
 class AccountMigrationError(RuntimeError):
@@ -313,7 +319,8 @@ async def inspect_account_state(connection, migrations) -> str:
     )
     applied = set()
     for logical_id, path, checksum in ledger:
-        _require(logical_id in known and known[logical_id] == (path, checksum), "unknown_or_drifted_ledger")
+        _require(logical_id in known and (path, checksum) in {known[logical_id], HISTORICAL_RECEIPTS.get(logical_id)},
+                 "unknown_or_drifted_ledger")
         applied.add(logical_id)
     required = {m.logical_id for m in migrations if m.logical_id < "027-"}
     if "019-media-model-registry" in applied:
