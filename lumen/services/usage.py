@@ -73,8 +73,25 @@ class UsageView:
 BILLING_SCOPE = case((ChatUsageLog.payer_domain_id.is_not(None), "domain"), else_="user")
 
 
-async def user_usage_summary(view: UsageView) -> dict:
-    """Return the view's usage totals, with a per-payer breakdown."""
+def _domain_pool(pool: DomainCreditPool | None, domain_id: str) -> dict:
+    """Read-only aggregates of the caller's domain pool; never other members' rows."""
+    public = domain_credit.public(pool, domain_id)
+    return {
+        "domain_id": domain_id,
+        "exists": pool is not None,
+        "funded": pool is not None and pool.is_active and pool.balance_credits > 0,
+        **{key: public[key] for key in (
+            "balance_credits", "reserved_credits", "monthly_used_credits", "effective_monthly_limit_credits",
+        )},
+    }
+
+
+async def user_usage_summary(view: UsageView, *, member_domain_id: str | None = None) -> dict:
+    """Return the view's usage totals, with a per-payer breakdown.
+
+    ``member_domain_id`` is the Keystone session's verified domain; its pool aggregates are added as
+    ``domain_pool`` for any member, independently of the view.
+    """
     if not is_db_available():
         return dict(_EMPTY)
     factory = get_session_factory()
@@ -135,6 +152,11 @@ async def user_usage_summary(view: UsageView) -> dict:
                     func.sum(case((ledger.created_at >= month_start(), charged), else_=0)),
                     func.sum(case((ledger.created_at >= week_start(), charged), else_=0)),
                 ).where(ledger.domain_id == domain_id, ledger.kind == "charge"))).one()
+            domain_pool = None
+            if member_domain_id is not None:
+                member_pool = (pool if member_domain_id == domain_id
+                               else await session.get(DomainCreditPool, member_domain_id))
+                domain_pool = _domain_pool(member_pool, member_domain_id)
         by_source = [
             {"source": s or "web", "tokens": int(t or 0), "credited_cost": float(c or 0), "request_count": int(n or 0)}
             for s, t, c, n in src_rows
@@ -165,6 +187,7 @@ async def user_usage_summary(view: UsageView) -> dict:
             **pool_summary,
             "by_source": by_source,
             "by_payer": by_payer,
+            **({"domain_pool": domain_pool} if member_domain_id is not None else {}),
         }
     except Exception:
         logger.warning("빌트인 채팅 사용량 집계 실패", exc_info=True)
