@@ -1,5 +1,6 @@
 """Idempotent online import from the old encrypted chat-memory source."""
 
+import logging
 from datetime import UTC, datetime, timedelta
 from time import monotonic
 
@@ -10,12 +11,14 @@ from sqlalchemy.exc import IntegrityError
 from starlette.concurrency import run_in_threadpool
 
 from lumen import auth
-from lumen.crypto import decrypt_chat_content
+from lumen.crypto import decrypt_chat_content, derive_encryption_subkey
 from lumen.db import get_session_factory
 from lumen.models.chat_db import ChatMemory, ChatWorkspace
 from lumen.services import auxiliary, vault_store
 
 _LEGACY_LIMIT = 1 << 40
+_DISABLED_RETRY = timedelta(minutes=15)
+logger = logging.getLogger(__name__)
 
 
 class UnresolvedProject(RuntimeError):
@@ -84,7 +87,8 @@ async def _import_one(session, row: ChatMemory, domain_id: str | None) -> None:
 
 
 @auxiliary.retry_db
-async def _finish_one(factory, note_id: int, project_id: str | None, domain_id: str | None, *, blocked: str | None) -> None:
+async def _finish_one(factory, note_id: int, project_id: str | None, domain_id: str | None, *,
+                      blocked: str | None, retry_after: timedelta = timedelta(minutes=1)) -> None:
     now = datetime.now(UTC)
     async with factory() as session, session.begin():
         row = await session.get(ChatMemory, note_id, with_for_update=True)
@@ -94,7 +98,7 @@ async def _finish_one(factory, note_id: int, project_id: str | None, domain_id: 
             row.vault_migration_status = blocked
             return
         if project_id and domain_id is None:
-            row.vault_migration_retry_at = now + timedelta(minutes=1)
+            row.vault_migration_retry_at = now + retry_after
             return
         try:
             async with session.begin_nested():
@@ -110,27 +114,34 @@ async def migrate_batch(*, limit: int = 32) -> int:
     factory = get_session_factory()
     if factory is None:
         return 0
+    try:
+        # A missing or malformed service key is deployment state, not evidence that a row is invalid.
+        derive_encryption_subkey(b"agent_vault_body_hash")
+    except ValueError:
+        logger.error("Vault legacy import paused: Lumen encryption key is missing or invalid")
+        return 0
     async with factory() as session:
         targets = (await session.execute(select(ChatMemory.id, ChatMemory.project_id).where(
             ChatMemory.vault_migration_status.is_(None),
             or_(ChatMemory.vault_migration_retry_at.is_(None), ChatMemory.vault_migration_retry_at <= datetime.now(UTC)),
         ).order_by(ChatMemory.id).limit(limit))).all()
-    domains: dict[str, tuple[str | None, str | None]] = {}
+    domains: dict[str, tuple[str | None, str | None, timedelta]] = {}
     for note_id, project_id in targets:
         if project_id is None:
-            domain_id, blocked = None, None
+            domain_id, blocked, retry_after = None, None, timedelta(minutes=1)
         else:
             if project_id not in domains:
                 try:
-                    domains[project_id] = await run_in_threadpool(_native_domain, project_id), None
+                    domains[project_id] = await run_in_threadpool(_native_domain, project_id), None, timedelta(minutes=1)
                 except NotFound:
-                    domains[project_id] = None, "origin_missing"
+                    domains[project_id] = None, "origin_missing", timedelta(minutes=1)
                 except DisabledProject:
-                    domains[project_id] = None, "origin_disabled"
+                    # A disabled project or domain can be re-enabled; keep its rows pending.
+                    domains[project_id] = None, None, _DISABLED_RETRY
                 except Exception:
-                    domains[project_id] = None, None
-            domain_id, blocked = domains[project_id]
-        await _finish_one(factory, note_id, project_id, domain_id, blocked=blocked)
+                    domains[project_id] = None, None, timedelta(minutes=1)
+            domain_id, blocked, retry_after = domains[project_id]
+        await _finish_one(factory, note_id, project_id, domain_id, blocked=blocked, retry_after=retry_after)
     return len(targets)
 
 
