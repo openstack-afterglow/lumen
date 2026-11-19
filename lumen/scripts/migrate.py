@@ -16,6 +16,7 @@ from lumen.plugins.registry import get_plugin
 from lumen.scripts.backfill_history import backfill_history, count_unready, has_history_domain_scope
 from lumen.scripts.provider_account_migration import (
     ACCOUNT_ID,
+    HISTORICAL_RECEIPTS,
     REPAIRED_CUTOVER_SQL,
     AccountMigrationError,
     inspect_account_state,
@@ -352,7 +353,9 @@ async def migrate(database_url: str, *, apply: bool, repair_schema_drift: bool =
                     )
                 ).first()
                 if row is not None:
-                    if row.relative_path != migration.relative_path or row.sha256 != migration.sha256:
+                    if (row.relative_path, row.sha256) != (migration.relative_path, migration.sha256) and (
+                        HISTORICAL_RECEIPTS.get(migration.logical_id) != (row.relative_path, row.sha256)
+                    ):
                         raise MigrationLedgerError(f"applied migration identity drift: {migration.logical_id}")
                     continue
                 pending.append(migration.logical_id)
