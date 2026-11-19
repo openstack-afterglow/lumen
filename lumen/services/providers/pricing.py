@@ -881,6 +881,20 @@ def _model_public(
             text_sources[field] = text_sources["input_price_per_million"]
         elif source and source.startswith("fallback_5m:"):
             text_sources[field] = text_sources["cache_write_price_per_million"]
+    domain_billing = None
+    if _kind(row) == "text":
+        try:
+            token_rates = route_token_rates({"media_pricing": effective_media})
+        except ProviderValidationError:
+            # One malformed stored rate must not break the whole catalog listing.
+            domain_billing = {"ready": False, "reason_code": "pricing_unavailable"}
+        else:
+            domain_billing = domain_billing_readiness(eff_caps, {
+                "input_price_per_token": effective_input,
+                "output_price_per_token": effective_output,
+                **{resolved: effective_cache[resolved] for _, _, resolved in CACHE_PRICE_FIELDS},
+                "token_rates": token_rates,
+            })
     return {
         "id": row.id,
         "provider_id": row.provider_id,
@@ -926,15 +940,7 @@ def _model_public(
         "created_at": _iso(row.created_at),
         "updated_at": _iso(row.updated_at),
         # Not part of route capabilities, so run config hashes stay unchanged.
-        "domain_billing": (
-            domain_billing_readiness(eff_caps, {
-                "input_price_per_token": effective_input,
-                "output_price_per_token": effective_output,
-                **{resolved: effective_cache[resolved] for _, _, resolved in CACHE_PRICE_FIELDS},
-                "token_rates": route_token_rates({"media_pricing": _effective_media_pricing(row, provider_type, api_base)}),
-            })
-            if _kind(row) == "text" else None
-        ),
+        "domain_billing": domain_billing,
     }
 
 

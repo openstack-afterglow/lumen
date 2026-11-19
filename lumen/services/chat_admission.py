@@ -204,6 +204,14 @@ def _require_execution_capability(
                 status_code=422,
                 detail=f"requested chat capability is not available: domain_billing ({readiness['reason_code']})",
             )
+        if features.advisor.enabled:
+            # The advisor tool hold needs the same frozen bounds as the executor.
+            readiness = route_domain_billing((feature_routes or {})["advisor"])
+            if not readiness["ready"]:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"requested chat capability is not available: advisor ({readiness['reason_code']})",
+                )
 
     # Output generation modalities still lack execution paths. Keep them
     # fail-closed rather than silently omitting an advertised modality.

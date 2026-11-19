@@ -299,6 +299,13 @@ async def _prepare_child_inputs(
             gate = chat_admission._capability_gate("text", route)
             if not gate["available"] or not gate["pricing_available"]:
                 raise ChildFailure("child_route_unavailable", "child agent model cannot serve priced text")
+        if parent.payer_domain_id is not None:
+            readiness = chat_admission.route_domain_billing(route)
+            if not readiness["ready"]:
+                raise ChildFailure(
+                    "child_route_unavailable",
+                    f"child agent model is not available for domain billing ({readiness['reason_code']})",
+                )
     else:
         route = await ps.resolve_model_snapshot(parent.capability_snapshot or {})
         if route is None:

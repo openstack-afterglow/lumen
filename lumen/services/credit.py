@@ -954,17 +954,6 @@ async def apply_usage_in_transaction(
         raise ValueError("only a prepaid usage projection can supply settled credits")
     credited = (settled_credits if settled_credits is not None
                 else credits_for_cost(usage_cost.raw_cost, margin_multiplier, credit_per_usd))
-    if charge_wallet and payer.domain_id is not None:
-        await charge_domain_in_transaction(session, payer=payer, amount=credited, reference=event_id,
-                                           user_id=actor_id(user_id, api_key_id))
-    if charge_wallet and payer.scope == "user":
-        wallet = await _get_or_create_wallet(session, payer.user_id, project_id)
-        _maybe_reset_month(wallet)
-        await session.execute(
-            update(UserWallet)
-            .where(UserWallet.user_id == payer.user_id)
-            .values(used_quota_this_month=UserWallet.used_quota_this_month + credited)
-        )
     pricing_snapshot = {
         **usage_cost.pricing_snapshot,
         "margin_multiplier": format(Decimal(margin_multiplier), "f"),
@@ -1014,6 +1003,20 @@ async def apply_usage_in_transaction(
         completion_tokens=int(completion_tokens), raw_cost=usage_cost.raw_cost,
     ):
         session.add(ChatProviderUsage(event_id=event_id, **allocation))
+    # The unique event row comes first: a concurrent replay of the same event blocks on its key and
+    # then replays, instead of racing this transaction to the wallet or pool row.
+    await session.flush()
+    if charge_wallet and payer.domain_id is not None:
+        await charge_domain_in_transaction(session, payer=payer, amount=credited, reference=event_id,
+                                           user_id=actor_id(user_id, api_key_id))
+    if charge_wallet and payer.scope == "user":
+        wallet = await _get_or_create_wallet(session, payer.user_id, project_id)
+        _maybe_reset_month(wallet)
+        await session.execute(
+            update(UserWallet)
+            .where(UserWallet.user_id == payer.user_id)
+            .values(used_quota_this_month=UserWallet.used_quota_this_month + credited)
+        )
     await session.flush()
     return credited
 
