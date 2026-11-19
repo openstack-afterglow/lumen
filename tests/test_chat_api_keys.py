@@ -395,7 +395,7 @@ class TestStorePureLogic:
         session = FakeSession()
         monkeypatch.setattr(aks, "_require_db", lambda: lambda: session)
 
-        with pytest.raises(aks.ApiKeyForbidden, match="소유자가 아닙니다"):
+        with pytest.raises(aks.ApiKeyNotFound):
             await aks.rename_key(1, "u-owner", "노트북")
 
     def test_scope_validation_fails_closed(self):

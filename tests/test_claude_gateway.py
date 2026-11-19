@@ -219,7 +219,11 @@ async def test_managed_settings_support_conditional_etag(client, gateway_auth, m
     assert second.headers["etag"] == etag
 
 
-async def test_gateway_denies_server_tools_before_resolution(client, gateway_auth, monkeypatch):
+@pytest.mark.parametrize("server_tool", [
+    {"tools": [{"type": "web_search_20250305", "name": "web_search"}]},
+    {"tool_choice": {"type": "web_search_20250305"}},
+])
+async def test_gateway_denies_server_tools_before_resolution(client, gateway_auth, monkeypatch, server_tool):
     from unittest.mock import AsyncMock
 
     resolve = AsyncMock()
@@ -227,7 +231,7 @@ async def test_gateway_denies_server_tools_before_resolution(client, gateway_aut
     response = await client.post(
         f"{_GATEWAY}/v1/messages", headers=_HEADERS,
         json={"model": "client-alias", "messages": [{"role": "user", "content": "hello"}],
-              "max_tokens": 100, "tools": [{"type": "web_search_20250305", "name": "web_search"}]},
+              "max_tokens": 100, **server_tool},
     )
     assert response.status_code == 403
     assert "server_tool_not_allowed_for_key" in response.text
