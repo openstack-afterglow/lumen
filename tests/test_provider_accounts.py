@@ -13,8 +13,9 @@ from lumen import crypto
 from lumen.models.chat_db import ChatProviderUsage, ChatUsageLog
 from lumen.services import credit
 from lumen.services.provider_metadata import UsageCost
-from lumen.services.providers import accounts, credentials, repository, routing
+from lumen.services.providers import accounts, credentials, repository, routing, subscriptions
 from lumen.services.providers.errors import ProviderSubscriptionError
+from lumen.services.quota_periods import month_start
 
 provider_db = test_chat_api_model_routing.provider_db
 
@@ -35,6 +36,41 @@ async def _pool(provider_db, admin_client, monkeypatch):
     assert first.status_code == second.status_code == 201
     assert "upstream-secret" not in first.text + second.text + created.text
     return account_id, first.json()["id"], second.json()["id"]
+
+
+async def test_account_and_credential_created_at_survive_all_public_mutations(provider_db, admin_client, monkeypatch):
+    add_provider, _, _ = provider_db
+    add_provider(provider_type="anthropic", auth_mode="anthropic_subscription")
+    monkeypatch.setattr(subscriptions, "_require_db", routing._require_db)
+    accounts_path = "/v1/admin/providers/1/accounts"
+    before = datetime.now(UTC).replace(microsecond=0)
+    created = await admin_client.post(accounts_path, json={"name": "account"})
+    assert created.status_code == 201
+    account = created.json()
+    account_path = f"{accounts_path}/{account['id']}"
+    created = await admin_client.post(f"{account_path}/credentials", json={"name": "credential"})
+    assert created.status_code == 201
+    credential = created.json()
+    credential_path = f"{account_path}/credentials/{credential['id']}"
+    account_created = datetime.fromisoformat(account["created_at"])
+    credential_created = datetime.fromisoformat(credential["created_at"])
+    assert account_created.utcoffset() == credential_created.utcoffset() == timedelta()
+    assert before <= account_created <= credential_created <= datetime.now(UTC)
+
+    account_edit = await admin_client.patch(account_path, json={"name": "renamed account"})
+    credential_edit = await admin_client.patch(credential_path, json={"name": "renamed credential"})
+    token_edit = await admin_client.put(f"{credential_path}/auth/token", json={"token": "sk-ant-oat-synthetic-test"})
+    listed = await admin_client.get(accounts_path)
+    assert account_edit.status_code == credential_edit.status_code == token_edit.status_code == listed.status_code == 200
+    saved = next(row for row in listed.json() if row["id"] == account["id"])
+    assert saved["created_at"] == account_edit.json()["created_at"] == account["created_at"]
+    assert (
+        saved["credentials"][0]["created_at"]
+        == account_edit.json()["credentials"][0]["created_at"]
+        == credential_edit.json()["created_at"]
+        == token_edit.json()["created_at"]
+        == credential["created_at"]
+    )
 
 
 async def test_additional_key_never_reassigns_an_admitted_route_and_revoke_fails_closed(provider_db, admin_client, monkeypatch):
@@ -156,6 +192,65 @@ async def test_account_usage_allocates_advisor_without_a_second_customer_debit(p
     assert usage.status_code == 200
     assert {row["credential_id"]: Decimal(row["raw_cost"]) for row in usage.json()["credentials"]} == {
         key_a: Decimal("0.003"), key_b: Decimal("0.007")}
+
+
+async def test_account_usage_utc_month_and_historical_credential_buckets(provider_db, admin_client, monkeypatch):
+    account_id, key_a, key_b = await _pool(provider_db, admin_client, monkeypatch)
+    deleted = (await accounts.create_credential(1, account_id, {"name": "deleted"}))["id"]
+    unused = (await accounts.create_credential(1, account_id, {"name": "unused"}))["id"]
+    start = datetime(2026, 12, 1, tzinfo=UTC)
+    end = datetime(2027, 1, 1, tzinfo=UTC)
+    prior = start - timedelta(seconds=1)
+    inside = start + timedelta(days=15)
+    monkeypatch.setattr(accounts, "month_start", lambda now=None: month_start(inside if now is None else now))
+
+    # Insert out of timestamp order. Customer ledger timestamps deliberately differ from allocation timestamps.
+    fixtures = [
+        ("exclusive-end", key_a, end, 7, 8, "0.4"),
+        ("prior", key_a, prior, 1, 2, "0.1"),
+        ("inclusive-start", key_a, start, 3, 4, "0.2"),
+        ("inside", key_a, inside, 5, 6, "0.3"),
+        ("prior-only", key_b, prior, 9, 10, "0.5"),
+        ("deleted-key", deleted, inside, 11, 12, "0.0000005"),
+    ]
+    async with routing._require_db()() as session, session.begin():
+        for event_id, credential_id, settled_at, prompt, completion, cost in fixtures:
+            session.add(ChatUsageLog(event_id=event_id, model_name="account-model", created_at=inside))
+            session.add(ChatProviderUsage(
+                event_id=event_id, provider_id=1, provider_account_id=account_id, provider_credential_id=credential_id,
+                provider_credential_generation=0, prompt_tokens=prompt, completion_tokens=completion,
+                raw_cost=Decimal(cost), created_at=settled_at,
+            ))
+        await session.flush()
+
+    path = f"/v1/admin/providers/1/accounts/{account_id}"
+    assert (await admin_client.delete(f"{path}/credentials/{deleted}")).status_code == 204
+    response = await admin_client.get(f"{path}/usage")
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    usage = response.json()
+    assert usage["account_id"] == account_id and usage["provider_id"] == 1
+    period = usage["period"]
+    assert period["kind"] == "calendar_month" and period["timezone"] == "UTC"
+    for field, instant in (("start", start), ("end", end)):
+        value = datetime.fromisoformat(period[field])
+        assert value == instant and value.utcoffset() == timedelta()
+    rows = {row["credential_id"]: row for row in usage["credentials"]}
+    assert unused not in rows
+    assert set(rows) == {key_a, key_b, deleted}
+    for credential_id, all_time, month, last_used_at in (
+        (key_a, (4, 16, 20, "1.0"), (2, 8, 10, "0.5"), end),
+        (key_b, (1, 9, 10, "0.5"), (0, 0, 0, "0"), prior),
+        (deleted, (1, 11, 12, "0.0000005"), (1, 11, 12, "0.0000005"), inside),
+    ):
+        row = rows[credential_id]
+        for prefix, expected in (("", all_time), ("month_", month)):
+            assert tuple(row[prefix + field] for field in ("requests", "prompt_tokens", "completion_tokens")) == expected[:3]
+            raw_cost = row[prefix + "raw_cost"]
+            assert isinstance(raw_cost, str)
+            assert Decimal(raw_cost) == Decimal(expected[3])
+        value = datetime.fromisoformat(row["last_used_at"])
+        assert value == last_used_at and value.utcoffset() == timedelta()
 
 
 @pytest.mark.parametrize("provider_type,api_base,allowed", [

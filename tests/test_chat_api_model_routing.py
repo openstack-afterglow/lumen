@@ -80,6 +80,9 @@ class _AsyncSession(AbstractAsyncContextManager):
                     self.ids[counter] += 1
         self.sync.flush()
 
+    async def refresh(self, row, *, attribute_names):
+        self.sync.refresh(row, attribute_names=attribute_names)
+
 
 @pytest.fixture
 def provider_db(monkeypatch):

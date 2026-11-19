@@ -1035,6 +1035,7 @@ class ProviderCredentialResponse(BaseModel):
     id: int
     account_id: int
     name: str
+    created_at: datetime = Field(description="UTC credential creation time")
     auth_mode: Literal["api_key", "chatgpt_device", "anthropic_subscription"]
     generation: int
     is_active: bool
@@ -1054,6 +1055,7 @@ class ProviderCredentialResponse(BaseModel):
 class ProviderAccountResponse(ProviderAccountCreate):
     id: int
     provider_id: int
+    created_at: datetime = Field(description="UTC account creation time")
     credentials: list[ProviderCredentialResponse]
 
 
@@ -1101,7 +1103,34 @@ async def delete_provider_account(provider_id: int, account_id: int):
     return response
 
 
-@router.get("/admin/providers/{provider_id}/accounts/{account_id}/usage")
+class ProviderAccountUsagePeriod(BaseModel):
+    kind: Literal["calendar_month"]
+    start: datetime = Field(description="Inclusive UTC month start")
+    end: datetime = Field(description="Exclusive UTC start of the next month")
+    timezone: Literal["UTC"]
+
+
+class ProviderCredentialUsage(BaseModel):
+    credential_id: int | None
+    requests: int
+    prompt_tokens: int
+    completion_tokens: int
+    raw_cost: str = Field(description="All-time Lumen-allocated raw cost as a decimal string, not a provider invoice")
+    month_requests: int
+    month_prompt_tokens: int
+    month_completion_tokens: int
+    month_raw_cost: str = Field(description="Lumen-allocated raw cost in the UTC month as a decimal string")
+    last_used_at: datetime | None = Field(description="Latest UTC allocation timestamp recorded at settlement")
+
+
+class ProviderAccountUsageResponse(BaseModel):
+    provider_id: int
+    account_id: int
+    period: ProviderAccountUsagePeriod
+    credentials: list[ProviderCredentialUsage]
+
+
+@router.get("/admin/providers/{provider_id}/accounts/{account_id}/usage", response_model=ProviderAccountUsageResponse)
 async def provider_account_usage(provider_id: int, account_id: int, response: Response):
     return await _account_action(accounts.account_usage(provider_id, account_id), response)
 

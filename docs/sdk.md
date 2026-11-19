@@ -127,7 +127,7 @@ The shared `Client`/`AsyncClient`/Keystone proxy API mixin declares these method
 | `admin_create_provider_account(provider_id, **attrs)` | POST `/accounts`. |
 | `admin_update_provider_account(provider_id, account_id, **attrs)` | PATCH `/accounts/{account_id}`. |
 | `admin_delete_provider_account(provider_id, account_id)` | DELETE `/accounts/{account_id}`. |
-| `admin_provider_account_usage(provider_id, account_id)` | GET `/accounts/{account_id}/usage`; local allocation totals, not another customer charge/invoice. |
+| `admin_provider_account_usage(provider_id, account_id)` | GET `/accounts/{account_id}/usage`; all-time and current UTC calendar month allocations by credential, not another customer charge or a provider invoice. |
 | `admin_create_provider_credential(provider_id, account_id, **attrs)` | POST `/accounts/{account_id}/credentials`. |
 | `admin_update_provider_credential(provider_id, account_id, credential_id, **attrs)` | PATCH `/accounts/{account_id}/credentials/{credential_id}`. |
 | `admin_delete_provider_credential(provider_id, account_id, credential_id)` | DELETE that credential. |
@@ -136,6 +136,8 @@ The shared `Client`/`AsyncClient`/Keystone proxy API mixin declares these method
 | `admin_begin_provider_credential_device_auth(provider_id, account_id, credential_id)` | POST credential `/auth/device`. |
 | `admin_poll_provider_credential_device_auth(provider_id, account_id, credential_id, attempt_id)` | POST credential `/auth/device/{attempt_id}/poll`. |
 | `admin_cancel_provider_credential_device_auth(provider_id, account_id, credential_id, attempt_id)` | DELETE credential `/auth/device/{attempt_id}`. |
+
+Account and credential metadata include UTC `created_at`. The usage response describes its `period` with inclusive `start` and exclusive `end`. Each credential bucket includes `month_requests`, `month_prompt_tokens`, `month_completion_tokens`, `month_raw_cost`, and `last_used_at` (latest UTC allocation timestamp recorded at settlement, or `null` if unavailable). Costs stay decimal strings. Deleted credential IDs remain in historical buckets; credentials with no allocations are absent. When targeting older servers, tolerate missing additive fields.
 
 Existing `admin_update_provider(provider_id, **attrs)` sets endpoint `selection_policy="explicit"|"priority"|"weighted"` and `selected_credential_id`. Account/credential `allowed_model_ids` and `allowed_capabilities` preserve `None` (unrestricted) versus `[]` (deny all); operations are `chat,responses,messages,count_tokens,embeddings,search,image,tts,stt,realtime`, not model features. Only endpoint-owned model/credential IDs are valid. Expiry/cooldown and secret/restriction edits can invalidate frozen generations; they do not rotate in-flight requests. See [API reference](api-reference.md#provider-account-and-credential-administration) for fields and status semantics. Never log submitted secrets/device codes, and treat subscription authentication as separate from vendor permission for public multi-user pooling.
 
