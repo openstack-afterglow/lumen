@@ -6,7 +6,7 @@ Lumen은 owned provider transport(`provider_client` + private Bifrost converter)
 
 - Repository: https://github.com/openstack-afterglow/lumen
 - 분석 기준: `dev` branch, 현재 working tree source와 설정
-- 버전: package/runtime/lock/Kolla image default `0.6.20`은 불변 tag `0.6.20`(`d2751b6d`)으로 발행했고, DMS Lab 컨트롤러 3대에 배포했다(OpenAI 이미지·GPT-6.2·실시간 확장). protocol 2와 관리형 ClamAV는 유지하고 선택 도구 sandbox runtime은 끈 상태다. 새 migration은 없고 기존 035 ledger와 CHECK를 보존했다. 운영 수신증과 유료 SDK 호출 범위는 `docs/testing.md`에 기록한다. SDK·plugin·sandbox package 버전은 독립 계약을 유지한다. 033–035 적용 시 schema-first 전환 및 혼합 writer 금지 조건은 그대로다.
+- 버전: package/runtime/lock/Kolla image default는 `0.6.21`(도메인 범위·도메인 크레딧 풀·개인/서비스 키·Agent Vault·이미지 토큰 단가·Gemini 호환; 릴리스 준비, 아직 발행·배포 전)이다. 현재 운영 버전은 불변 tag `0.6.20`(`d2751b6d`)이며 DMS Lab 컨트롤러 3대에 배포했다. protocol 2와 관리형 ClamAV는 유지하고 선택 도구 sandbox runtime은 끈 상태다. 0.6.21은 additive migration 036–040을 추가하며 schema-first 전환(drain → backup → migrate → 호환 writer 시작)과 혼합 writer 금지 조건을 그대로 따른다. 운영 수신증과 유료 SDK 호출 범위는 `docs/testing.md`에 기록한다. SDK·plugin·sandbox package 버전은 독립 계약을 유지한다.
 - 주요 실행 단위: FastAPI API(`lumen/main.py`), durable worker(`lumen/worker.py`), migration CLI(`lumen/scripts/migrate.py`), migration 이후 provider bootstrap CLI(`lumen/scripts/seed_providers.py`), 독립 `lumen-sdk`, 선택적 local Console(`lumen_console/`)
 
 짧게 말하면 대부분의 HTTP route는 인증·scope·입력 검증과 journal 조회만 담당하고, `chat_admission`이 실행에 필요한 권한·context·provider/model·extension snapshot을 고정한다. `durable_runs`가 MariaDB transaction으로 intent/run/event를 기록하고, worker가 lease를 획득해 provider·tool을 실행한다. Redis는 일반 run wakeup 최적화지만 realtime 한 번 쓰는 connect ticket에는 필수다. Realtime 예외는 API WebSocket process가 직접 lease를 소유하며 양방향 provider audio를 relay/정산한다.
@@ -670,9 +670,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "4b1a6e6cb2cd017ca45a68e0ddf9bc65ee9cc303e31618354cd6d106bbd30fba",
-  "reviewed_at": "2026-11-18T17:46:40Z",
-  "summary": "Move official SDK test model-key helpers into tests/sdk_fixtures.py (bare import like provider_fixtures); no runtime change"
+  "source_sha256": "6393ac894a939b4c2dc127ce653e673a0ebb9d236f754acd373fca8ef112d85e",
+  "reviewed_at": "2026-11-19T03:12:37Z",
+  "summary": "Lumen 0.6.21 release prep: domain scope, domain credit pools, personal/service keys, Agent Vault, image token pricing, Gemini compat"
 }
 ```
 <!-- architecture-review:end -->
