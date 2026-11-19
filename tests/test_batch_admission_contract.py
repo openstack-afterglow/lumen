@@ -60,7 +60,7 @@ async def test_model_keys_never_hold_batch_write_even_with_legacy_stored_scope(c
     required = batches._scopes("chat.completions", contract, {})
     write = "native:batches:write" if contract == "native" else "compat:batches:write"
     row = SimpleNamespace(id=7, key_kind="personal", credential_kind="api_key", owner_user_id="u",
-                          owner_project_id=None, owner_domain_id=None, is_active=True, revoked_at=None,
+                          owner_project_id=None, owner_domain_id=None, created_by_user_id="u", is_active=True, revoked_at=None,
                           expires_at=None, scopes=["compat:completions:write", write])
 
     class Session:

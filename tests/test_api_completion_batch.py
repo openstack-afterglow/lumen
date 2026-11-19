@@ -268,7 +268,7 @@ _KEY_PROJECT = "lumen:key:7"  # A personal key's storage identity, never an owne
 def _key(**overrides):
     row = SimpleNamespace(
         id=7, key_kind="personal", credential_kind="api_key", owner_user_id="u", owner_project_id=None,
-        owner_domain_id=None, is_active=True, revoked_at=None, expires_at=None,
+        owner_domain_id=None, created_by_user_id="u", is_active=True, revoked_at=None, expires_at=None,
         scopes=["models:read", "compat:completions:write"],
     )
     for key, value in overrides.items():

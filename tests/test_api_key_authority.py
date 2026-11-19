@@ -62,6 +62,7 @@ def key_row(**changes):
         id=7, owner_user_id="u", owner_project_id="p", is_active=True,
         revoked_at=None, expires_at=None, scopes=["models:read", _CHAT, "compat:images:write"],
         key_hash=aks._hash_key(_RAW), key_kind="personal", credential_kind="claude_gateway", last_used_at=None,
+        created_by_user_id="u",
     )
     fields.update(changes)
     return SimpleNamespace(**fields)
@@ -664,6 +665,91 @@ async def test_zero_role_system_owner_before_new_io_preserves_key_attenuation(
     with pytest.raises(aks.ApiKeyForbidden):
         await aks.authorize_api_key_in_transaction(
             session, api_key_id=api_key_id, user_id="u", project_id="p", required_scopes=required_scopes)
+
+
+_LEGACY_ALIASES = ["embeddings:write", "decisions:write"]
+
+
+@pytest.mark.parametrize(("key_kind", "created_by", "expected"), [
+    ("personal", None, ["models:read", _CHAT, *_LEGACY_ALIASES]),
+    ("personal", "u", ["models:read", _CHAT]),
+    ("service", "u", ["models:read", _CHAT]),
+], ids=["converted-by-038", "issued-personal", "issued-service"])
+async def test_key_reads_report_exactly_the_enforced_model_scopes(monkeypatch, key_kind, created_by, expected):
+    legacy = ["models:read", "native:conversations:read", _CHAT, "native:runs:write"]
+    session = stored_key(
+        monkeypatch, credential_kind="api_key", key_kind=key_kind, scopes=list(legacy),
+        owner_user_id="u" if key_kind == "personal" else None, owner_project_id="p",
+        owner_domain_id="d" if key_kind == "service" else None, created_by_user_id=created_by, name="legacy",
+        key_prefix="sk-afgl-lega", owner_monthly_credit_limit=None, admin_monthly_credit_limit=None,
+        owner_weekly_credit_limit=None, created_at=None,
+    )
+    session.execute = AsyncMock(return_value=SimpleNamespace(
+        scalar_one_or_none=lambda: session.row, scalars=lambda: SimpleNamespace(all=lambda: [session.row])))
+    monkeypatch.setattr(aks, "_get_system_quota", AsyncMock(return_value=SimpleNamespace(monthly=None, weekly=None)))
+    monkeypatch.setattr(aks, "_get_system_quotas_batch", AsyncMock(return_value={}))
+    monkeypatch.setattr(aks, "_credited_costs_since_batch", AsyncMock(return_value={}))
+    monkeypatch.setattr(aks, "_verify_model_key_owner", lambda **kwargs: None)
+
+    owned = await (aks.list_keys("u") if key_kind == "personal" else aks.list_service_keys("d"))
+    admin = await aks.list_keys_admin(kind=key_kind)
+    assert [owned[0]["scopes"], admin["items"][0]["scopes"]] == [expected] * 2
+    if key_kind == "personal":
+        assert (await aks.rename_key(7, "u", "legacy"))["scopes"] == expected
+    assert "ignored_scopes" not in owned[0]
+
+    verified = await aks.verify_key(_RAW)
+    assert verified["scopes"] == tuple(expected)
+    assert session.row.scopes == legacy
+
+
+@pytest.mark.parametrize("stored", [[_CHAT], ["native:runs:write"]])
+@pytest.mark.parametrize(("created_by", "status"), [(None, 200), ("u", 403)], ids=["converted-by-038", "issued"])
+async def test_converted_key_keeps_pre_0621_embeddings_and_decisions_access(monkeypatch, stored, created_by, status):
+    from lumen.api.compat import decisions as compat_decisions
+    from lumen.api.compat import embeddings as compat_embeddings
+
+    session = stored_key(monkeypatch, credential_kind="api_key", scopes=list(stored), created_by_user_id=created_by)
+    monkeypatch.setattr(aks, "_verify_model_key_owner", lambda **kwargs: None)
+    authorized = []
+
+    async def recheck(**kwargs):
+        # The provider-I/O revalidation reads the same stored row as the read views.
+        await aks.authorize_api_key_in_transaction(
+            session, api_key_id=kwargs["api_key_id"], user_id=kwargs["user_id"],
+            project_id=kwargs["project_id"], required_scopes=kwargs["required_scopes"])
+        authorized.extend(kwargs["required_scopes"])
+
+    async def embed(**kwargs):
+        await recheck(**kwargs)
+        return {"model": "embed", "embeddings": [{"index": 0, "embedding": [0.5]}],
+                "usage": {"prompt_tokens": 1, "total_tokens": 1}}
+
+    async def decide(**kwargs):
+        await recheck(**kwargs)
+        return {"model": "decide", "answers": [], "usage": {}}
+
+    monkeypatch.setattr(compat_embeddings.embeddings, "resolve", AsyncMock(return_value={}))
+    monkeypatch.setattr(compat_embeddings.embeddings, "embed", embed)
+    monkeypatch.setattr(compat_decisions.decisions, "resolve", AsyncMock(return_value={}))
+    monkeypatch.setattr(compat_decisions.decisions, "decide", decide)
+    application = FastAPI()
+    application.include_router(compat_embeddings.router, prefix="/v1")
+    application.include_router(compat_embeddings.google_router)
+    application.include_router(compat_decisions.router, prefix="/v1")
+    headers = {"Authorization": f"Bearer {_RAW}"}
+    async with AsyncClient(transport=ASGITransport(application), base_url="http://synthetic") as client:
+        responses = [
+            await client.post("/v1/embeddings", headers=headers, json={"model": "embed", "input": "hello"}),
+            await client.post("/v1/decisions", headers=headers, json={
+                "model": "decide", "input": "hello",
+                "questions": [{"type": "predicate", "name": "yes", "instructions": "Yes?"}]}),
+            await client.post("/v1beta/models/embed:embedContent", headers=headers,
+                              json={"content": {"parts": [{"text": "hello"}]}}),
+        ]
+    assert [response.status_code for response in responses] == [status] * 3
+    assert authorized == (["embeddings:write", "decisions:write", "embeddings:write"] if status == 200 else [])
+    assert session.row.scopes == stored
 
 
 async def test_system_owner_personal_key_cannot_access_native_agents_or_admin(monkeypatch):

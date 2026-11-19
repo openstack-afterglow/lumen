@@ -33,6 +33,7 @@ def active_key(*scopes, **fields):
     # roles. Like every key, its stored scopes only ever count inside the model allowlist.
     return SimpleNamespace(**{"id": 7, "key_kind": "personal", "credential_kind": "claude_gateway",
                               "owner_user_id": "owner", "owner_project_id": "project", "owner_domain_id": None,
+                              "created_by_user_id": "owner",
                               "is_active": True, "revoked_at": None, "expires_at": None,
                               "scopes": list(scopes), **fields})
 

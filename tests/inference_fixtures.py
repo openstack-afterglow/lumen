@@ -18,7 +18,7 @@ def synthetic_inference_store(monkeypatch, current_project_authority):
     key row lookup. Tests may mutate the returned key/run rows.
     """
     key = SimpleNamespace(id=7, key_kind="personal", credential_kind="claude_gateway", owner_user_id="u1",
-                          owner_project_id="p1", owner_domain_id=None, is_active=True,
+                          owner_project_id="p1", owner_domain_id=None, created_by_user_id="u1", is_active=True,
                           revoked_at=None, expires_at=None, scopes=list(api_key_store.API_KEY_SCOPES))
     run = SimpleNamespace(user_id="u1", project_id="p1", api_key_id=None, source="web",
                           run_scope="persistent", conversation_id="c1", capability_snapshot={})

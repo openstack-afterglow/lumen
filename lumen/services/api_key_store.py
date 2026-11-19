@@ -39,6 +39,12 @@ _KEY_PREFIX = "sk-afgl-"  # 발급 키 접두(식별·표시용)
 DEFAULT_API_KEY_SCOPES = ("models:read", "compat:completions:write")
 MODEL_API_KEY_SCOPES = service_authority.MODEL_API_KEY_SCOPES
 API_KEY_SCOPES = MODEL_API_KEY_SCOPES
+# Before 0.6.21, embeddings and decisions were authorized by these scopes. Keys that
+# migration 038 converted (the only rows without created_by_user_id) keep that access.
+_LEGACY_SCOPE_ALIASES = {
+    "compat:completions:write": ("embeddings:write", "decisions:write"),
+    "native:runs:write": ("embeddings:write", "decisions:write"),
+}
 
 
 def _valid_scopes(scopes: object) -> tuple[str, ...] | None:
@@ -221,7 +227,8 @@ def _public(
         "name": row.name,
         "key_kind": row.key_kind,
         "key_prefix": row.key_prefix,
-        "scopes": list(row.scopes),
+        # Report only what verification can enforce; legacy stored scopes stay untouched.
+        "scopes": list(_stored_model_scopes(row) or ()),
         "owner_monthly_credit_limit": _dec_str(row.owner_monthly_credit_limit),
         "admin_monthly_credit_limit": _dec_str(row.admin_monthly_credit_limit),
         "system_monthly_credit_limit": _dec_str(system_quota),
@@ -741,7 +748,10 @@ def _stored_model_scopes(row: ChatApiKey) -> tuple[str, ...] | None:
     if (not isinstance(stored, list) or not stored
             or any(not isinstance(scope, str) for scope in stored) or len(set(stored)) != len(stored)):
         return None
-    return tuple(scope for scope in stored if scope in MODEL_API_KEY_SCOPES)
+    effective = list(stored)
+    if row.created_by_user_id is None:
+        effective.extend(alias for scope in stored for alias in _LEGACY_SCOPE_ALIASES.get(scope, ()))
+    return tuple(dict.fromkeys(scope for scope in effective if scope in MODEL_API_KEY_SCOPES))
 
 
 def _key_storage_actor(row: ChatApiKey) -> tuple[str, str] | None:
