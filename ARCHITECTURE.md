@@ -675,7 +675,7 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 {
   "schema_version": 1,
   "source_sha256": "6924049d8b88e551a50a61eef39ed53dd2f5eec7a6743d6fc7801898a5ce6758",
-  "reviewed_at": "2026-11-19T03:58:28Z",
+  "reviewed_at": "2026-11-19T04:03:31Z",
   "summary": "Lumen 0.6.21 release prep (final): domain scope, domain credit pools and usage views with domain_pool summary, personal/service keys with tool classification and gateway hold fix, Agent Vault with recoverable import, image token pricing, Gemini compat"
 }
 ```
