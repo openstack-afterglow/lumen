@@ -1228,6 +1228,8 @@ class UsageRecord(_StrictModel):
     cache_creation_1h_input_tokens: int = Field(ge=0)
     credited_cost: str
     source: Literal["web", "api"]
+    # Who paid: the user's wallet (including pre-domain-billing history) or the Keystone domain pool.
+    billing_scope: Literal["user", "domain"] = "user"
     api_key_id: int | None = None
     conversation_id: str | None = None
     run_id: str | None = None

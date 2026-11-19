@@ -1,4 +1,6 @@
-CREATE TABLE domain_credit_pools (
+-- Every statement is re-runnable: MariaDB commits each DDL on its own, so a failure part-way leaves
+-- earlier statements applied and the runner replays the whole file on the next attempt.
+CREATE TABLE IF NOT EXISTS domain_credit_pools (
     domain_id VARCHAR(64) NOT NULL PRIMARY KEY,
     balance_credits DECIMAL(18,8) NOT NULL DEFAULT 0,
     reserved_credits DECIMAL(18,8) NOT NULL DEFAULT 0,
@@ -15,7 +17,7 @@ CREATE TABLE domain_credit_pools (
     CONSTRAINT ck_domain_pool_ceiling CHECK (admin_ceiling_credits >= 0)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
-CREATE TABLE domain_credit_ledger (
+CREATE TABLE IF NOT EXISTS domain_credit_ledger (
     id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
     domain_id VARCHAR(64) NOT NULL,
     kind VARCHAR(20) NOT NULL,
@@ -31,31 +33,32 @@ CREATE TABLE domain_credit_ledger (
     INDEX idx_domain_ledger_actor_charge (actor_user_id, kind, created_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;
 
+-- One ALTER per table so each table is rebuilt at most once; re-applying MODIFY ... NULL is a no-op.
 ALTER TABLE chat_usage_logs
-    MODIFY project_id VARCHAR(64) NULL,
-    MODIFY user_id VARCHAR(64) NULL,
-    ADD domain_id VARCHAR(64) NULL,
-    ADD billing_scope VARCHAR(10) NOT NULL DEFAULT 'user',
-    ADD payer_user_id VARCHAR(64) NULL,
-    ADD payer_domain_id VARCHAR(64) NULL,
-    ADD INDEX idx_chat_usage_domain_created (domain_id, created_at),
-    ADD INDEX idx_chat_usage_payer_domain_created (payer_domain_id, created_at),
-    ADD INDEX idx_chat_usage_payer_user_created (payer_user_id, created_at);
+    MODIFY COLUMN project_id VARCHAR(64) NULL,
+    MODIFY COLUMN user_id VARCHAR(64) NULL,
+    ADD COLUMN IF NOT EXISTS domain_id VARCHAR(64) NULL,
+    ADD COLUMN IF NOT EXISTS billing_scope VARCHAR(10) NOT NULL DEFAULT 'user',
+    ADD COLUMN IF NOT EXISTS payer_user_id VARCHAR(64) NULL,
+    ADD COLUMN IF NOT EXISTS payer_domain_id VARCHAR(64) NULL,
+    ADD INDEX IF NOT EXISTS idx_chat_usage_domain_created (domain_id, created_at),
+    ADD INDEX IF NOT EXISTS idx_chat_usage_payer_domain_created (payer_domain_id, created_at),
+    ADD INDEX IF NOT EXISTS idx_chat_usage_payer_user_created (payer_user_id, created_at);
 
-ALTER TABLE chat_runs ADD payer_domain_id VARCHAR(64) NULL;
+ALTER TABLE chat_runs ADD COLUMN IF NOT EXISTS payer_domain_id VARCHAR(64) NULL;
 ALTER TABLE chat_model_call_reservations
-    ADD payer_user_id VARCHAR(64) NULL,
-    ADD payer_domain_id VARCHAR(64) NULL,
-    ADD INDEX idx_model_call_payer_domain (payer_domain_id, status);
+    ADD COLUMN IF NOT EXISTS payer_user_id VARCHAR(64) NULL,
+    ADD COLUMN IF NOT EXISTS payer_domain_id VARCHAR(64) NULL,
+    ADD INDEX IF NOT EXISTS idx_model_call_payer_domain (payer_domain_id, status);
 ALTER TABLE chat_stateless_call_reservations
-    MODIFY project_id VARCHAR(64) NULL,
-    MODIFY user_id VARCHAR(64) NULL,
-    ADD payer_user_id VARCHAR(64) NULL,
-    ADD payer_domain_id VARCHAR(64) NULL,
-    ADD INDEX idx_stateless_hold_payer_domain (payer_domain_id, status);
+    MODIFY COLUMN project_id VARCHAR(64) NULL,
+    MODIFY COLUMN user_id VARCHAR(64) NULL,
+    ADD COLUMN IF NOT EXISTS payer_user_id VARCHAR(64) NULL,
+    ADD COLUMN IF NOT EXISTS payer_domain_id VARCHAR(64) NULL,
+    ADD INDEX IF NOT EXISTS idx_stateless_hold_payer_domain (payer_domain_id, status);
 ALTER TABLE chat_agent_reservations
-    ADD payer_user_id VARCHAR(64) NULL,
-    ADD payer_domain_id VARCHAR(64) NULL,
-    ADD INDEX idx_agent_reservation_payer_domain (payer_domain_id, kind, status);
+    ADD COLUMN IF NOT EXISTS payer_user_id VARCHAR(64) NULL,
+    ADD COLUMN IF NOT EXISTS payer_domain_id VARCHAR(64) NULL,
+    ADD INDEX IF NOT EXISTS idx_agent_reservation_payer_domain (payer_domain_id, kind, status);
 
-ALTER TABLE chat_batches ADD payer_domain_id VARCHAR(64) NULL;
+ALTER TABLE chat_batches ADD COLUMN IF NOT EXISTS payer_domain_id VARCHAR(64) NULL;

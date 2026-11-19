@@ -27,7 +27,7 @@ from lumen.services.chat_admission import _run_snapshots
 from lumen.services.durable_runs import budgets, execution
 from lumen.services.durable_runs.errors import DurableRunInputError
 from lumen.services.provider_metadata import UsageCost
-from lumen.services.usage import user_usage_summary
+from lumen.services.usage import UsageView, user_usage_summary
 
 pytestmark = pytest.mark.integration
 
@@ -398,7 +398,7 @@ async def test_settle_release_replay_and_actor_quota(pool_scope):
         ]
         assert (pool.balance_credits, pool.monthly_used_credits, pool.reserved_credits) == (17, 3, 0)
         assert (await session.get(UserWallet, scope.users[0])).used_quota_this_month == 0
-    summary = await user_usage_summary(scope.users[1], "other-project", payer=scope.payer)
+    summary = await user_usage_summary(UsageView(scope.users[1], scope.id))
     assert (summary["total_credited_cost"], summary["quota_used"], summary["quota_max"]) == (3, 3, 5)
 
 

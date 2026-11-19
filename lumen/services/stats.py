@@ -17,9 +17,8 @@ from decimal import Decimal
 from sqlalchemy import case, func, select
 
 from lumen.db import get_session_factory, is_db_available
-from lumen.models.billing import Payer
 from lumen.models.chat_db import ChatApiKey, ChatUsageLog
-from lumen.services.usage import payer_filter
+from lumen.services.usage import BILLING_SCOPE, UsageView
 
 logger = logging.getLogger(__name__)
 
@@ -445,12 +444,13 @@ async def timeseries(
     model_name: str | None = None,
     include_system: bool = True,
     api_key_id: int | None = None,
-    payer: Payer | None = None,
+    view: UsageView | None = None,
 ) -> list[dict]:
     """시간버킷(hour/day/month)별 × source(web/api/system)별 시계열(오름차순).
 
     프론트가 접근경로(web vs api)를 시간축으로 쌓아 "언제·어느 경로로 많이 썼는지" 표시.
     user_id 지정 시 해당 사용자만(개인 사용량 뷰). include_system=False 면 시스템 부담 제외.
+    A dashboard ``view`` replaces ``user_id``; each item then splits its credits by billing scope.
     """
     factory = _factory()
     if factory is None:
@@ -459,8 +459,8 @@ async def timeseries(
     fine_window_days = {"5m": 1, "15m": 7}.get(_norm_bucket(bucket))
     if fine_window_days is not None:
         conds.append(ChatUsageLog.created_at >= datetime.now(UTC) - timedelta(days=fine_window_days))
-    if payer is not None:
-        conds.append(payer_filter(payer))
+    if view is not None:
+        conds.append(view.predicate())
     elif user_id:
         conds.append(ChatUsageLog.user_id == user_id)
     if model_name:
@@ -481,6 +481,7 @@ async def timeseries(
                         func.coalesce(func.sum(ChatUsageLog.completion_tokens), 0),
                         func.coalesce(func.sum(ChatUsageLog.credited_cost), 0),
                         func.count(ChatUsageLog.id),
+                        func.coalesce(func.sum(case((BILLING_SCOPE == "domain", ChatUsageLog.credited_cost), else_=0)), 0),
                     )
                     .where(*conds)
                     .group_by(bexpr, ChatUsageLog.source)
@@ -496,8 +497,10 @@ async def timeseries(
                 "total_tokens": int(pt or 0) + int(ct or 0),
                 "credited_cost": float(credited or 0),
                 "request_count": int(req or 0),
+                **({"credited_cost_by_payer": {"user": float((credited or 0) - (domain or 0)),
+                                               "domain": float(domain or 0)}} if view is not None else {}),
             }
-            for b, s, pt, ct, credited, req in rows
+            for b, s, pt, ct, credited, req, domain in rows
         ]
     except Exception:
         logger.warning("채팅 통계 timeseries 집계 실패", exc_info=True)
@@ -511,7 +514,7 @@ async def by_api_key(
     user_id: str | None = None,
     limit: int = 50,
     api_key_id: int | None = None,
-    payer: Payer | None = None,
+    view: UsageView | None = None,
 ) -> list[dict]:
     """API 키별 집계(토큰 desc) — source="api" 만. 폐기된 키도 원장 보존(name None 가능).
 
@@ -521,8 +524,8 @@ async def by_api_key(
     if factory is None:
         return []
     conds = [*_base_conds(range_key, project_id), ChatUsageLog.source == "api", ChatUsageLog.api_key_id.isnot(None)]
-    if payer is not None:
-        conds.append(payer_filter(payer))
+    if view is not None:
+        conds.append(view.predicate())
     elif user_id:
         conds.append(ChatUsageLog.user_id == user_id)
     if api_key_id is not None:
@@ -536,6 +539,7 @@ async def by_api_key(
                         ChatUsageLog.api_key_id,
                         ChatApiKey.name,
                         ChatApiKey.key_prefix,
+                        BILLING_SCOPE,
                         func.coalesce(func.sum(ChatUsageLog.prompt_tokens), 0),
                         func.coalesce(func.sum(ChatUsageLog.completion_tokens), 0),
                         func.coalesce(func.sum(ChatUsageLog.credited_cost), 0),
@@ -543,7 +547,7 @@ async def by_api_key(
                     )
                     .outerjoin(ChatApiKey, ChatApiKey.id == ChatUsageLog.api_key_id)
                     .where(*conds)
-                    .group_by(ChatUsageLog.api_key_id, ChatApiKey.name, ChatApiKey.key_prefix)
+                    .group_by(ChatUsageLog.api_key_id, ChatApiKey.name, ChatApiKey.key_prefix, BILLING_SCOPE)
                     .order_by(func.sum(total_tok).desc())
                     .limit(min(max(limit, 1), 200))
                 )
@@ -553,13 +557,14 @@ async def by_api_key(
                 "api_key_id": kid,
                 "name": name,
                 "key_prefix": prefix,
+                "billing_scope": scope,
                 "prompt_tokens": int(pt or 0),
                 "completion_tokens": int(ct or 0),
                 "total_tokens": int(pt or 0) + int(ct or 0),
                 "credited_cost": float(credited or 0),
                 "request_count": int(req or 0),
             }
-            for kid, name, prefix, pt, ct, credited, req in rows
+            for kid, name, prefix, scope, pt, ct, credited, req in rows
         ]
     except Exception:
         logger.warning("채팅 통계 by_api_key 집계 실패", exc_info=True)
