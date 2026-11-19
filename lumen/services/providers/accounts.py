@@ -2,14 +2,15 @@
 from __future__ import annotations
 
 import secrets
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from functools import wraps
 
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 
 from lumen.crypto import encrypt_llm_provider_key
 from lumen.models.chat_db import ChatProviderUsage, ChatUsageLog, LlmProvider, LlmProviderAccount, LlmProviderCredential
+from lumen.services.quota_periods import month_start
 
 from .credentials import api_key_source, normalize_api_key_env
 from .errors import ProviderConfigurationChangedError, ProviderNotFoundError, ProviderValidationError
@@ -39,6 +40,7 @@ def _utc(value):
 
 def credential_public(credential):
     return {"id": credential.id, "account_id": credential.account_id, "name": credential.name,
+            "created_at": _utc(credential.created_at),
             "auth_mode": credential.auth_mode, "generation": credential.generation,
             "is_active": credential.is_active, "priority": credential.priority, "weight": credential.weight,
             "api_key_configured": api_key_source(credential) is not None,
@@ -51,6 +53,7 @@ def credential_public(credential):
 
 def account_public(account):
     return {"id": account.id, "provider_id": account.provider_id, "name": account.name,
+            "created_at": _utc(account.created_at),
             "is_active": account.is_active, "priority": account.priority, "weight": account.weight,
             "quota_group": account.quota_group, "allowed_model_ids": account.allowed_model_ids,
             "allowed_capabilities": account.allowed_capabilities,
@@ -218,6 +221,7 @@ async def create_account(provider_id, patch):
         row = LlmProviderAccount(provider_id=provider_id, credentials=[], **patch)
         provider.accounts.append(row)
         await session.flush()
+        await session.refresh(row, attribute_names=["created_at"])
         return account_public(row)
 
 
@@ -255,6 +259,7 @@ async def create_credential(provider_id, account_id, patch):
             subscription_status="disconnected", generation=0, **patch)
         account.credentials.append(row)
         await session.flush()
+        await session.refresh(row, attribute_names=["created_at"])
         return credential_public(row)
 
 
@@ -309,13 +314,46 @@ async def account_usage(provider_id, account_id):
         provider = await _provider(session, provider_id)
         if not any(a.id == account_id for a in provider.accounts):
             raise ProviderNotFoundError("account not found")
-        rows = (await session.execute(select(ChatProviderUsage.provider_credential_id, func.count(ChatProviderUsage.event_id),
-            func.sum(ChatProviderUsage.prompt_tokens), func.sum(ChatProviderUsage.completion_tokens), func.sum(ChatProviderUsage.raw_cost))
+        start = month_start()
+        end = month_start(start + timedelta(days=31))
+        settled_at = ChatProviderUsage.created_at
+        in_month = (settled_at >= start) & (settled_at < end)
+        rows = (await session.execute(
+            select(
+                ChatProviderUsage.provider_credential_id.label("credential_id"),
+                func.count(ChatProviderUsage.event_id).label("requests"),
+                func.sum(ChatProviderUsage.prompt_tokens).label("prompt_tokens"),
+                func.sum(ChatProviderUsage.completion_tokens).label("completion_tokens"),
+                func.sum(ChatProviderUsage.raw_cost).label("raw_cost"),
+                func.count(case((in_month, ChatProviderUsage.event_id))).label("month_requests"),
+                func.sum(case((in_month, ChatProviderUsage.prompt_tokens))).label("month_prompt_tokens"),
+                func.sum(case((in_month, ChatProviderUsage.completion_tokens))).label("month_completion_tokens"),
+                func.sum(case((in_month, ChatProviderUsage.raw_cost))).label("month_raw_cost"),
+                func.max(settled_at).label("last_used_at"),
+            )
             .where(ChatProviderUsage.provider_id == provider_id, ChatProviderUsage.provider_account_id == account_id)
-            .group_by(ChatProviderUsage.provider_credential_id))).all()
-        return {"provider_id": provider_id, "account_id": account_id, "credentials": [
-            {"credential_id": r[0], "requests": r[1], "prompt_tokens": r[2] or 0,
-             "completion_tokens": r[3] or 0, "raw_cost": str(r[4] or Decimal(0))} for r in rows]}
+            .group_by(ChatProviderUsage.provider_credential_id)
+        )).all()
+        return {
+            "provider_id": provider_id,
+            "account_id": account_id,
+            "period": {"kind": "calendar_month", "start": start, "end": end, "timezone": "UTC"},
+            "credentials": [
+                {
+                    "credential_id": row.credential_id,
+                    "requests": row.requests,
+                    "prompt_tokens": row.prompt_tokens or 0,
+                    "completion_tokens": row.completion_tokens or 0,
+                    "raw_cost": str(row.raw_cost or Decimal(0)),
+                    "month_requests": row.month_requests,
+                    "month_prompt_tokens": row.month_prompt_tokens or 0,
+                    "month_completion_tokens": row.month_completion_tokens or 0,
+                    "month_raw_cost": str(row.month_raw_cost or Decimal(0)),
+                    "last_used_at": _utc(row.last_used_at),
+                }
+                for row in rows
+            ],
+        }
 
 
 @_retry_db

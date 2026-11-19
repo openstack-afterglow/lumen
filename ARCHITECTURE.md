@@ -545,6 +545,10 @@ Durable interrupt inspection compiles the executed graph topology without runnin
 - **Atomic provider model reorder**: 관리자 `POST /v1/admin/models/reorder`는 `{provider_id, expected_model_ids, model_ids}`의 strict positive unique bounded ID 목록을 받는다. Repository가 기존 `_lock_mutable_route`로 provider→전체 model ID 순서 잠금 및 provider 전체 active-run fence를 획득하고, 모든 종류·비활성 모델을 포함한 현재 `(sort_order,id)` 순서를 expected와 대조한다. Stale/membership/active-run 충돌은 409이며 변경 없이 rollback한다. 단일 transaction에서 바뀐 rank만 `0..N-1`로 쓰고 `updated_at`을 명시 보존해 legacy manual/media 가격 version 및 frozen HMAC을 유지한다. Provider/config/가격/flag는 변경하지 않는다. 성공은 no-store 204, provider 부재는 404; migration/dependency 변경은 없다. 실제 HTTP+SQLite 영속 회귀는 test-defined이며 이번 작업에서는 실행하지 않았다.
 - **0.3.1 integration boundary**: `origin/dev`의 title/admission/operator/graph reasoning 수정과 기존 subscription sampling·operations 변경을 별도 worktree에서 통합했다. Legacy Perplexity Sonar의 정확한 bundled 가격 키를 synthetic Agent 중복 접두보다 우선해 서로 다른 tariff를 유지한다. Managed runtime guest 인증서의 Authority Key Identifier는 controller CA의 Subject Key Identifier가 있으면 그 값을 사용하고, 없으면 CA 공개키에서 유도한다. 기존 CA material·소유권은 변경하지 않는다. 서비스·schema·dependency·저장소 소유권 변경은 없으며 root/runtime/lock 및 packaged Kolla image default만 patch version으로 맞춘다. 기존 discovery는 변경하지 않았다. 0.3.1 candidate에서 contract 1,369건, SDK 125건, 실제 MariaDB/Redis integration 40건, local Compose fake-provider system 9건, Ruff와 wheel build, API/worker/controller/sandbox linux/amd64·linux/arm64 이미지 build 및 각 이미지의 offline import/platform smoke를 통과했다. `v0.3.1` package/image workflows와 네 tag image의 linux/amd64·linux/arm64 manifest/OCI revision은 게시 후 확인했다. live Anthropic/OpenAI provider·production rollout은 아직 검증하지 않았다.
 
+### Provider account usage
+
+The admin account API exposes stored UTC creation times for the account group and each credential. Account `/usage` keeps all-time allocation totals and deleted credentials' historical IDs. The current UTC calendar month and latest use are measured by `chat_provider_usage.created_at`, recorded in the same transaction as customer settlement. The read uses the account index and does not join the customer ledger. It requires no migration, creates no debit, and does not report provider invoices. See [the admin API contract](docs/api-reference.md#provider-account-and-credential-administration).
+
 ### Provider model onboarding
 
 관리자 discovery는 Anthropic `x-api-key`/`anthropic-version` + `after_id`, Gemini `x-goog-api-key` + `pageToken`, OpenAI-compatible Bearer `/models`로 계정별 후보를 조회한다. 기존 Perplexity router·custom base와 subscription namespace를 보존한다. HTTP client는 redirects/environment proxy를 사용하지 않고 전체 20초·25페이지·2,000 unique 모델·5MB streamed identity response로 제한한다. 정상 empty는 complete API 결과다. 오류나 중간 페이지 실패·한도 초과는 모델 목록 전체를 폐기하고 safe error로 반환하며 static fallback을 하지 않는다. Static 참고 목록은 live 미지원 provider/auth에만 제공한다.
@@ -677,9 +681,9 @@ Architecture is a living snapshot, not a historical plan. 작업 전 이 파일�
 ```json
 {
   "schema_version": 1,
-  "source_sha256": "2343713365d3da39332f7f08f7a8f33b1aa3f8d08979c065144dcc072a9b02c4",
-  "reviewed_at": "2026-11-19T07:22:50Z",
-  "summary": "Isolate the fixed Afterglow ingress test vector from cached plugin settings. No production code changes."
+  "source_sha256": "a06f18cee8ea40a0bb088db453dd3f16a46d0d6cac829d25fd2a1322dc6a0cd9",
+  "reviewed_at": "2026-11-19T18:24:28Z",
+  "summary": "Review provider account and credential creation timestamps, UTC settlement allocation aggregation without a ledger join, admin API schemas and focused regressions; no migration or billing change"
 }
 ```
 <!-- architecture-review:end -->

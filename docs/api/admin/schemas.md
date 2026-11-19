@@ -306,6 +306,7 @@ Published embedding dimensions; null means the provider did not publish a constr
 | `quota_group` | string \| null | no | — | Quota Group |
 | `id` | integer | yes | — | Id |
 | `provider_id` | integer | yes | — | Provider Id |
+| `created_at` | string (date-time) | yes | — | UTC account creation time |
 | `credentials` | array of [ProviderCredentialResponse](#providercredentialresponse) | yes | — | Credentials |
 
 ### ProviderAccountUpdate
@@ -319,6 +320,24 @@ Published embedding dimensions; null means the provider did not publish a constr
 | `allowed_model_ids` | array of integer \| null | no | — | Allowed Model Ids |
 | `allowed_capabilities` | array of string \| null | no | — | Allowed Capabilities |
 | `quota_group` | string \| null | no | — | Quota Group |
+
+### ProviderAccountUsagePeriod
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `kind` | const `calendar_month` | yes | — | Kind |
+| `start` | string (date-time) | yes | — | Inclusive UTC month start |
+| `end` | string (date-time) | yes | — | Exclusive UTC start of the next month |
+| `timezone` | const `UTC` | yes | — | Timezone |
+
+### ProviderAccountUsageResponse
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `provider_id` | integer | yes | — | Provider Id |
+| `account_id` | integer | yes | — | Account Id |
+| `period` | [ProviderAccountUsagePeriod](#provideraccountusageperiod) | yes | — |  |
+| `credentials` | array of [ProviderCredentialUsage](#providercredentialusage) | yes | — | Credentials |
 
 ### ProviderBillingBalance
 
@@ -473,6 +492,7 @@ Anthropic organization-report token categories; consistent rows sum to ``tokens`
 | `id` | integer | yes | — | Id |
 | `account_id` | integer | yes | — | Account Id |
 | `name` | string | yes | — | Name |
+| `created_at` | string (date-time) | yes | — | UTC credential creation time |
 | `auth_mode` | enum: `api_key`, `chatgpt_device`, `anthropic_subscription` | yes | — | Auth Mode |
 | `generation` | integer | yes | — | Generation |
 | `is_active` | boolean | yes | — | Is Active |
@@ -502,6 +522,21 @@ Anthropic organization-report token categories; consistent rows sum to ``tokens`
 | `allowed_capabilities` | array of string \| null | no | — | Allowed Capabilities |
 | `expires_at` | string (date-time) \| null | no | — | Expires At |
 | `cooldown_until` | string (date-time) \| null | no | — | Cooldown Until |
+
+### ProviderCredentialUsage
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `credential_id` | integer \| null | yes | — | Credential Id |
+| `requests` | integer | yes | — | Requests |
+| `prompt_tokens` | integer | yes | — | Prompt Tokens |
+| `completion_tokens` | integer | yes | — | Completion Tokens |
+| `raw_cost` | string | yes | — | All-time Lumen-allocated raw cost as a decimal string, not a provider invoice |
+| `month_requests` | integer | yes | — | Month Requests |
+| `month_prompt_tokens` | integer | yes | — | Month Prompt Tokens |
+| `month_completion_tokens` | integer | yes | — | Month Completion Tokens |
+| `month_raw_cost` | string | yes | — | Lumen-allocated raw cost in the UTC month as a decimal string |
+| `last_used_at` | string (date-time) \| null | yes | — | Latest UTC allocation timestamp recorded at settlement |
 
 ### ProviderProbeRequest
 

@@ -95,9 +95,9 @@ All paths below are relative to `/v1/admin/providers/{provider_id}` and require 
 | --- | --- | --- |
 | GET / POST | `/accounts` | List accounts including nested credential metadata / create account (201). |
 | PATCH / DELETE | `/accounts/{account_id}` | Update account / delete account and its credentials (204). |
-| GET | `/accounts/{account_id}/usage` | `{provider_id,account_id,credentials:[{credential_id,requests,prompt_tokens,completion_tokens,raw_cost}]}`; Lumen allocation totals, not provider invoice/balance. `raw_cost` is a Decimal string. |
+| GET | `/accounts/{account_id}/usage` | All-time and current UTC calendar month Lumen allocation totals by credential. See the response shape below. |
 | POST | `/accounts/{account_id}/credentials` | Create credential under the endpoint's auth mode (201). |
-| PATCH / DELETE | `/accounts/{account_id}/credentials/{credential_id}` | Update / delete credential (204); no separate credential GET, use nested account list. |
+| PATCH / DELETE | `/accounts/{account_id}/credentials/{credential_id}` | Update (200 with safe metadata) / delete (204); no separate credential GET, use nested account list. |
 | POST | `/accounts/{account_id}/credentials/{credential_id}/probe` | Explicit cost-bearing single-request connection test: strict `{model_id:positive integer,generation:nonnegative integer}`; registered active text model from this endpoint, exact current credential only. |
 | GET | `/accounts/{account_id}/credentials/{credential_id}/relays` | Exact owned credential's settled-usage receipts; `limit=10` (1–50), optional positive `before_id` ledger cursor. Not an all-attempt or live connection monitor. |
 | PUT | `/accounts/{account_id}/credentials/{credential_id}/auth/token` | Subscription `{token,expires_at?}` upload; returns safe credential metadata. |
@@ -105,6 +105,12 @@ All paths below are relative to `/v1/admin/providers/{provider_id}` and require 
 | POST | `/accounts/{account_id}/credentials/{credential_id}/auth/device` | Begin/reuse owner/project-bound device attempt (201 new, 200 reused). |
 | POST | `/accounts/{account_id}/credentials/{credential_id}/auth/device/{attempt_id}/poll` | Poll that exact credential/attempt under the initiating owner/project. |
 | DELETE | `/accounts/{account_id}/credentials/{credential_id}/auth/device/{attempt_id}` | Cancel that exact attempt (204). |
+
+`account_id` identifies an operator-named group that owns keys and sets account-level restrictions. `credential_id` identifies a single secret-bearing credential within that group. Account and credential metadata include read-only `created_at`, the stored creation time as an ISO-8601 UTC timestamp, not the time of a key rotation.
+
+Account usage returns `{provider_id, account_id, period, credentials}`. The `period` is `{kind:"calendar_month", start, end, timezone:"UTC"}`, with ISO-8601 UTC bounds from the shared quota calendar. The start is inclusive and the start of the next month is exclusive.
+
+Each `credentials` item contains `credential_id` and all-time `requests`, `prompt_tokens`, `completion_tokens`, `raw_cost`. It also contains `month_requests`, `month_prompt_tokens`, `month_completion_tokens`, `month_raw_cost`, and `last_used_at`. The monthly fields filter on the allocation timestamp recorded in the customer settlement transaction. `last_used_at` is the latest such UTC timestamp across all time, or `null` if unavailable. The allocation timestamp does not measure upstream dispatch time. Both costs are decimal strings and can use exponent notation; they report Lumen allocations, not provider invoices or balances. Credentials with no allocations are omitted; allocation rows for deleted credentials keep their historical `credential_id`. Older usage without allocation rows remains unattributed.
 
 Account create/patch fields: `name`, `is_active`, nonnegative `priority`, positive `weight`, nullable `allowed_model_ids`, nullable `allowed_capabilities`, nullable `quota_group`. Credential create/patch fields: `name`, `is_active`, `priority`, `weight`, `allowed_model_ids`, `allowed_capabilities`, nullable `expires_at`/`cooldown_until` and API-mode-only `api_key`/`api_key_env`. Names are1–100 characters; priority/weight are strict bounded integers. Unknown fields are rejected. Subscription credentials cannot contain API-key fields; auth mode belongs to the endpoint. Encrypted DB keys take precedence over an environment reference; only the environment name is stored/returned. Secret input is never a secret readback API.
 
